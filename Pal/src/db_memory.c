@@ -7,7 +7,6 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -22,6 +21,14 @@ int DkVirtualMemoryAlloc(PAL_PTR* addr, PAL_NUM size, PAL_FLG alloc_type, PAL_FL
 
     if (map_addr && _DkCheckMemoryMappable(map_addr, size)) {
         return -PAL_ERROR_DENIED;
+    }
+
+    if ((alloc_type & PAL_ALLOC_INTERNAL) && map_addr) {
+        return -PAL_ERROR_INVAL;
+    }
+
+    if (!(alloc_type & PAL_ALLOC_INTERNAL) && !map_addr) {
+        return -PAL_ERROR_INVAL;
     }
 
     return _DkVirtualMemoryAlloc(addr, size, alloc_type, prot);

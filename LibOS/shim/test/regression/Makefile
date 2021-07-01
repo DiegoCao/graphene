@@ -14,7 +14,7 @@ c_executables = \
 	bootstrap_pie \
 	bootstrap_static \
 	debug \
-	dev \
+	devfs \
 	device \
 	double_fork \
 	epoll_epollet \
@@ -40,6 +40,7 @@ c_executables = \
 	futex_wake_op \
 	getcwd \
 	getdents \
+	getdents_lseek \
 	getsockname \
 	getsockopt \
 	gettimeofday \
@@ -48,8 +49,9 @@ c_executables = \
 	host_root_fs \
 	init_fail \
 	kill_all \
-	large_mmap \
 	large_dir_read \
+	large_file \
+	large_mmap \
 	madvise \
 	mkfifo \
 	mmap_file \
@@ -83,6 +85,7 @@ c_executables = \
 	spinlock \
 	stat_invalid_args \
 	syscall \
+	syscall_restart \
 	sysfs_common \
 	tcp_ipv6_v6only \
 	tcp_msg_peek \
@@ -129,7 +132,6 @@ CFLAGS-debug = -g3
 CFLAGS-debug_regs-x86_64 = -g3
 CFLAGS-exec_same = -pthread
 CFLAGS-shared_object = -fPIC -pie
-CFLAGS-syscall += -I$(PALDIR)/../include -I$(PALDIR)/host/$(PAL_HOST) -I$(PALDIR)/../include/arch/$(ARCH)/Linux
 CFLAGS-openmp = -fopenmp
 CFLAGS-multi_pthread = -pthread
 CFLAGS-exit_group = -pthread
@@ -139,19 +141,24 @@ CFLAGS-futex_bitset = -pthread
 CFLAGS-futex_requeue = -pthread
 CFLAGS-futex_wake_op = -pthread
 CFLAGS-proc_common = -pthread
-CFLAGS-spinlock += -I$(PALDIR)/../include/lib -I$(PALDIR)/../include/arch/$(ARCH) -pthread
+CFLAGS-spinlock += -iquote ../../../../common/include -iquote ../../../../common/include/arch/$(ARCH) -pthread
 CFLAGS-sigaction_per_process += -pthread
 CFLAGS-signal_multithread += -pthread
 CFLAGS-pthread_set_get_affinity += -pthread
 CFLAGS-gettimeofday += -pthread
 
-CFLAGS-attestation += -I$(PALDIR)/../lib/crypto/mbedtls/include \
-                      -I$(PALDIR)/host/Linux-SGX \
-                      -I$(PALDIR)/../include/pal
-LDLIBS-attestation += $(PALDIR)/../lib/crypto/mbedtls/install/lib/libmbedcrypto.a
+CFLAGS-attestation += -iquote ../../../../common/src/crypto/mbedtls/include \
+                      -iquote $(PALDIR)/host/Linux-SGX
+LDLIBS-attestation += ../../../../common/src/crypto/mbedtls/install/lib/libmbedcrypto.a
 
 CFLAGS-fp_multithread += -pthread -fno-builtin  # see comment in the test's source
 LDLIBS-fp_multithread += -lm
+
+proc_common: proc_common.o dump.o
+	$(call cmd,cmulti)
+
+sysfs_common: sysfs_common.o dump.o
+	$(call cmd,cmulti)
 
 %: %.c
 	$(call cmd,csingle)
@@ -182,4 +189,5 @@ clean-tmp:
 		__pycache__ \
 		libos-regression.xml \
 		testfile \
-		tmp/*
+		tmp/* \
+		*.o

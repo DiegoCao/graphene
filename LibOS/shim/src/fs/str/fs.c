@@ -98,7 +98,7 @@ ssize_t str_read(struct shim_handle* hdl, void* buf, size_t count) {
     struct shim_str_data* data = strhdl->data;
 
     if (!data->str) {
-        log_warning("str_read: str_data has no str\n");
+        log_warning("str_read: str_data has no str");
         ret = 0;
         goto out;
     }
@@ -139,7 +139,7 @@ static ssize_t str_maybe_expand_buf(struct shim_str_handle* strhdl, size_t size)
         size_t new_size = 0;
 
         if (data->str) {
-            new_size = data->buf_size * 2;
+            new_size = data->buf_size ?: 1;
 
             while (size > new_size) {
                 new_size *= 2;

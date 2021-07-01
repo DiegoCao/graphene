@@ -14,7 +14,6 @@
 #include "elf/elf.h"
 #include "linux_utils.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -36,7 +35,14 @@ char* g_libpal_path = NULL;
 struct pal_linux_state g_linux_state;
 struct pal_sec g_pal_sec;
 
-static size_t g_page_size = PRESET_PAGESIZE;
+/* for internal PAL objects, Graphene first uses pre-allocated g_mem_pool and then falls back to
+ * _DkVirtualMemoryAlloc(PAL_ALLOC_INTERNAL); the amount of available PAL internal memory is limited
+ * by the variable below */
+size_t g_pal_internal_mem_size = 0;
+char* g_pal_internal_mem_addr = NULL;
+
+const size_t g_page_size = PRESET_PAGESIZE;
+
 static int g_uid, g_gid;
 static ElfW(Addr) g_sysinfo_ehdr;
 
@@ -73,7 +79,9 @@ static void read_args_from_stack(void* initial_rsp, int* out_argc, const char***
     for (ElfW(auxv_t)* av = (ElfW(auxv_t)*)(e + 1); av->a_type != AT_NULL; av++) {
         switch (av->a_type) {
             case AT_PAGESZ:
-                g_page_size = av->a_un.a_val;
+                if (av->a_un.a_val != g_page_size) {
+                    INIT_FAIL(PAL_ERROR_INVAL, "Unexpected AT_PAGESZ auxiliary vector");
+                }
                 break;
             case AT_UID:
             case AT_EUID:
@@ -91,10 +99,6 @@ static void read_args_from_stack(void* initial_rsp, int* out_argc, const char***
     *out_argc = argc;
     *out_argv = argv;
     *out_envp = envp;
-}
-
-unsigned long _DkGetAllocationAlignment(void) {
-    return g_page_size;
 }
 
 void _DkGetAvailableUserAddressRange(PAL_PTR* start, PAL_PTR* end) {
@@ -136,10 +140,9 @@ noreturn static void print_usage_and_exit(const char* argv_0) {
     const char* self = argv_0 ?: "<this program>";
     log_always("USAGE:\n"
                "\tFirst process: %s <path to libpal.so> init <application> args...\n"
-               "\tChildren:      %s <path to libpal.so> child <parent_pipe_fd> args...\n",
+               "\tChildren:      %s <path to libpal.so> child <parent_pipe_fd> args...",
                self, self);
-    log_always("This is an internal interface. Use pal_loader to launch applications in "
-               "Graphene.\n");
+    log_always("This is an internal interface. Use pal_loader to launch applications in Graphene.");
     _DkProcessExit(1);
 }
 
@@ -165,7 +168,7 @@ noreturn void pal_linux_main(void* initial_rsp, void* fini_callback) {
         INIT_FAIL(-ret, "_DkSystemTimeQuery() failed");
 
     /* Initialize alloc_align as early as possible, a lot of PAL APIs depend on this being set. */
-    g_pal_state.alloc_align = _DkGetAllocationAlignment();
+    g_pal_state.alloc_align = g_page_size;
     assert(IS_POWER_OF_2(g_pal_state.alloc_align));
 
     int argc;
@@ -243,7 +246,7 @@ noreturn void pal_linux_main(void* initial_rsp, void* fini_callback) {
             INIT_FAIL(PAL_ERROR_NOMEM, "Out of memory");
         }
     } else {
-        log_warning("vdso address range not preloaded, is your system missing vdso?!\n");
+        log_warning("vdso address range not preloaded, is your system missing vdso?!");
     }
     if (vvar_start || vvar_end) {
         ret = add_preloaded_range(vvar_start, vvar_end, "vvar");
@@ -251,7 +254,7 @@ noreturn void pal_linux_main(void* initial_rsp, void* fini_callback) {
             INIT_FAIL(PAL_ERROR_NOMEM, "Out of memory");
         }
     } else {
-        log_warning("vvar address range not preloaded, is your system missing vvar?!\n");
+        log_warning("vvar address range not preloaded, is your system missing vvar?!");
     }
 
     if (!g_pal_sec.process_id)
@@ -267,7 +270,6 @@ noreturn void pal_linux_main(void* initial_rsp, void* fini_callback) {
 
     PAL_HANDLE parent = NULL;
     char* manifest = NULL;
-    char* exec_uri = NULL; // TODO: This should be removed from here and handled by LibOS.
     if (first_process) {
         const char* application_path = argv[3];
         char* manifest_path = alloc_concat(application_path, -1, ".manifest", -1);
@@ -281,8 +283,7 @@ noreturn void pal_linux_main(void* initial_rsp, void* fini_callback) {
     } else {
         // Children receive their argv and config via IPC.
         int parent_pipe_fd = atoi(argv[3]);
-        init_child_process(parent_pipe_fd, &parent, &exec_uri, &manifest);
-        assert(exec_uri);
+        init_child_process(parent_pipe_fd, &parent, &manifest);
     }
     assert(manifest);
 
@@ -295,25 +296,28 @@ noreturn void pal_linux_main(void* initial_rsp, void* fini_callback) {
     if (!g_pal_state.manifest_root)
         INIT_FAIL_MANIFEST(PAL_ERROR_DENIED, errbuf);
 
-    if (!exec_uri) {
-        ret = toml_string_in(g_pal_state.manifest_root, "libos.entrypoint", &exec_uri);
-        if (ret < 0) {
-            INIT_FAIL_MANIFEST(PAL_ERROR_INVAL, "Cannot parse 'libos.entrypoint'\n");
-        } else if (exec_uri == NULL) {
-            // Temporary hack for PAL regression tests. TODO: We should always error out here.
-            char* pal_entrypoint;
-            ret = toml_string_in(g_pal_state.manifest_root, "pal.entrypoint", &pal_entrypoint);
-            if (ret < 0)
-                INIT_FAIL(PAL_ERROR_INVAL, "Cannot parse 'pal.entrypoint'\n");
-            if (!pal_entrypoint)
-                INIT_FAIL(PAL_ERROR_INVAL,
-                          "'libos.entrypoint' must be specified in the manifest\n");
-        } else if (!strstartswith(exec_uri, URI_PREFIX_FILE)) {
-            INIT_FAIL(PAL_ERROR_INVAL, "'libos.entrypoint' is missing 'file:' prefix\n");
-        }
+    ret = toml_sizestring_in(g_pal_state.manifest_root, "loader.pal_internal_mem_size",
+                             /*defaultval=*/g_page_size, &g_pal_internal_mem_size);
+    if (ret < 0) {
+        INIT_FAIL(PAL_ERROR_INVAL, "Cannot parse 'loader.pal_internal_mem_size'");
     }
 
+    void* internal_mem_addr = (void*)ARCH_MMAP(NULL, g_pal_internal_mem_size,
+                                               PROT_READ | PROT_WRITE,
+                                               MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (IS_ERR_P(internal_mem_addr)) {
+        INIT_FAIL(PAL_ERROR_NOMEM, "Cannot allocate PAL internal memory pool");
+    }
+
+    ret = add_preloaded_range((uintptr_t)internal_mem_addr,
+                              (uintptr_t)internal_mem_addr + g_pal_internal_mem_size,
+                              "pal_internal_mem");
+    if (ret < 0) {
+        INIT_FAIL(PAL_ERROR_NOMEM, "Out of memory");
+    }
+    g_pal_internal_mem_addr = internal_mem_addr;
+
     /* call to main function */
-    pal_main((PAL_NUM)g_linux_state.parent_process_id, exec_uri, parent, first_thread,
+    pal_main((PAL_NUM)g_linux_state.parent_process_id, parent, first_thread,
              first_process ? argv + 3 : argv + 4, envp);
 }

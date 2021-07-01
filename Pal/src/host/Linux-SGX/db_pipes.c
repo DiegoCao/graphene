@@ -12,9 +12,8 @@
 
 #include "api.h"
 #include "cpu.h"
+#include "crypto.h"
 #include "pal.h"
-#include "pal_crypto.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -22,7 +21,6 @@
 #include "pal_linux_defs.h"
 #include "pal_linux_error.h"
 #include "pal_security.h"
-
 
 static int pipe_addr(const char* name, struct sockaddr_un* addr) {
     /* use abstract UNIX sockets for pipes, with name format "@/graphene/<pipename>" */
@@ -39,30 +37,9 @@ static int pipe_addr(const char* name, struct sockaddr_un* addr) {
 }
 
 static int pipe_session_key(PAL_PIPE_NAME* name, PAL_SESSION_KEY* session_key) {
-    /* use SHA256 as a KDF; session key is KDF(g_master_key || pipe_name) */
-    int ret;
-    LIB_SHA256_CONTEXT sha;
-
-    ret = lib_SHA256Init(&sha);
-    if (ret < 0)
-        goto fail;
-
-    ret = lib_SHA256Update(&sha, (uint8_t*)&g_master_key, sizeof(g_master_key));
-    if (ret < 0)
-        goto fail;
-
-    ret = lib_SHA256Update(&sha, (uint8_t*)name->str, sizeof(name->str));
-    if (ret < 0)
-        goto fail;
-
-    ret = lib_SHA256Final(&sha, (uint8_t*)session_key);
-    if (ret < 0)
-        goto fail;
-
-    return 0;
-fail:
-    log_error("Failed to derive the pre-shared key for pipe %s: %d\n", name->str, ret);
-    return ret;
+    return lib_HKDF_SHA256((uint8_t*)&g_master_key, sizeof(g_master_key), /*salt=*/NULL,
+                           /*salt_size=*/0, (uint8_t*)name->str, sizeof(name->str),
+                           (uint8_t*)session_key, sizeof(*session_key));
 }
 
 static int thread_handshake_func(void* param) {
@@ -76,7 +53,7 @@ static int thread_handshake_func(void* param) {
     int ret = _DkStreamSecureInit(handle, handle->pipe.is_server, &handle->pipe.session_key,
                                   (LIB_SSL_CONTEXT**)&handle->pipe.ssl_ctx, NULL, 0);
     if (ret < 0) {
-        log_error("Failed to initialize secure pipe %s: %d\n", handle->pipe.name.str, ret);
+        log_error("Failed to initialize secure pipe %s: %d", handle->pipe.name.str, ret);
         _DkProcessExit(1);
     }
 
@@ -391,8 +368,11 @@ static int64_t pipe_read(PAL_HANDLE handle, uint64_t offset, uint64_t len, void*
         if (!handle->pipe.ssl_ctx)
             return -PAL_ERROR_NOTCONNECTION;
 
-        bytes = _DkStreamSecureRead(handle->pipe.ssl_ctx, buffer, len);
-	if (bytes < 0) SGX_DBG(DBG_E, "@@@@@@_DkStreamSecureRead returns %ld\n", bytes);
+
+//        bytes = _DkStreamSecureRead(handle->pipe.ssl_ctx, buffer, len);
+//	if (bytes < 0) SGX_DBG(DBG_E, "@@@@@@_DkStreamSecureRead returns %ld\n", bytes);
+        bytes = _DkStreamSecureRead(handle->pipe.ssl_ctx, buffer, len,
+                                    /*is_blocking=*/!handle->pipe.nonblocking);"
     }
 
     return bytes;
@@ -428,9 +408,10 @@ static int64_t pipe_write(PAL_HANDLE handle, uint64_t offset, uint64_t len, cons
 
         if (!handle->pipe.ssl_ctx)
             return -PAL_ERROR_NOTCONNECTION;
-
-        bytes = _DkStreamSecureWrite(handle->pipe.ssl_ctx, buffer, len);
-	if (bytes < 0) SGX_DBG(DBG_E, "@@@@@@_DkStreamSecureWrite returns %ld\n", bytes);
+//        bytes = _DkStreamSecureWrite(handle->pipe.ssl_ctx, buffer, len);
+//	if (bytes < 0) SGX_DBG(DBG_E, "@@@@@@_DkStreamSecureWrite returns %ld\n", bytes);
+        bytes = _DkStreamSecureWrite(handle->pipe.ssl_ctx, buffer, len,
+                                     /*is_blocking=*/!handle->pipe.nonblocking);
     }
 
     return bytes;

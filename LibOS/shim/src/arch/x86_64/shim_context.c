@@ -45,16 +45,15 @@ void shim_xstate_init(void) {
     if (DkCpuIdRetrieve(CPUID_LEAF_PROCINFO, 0, value) < 0)
         goto out;
 
-    if (!(value[PAL_CPUID_WORD_ECX] & CPUID_FEATURE_XSAVE) ||
-        !(value[PAL_CPUID_WORD_ECX] & CPUID_FEATURE_OSXSAVE))
+    if (!(value[CPUID_WORD_ECX] & CPUID_FEATURE_XSAVE) ||
+        !(value[CPUID_WORD_ECX] & CPUID_FEATURE_OSXSAVE))
         goto out;
 
     if (DkCpuIdRetrieve(CPUID_LEAF_XSAVE, 0, value) < 0)
         goto out;
 
-    uint32_t xsavesize = value[PAL_CPUID_WORD_ECX];
-    uint64_t xfeatures = value[PAL_CPUID_WORD_EAX] |
-                         ((uint64_t)value[PAL_CPUID_WORD_EDX] << 32);
+    uint32_t xsavesize = value[CPUID_WORD_ECX];
+    uint64_t xfeatures = value[CPUID_WORD_EAX] | ((uint64_t)value[CPUID_WORD_EDX] << 32);
     if (!xsavesize || !xfeatures) {
         /* could not read xfeatures; fall back to old-style FXSAVE */
         goto out;
@@ -69,7 +68,7 @@ void shim_xstate_init(void) {
     g_shim_xsave_size      = xsavesize;
 
 out:
-    log_debug("LibOS xsave_enabled %d, xsave_size 0x%x(%u), xsave_features 0x%lx\n",
+    log_debug("LibOS xsave_enabled %d, xsave_size 0x%x(%u), xsave_features 0x%lx",
               g_shim_xsave_enabled, g_shim_xsave_size, g_shim_xsave_size, g_shim_xsave_features);
 }
 
@@ -275,7 +274,7 @@ void prepare_sigframe(PAL_CONTEXT* context, siginfo_t* siginfo, void* handler, v
      * register arguments in `rax`. */
     context->rax = 0;
 
-    log_debug("Created sigframe for sig: %d at %p (handler: %p, restorer: %p)\n",
+    log_debug("Created sigframe for sig: %d at %p (handler: %p, restorer: %p)",
               siginfo->si_signo, sigframe, handler, restorer);
 }
 

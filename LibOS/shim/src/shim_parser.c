@@ -284,7 +284,8 @@ struct parser_table {
     [__NR_capset] = {.slow = false, .name = "capset", .parser = {NULL}},
     [__NR_rt_sigpending] = {.slow = false, .name = "rt_sigpending", .parser = {parse_long_arg,
                             parse_pointer_arg, parse_pointer_arg}},
-    [__NR_rt_sigtimedwait] = {.slow = false, .name = "rt_sigtimedwait", .parser = {NULL}},
+    [__NR_rt_sigtimedwait] = {.slow = true, .name = "rt_sigtimedwait", .parser = {parse_long_arg,
+                              parse_sigmask, parse_pointer_arg, parse_timespec, parse_pointer_arg}},
     [__NR_rt_sigqueueinfo] = {.slow = false, .name = "rt_sigqueueinfo", .parser = {NULL}},
     [__NR_rt_sigsuspend] = {.slow = true, .name = "rt_sigsuspend", .parser = {parse_long_arg,
                             parse_pointer_arg, parse_pointer_arg}},
@@ -898,13 +899,13 @@ static void parse_exec_args(struct print_buf* buf, va_list* ap) {
     buf_puts(buf, "[");
 
     for (;; args++) {
-        if (test_user_memory(args, sizeof(*args), false)) {
+        if (!is_user_memory_readable(args, sizeof(*args))) {
             buf_printf(buf, "(invalid-argv %p)", args);
             break;
         }
         if (*args == NULL)
             break;
-        if (test_user_string(*args)) {
+        if (!is_user_string_readable(*args)) {
             buf_printf(buf, "(invalid-addr %p),", *args);
             continue;
         }
@@ -927,13 +928,13 @@ static void parse_exec_envp(struct print_buf* buf, va_list* ap) {
 
     int cnt = 0;
     for (; cnt < 2; cnt++, envp++) {
-        if (test_user_memory(envp, sizeof(*envp), false)) {
+        if (!is_user_memory_readable(envp, sizeof(*envp))) {
             buf_printf(buf, "(invalid-envp %p)", envp);
             break;
         }
         if (*envp == NULL)
             break;
-        if (test_user_string(*envp)) {
+        if (!is_user_string_readable(*envp)) {
             buf_printf(buf, "(invalid-addr %p),", *envp);
             continue;
         }
@@ -950,7 +951,7 @@ static void parse_exec_envp(struct print_buf* buf, va_list* ap) {
 static void parse_pipe_fds(struct print_buf* buf, va_list* ap) {
     int* fds = va_arg(*ap, int*);
 
-    if (test_user_memory(fds, 2 * sizeof(*fds), false)) {
+    if (!is_user_memory_readable(fds, 2 * sizeof(*fds))) {
         buf_printf(buf, "[invalid-addr %p]", fds);
         return;
     }
@@ -971,7 +972,7 @@ static void parse_sigmask(struct print_buf* buf, va_list* ap) {
         return;
     }
 
-    if (test_user_memory(sigset, sizeof(*sigset), false)) {
+    if (!is_user_memory_readable(sigset, sizeof(*sigset))) {
         buf_printf(buf, "(invalid-addr %p)", sigset);
         return;
     }
@@ -1081,7 +1082,7 @@ static void parse_timespec(struct print_buf* buf, va_list* ap) {
         return;
     }
 
-    if (test_user_memory((void*)tv, sizeof(*tv), false)) {
+    if (!is_user_memory_readable((void*)tv, sizeof(*tv))) {
         buf_printf(buf, "(invalid-addr %p)", tv);
         return;
     }
@@ -1097,7 +1098,7 @@ static void parse_sockaddr(struct print_buf* buf, va_list* ap) {
         return;
     }
 
-    if (test_user_memory((void*)addr, sizeof(*addr), false)) {
+    if (!is_user_memory_readable((void*)addr, sizeof(*addr))) {
         buf_printf(buf, "(invalid-addr %p)", addr);
         return;
     }
@@ -1496,7 +1497,7 @@ static void parse_getrandom_flags(struct print_buf* buf, va_list* ap) {
 
 static void parse_string_arg(struct print_buf* buf, va_list* ap) {
     const char* arg = va_arg(*ap, const char*);
-    if (!test_user_string(arg)) {
+    if (is_user_string_readable(arg)) {
         buf_printf(buf, "\"%s\"", arg);
     } else {
         /* invalid memory region, print arg as ptr not string */
@@ -1542,9 +1543,9 @@ static void print_syscall_name(struct print_buf* buf, const char* name, unsigned
 
 void warn_unsupported_syscall(unsigned long sysno) {
     if (sysno < ARRAY_SIZE(syscall_parser_table) && syscall_parser_table[sysno].name)
-        log_warning("Unsupported system call %s\n", syscall_parser_table[sysno].name);
+        log_warning("Unsupported system call %s", syscall_parser_table[sysno].name);
     else
-        log_warning("Unsupported system call %lu\n", sysno);
+        log_warning("Unsupported system call %lu", sysno);
 }
 
 static int buf_write_all(const char* str, size_t size, void* arg) {
@@ -1553,12 +1554,12 @@ static int buf_write_all(const char* str, size_t size, void* arg) {
     /* Pass the buffer contents to log_trace(). Usually, that will be the whole message. However, if
      * the message is longer than the buffer, we will be called multiple times and the message will
      * be split across multiple log lines. */
-    log_trace("%.*s\n", (int)size, str);
+    log_trace("%.*s", (int)size, str);
     return 0;
 }
 
 void debug_print_syscall_before(unsigned long sysno, ...) {
-    if (g_log_level < PAL_LOG_TRACE)
+    if (g_log_level < LOG_LEVEL_TRACE)
         return;
 
     struct parser_table* parser = &syscall_parser_table[sysno];
@@ -1592,7 +1593,7 @@ void debug_print_syscall_before(unsigned long sysno, ...) {
 }
 
 void debug_print_syscall_after(unsigned long sysno, ...) {
-    if (g_log_level < PAL_LOG_TRACE)
+    if (g_log_level < LOG_LEVEL_TRACE)
         return;
 
     struct parser_table* parser = &syscall_parser_table[sysno];

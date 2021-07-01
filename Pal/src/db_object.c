@@ -8,7 +8,6 @@
 #include "api.h"
 #include "atomic.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -46,16 +45,6 @@ void DkObjectClose(PAL_HANDLE objectHandle) {
     assert(objectHandle);
 
     _DkObjectClose(objectHandle);
-}
-
-/* Wait on a synchronization handle and return `0` if this handle's event was triggered,
- * otherwise return negative error code. */
-int DkSynchronizationObjectWait(PAL_HANDLE handle, PAL_NUM timeout_us) {
-    if (!handle) {
-        return -PAL_ERROR_INVAL;
-    }
-
-    return _DkSynchronizationObjectWait(handle, timeout_us);
 }
 
 /* Wait for user-specified events of handles in the handle array. The wait can be timed out, unless

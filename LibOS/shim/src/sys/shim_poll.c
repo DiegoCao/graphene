@@ -14,6 +14,7 @@
 #include "shim_handle.h"
 #include "shim_internal.h"
 #include "shim_lock.h"
+#include "shim_signal.h"
 #include "shim_table.h"
 #include "shim_thread.h"
 #include "shim_utils.h"
@@ -182,12 +183,16 @@ static long _shim_do_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
     if (error == -EAGAIN) {
         /* `poll` returns 0 on timeout. */
         error = 0;
+    } else if (error == -EINTR) {
+        /* `poll`, `ppoll`, `select` and `pselect` are not restarted after being interrupted by
+         * a signal handler. */
+        error = -ERESTARTNOHAND;
     }
     return nrevents ? (long)nrevents : error;
 }
 
 long shim_do_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
-    if (test_user_memory(fds, sizeof(*fds) * nfds, true))
+    if (!is_user_memory_writable(fds, sizeof(*fds) * nfds))
         return -EFAULT;
 
     return _shim_do_poll(fds, nfds, timeout_ms);
@@ -215,10 +220,7 @@ long shim_do_select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* errorfd
             return shim_do_pause();
 
         /* special case of select(0, ..., tsv) used for sleep */
-        struct __kernel_timespec tsp;
-        tsp.tv_sec  = tsv->tv_sec;
-        tsp.tv_nsec = tsv->tv_usec * 1000;
-        return shim_do_nanosleep(&tsp, NULL);
+        return do_nanosleep(tsv->tv_sec * TIME_US_IN_S + tsv->tv_usec, NULL);
     }
 
     if (nfds < __NFDBITS) {

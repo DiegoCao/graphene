@@ -56,8 +56,8 @@ struct shim_vma {
 };
 
 static void copy_comment(struct shim_vma* vma, const char* comment) {
-    size_t len = MIN(sizeof(vma->comment), strlen(comment) + 1);
-    memcpy(vma->comment, comment, len);
+    size_t size = MIN(sizeof(vma->comment), strlen(comment) + 1);
+    memcpy(vma->comment, comment, size);
     vma->comment[sizeof(vma->comment) - 1] = '\0';
 }
 
@@ -160,11 +160,11 @@ static bool _traverse_vmas_in_range(uintptr_t begin, uintptr_t end, traverse_vis
         return true;
 
     struct shim_vma* vma = _lookup_vma(begin);
-    if (!vma || vma->begin >= end)
+    if (!vma || end <= vma->begin)
         return false;
 
     struct shim_vma* prev = NULL;
-    bool is_continuous = true;
+    bool is_continuous = vma->begin <= begin;
 
     while (1) {
         if (!visitor(vma, visitor_arg))
@@ -172,8 +172,8 @@ static bool _traverse_vmas_in_range(uintptr_t begin, uintptr_t end, traverse_vis
 
         prev = vma;
         vma = _get_next_vma(vma);
-        if (!vma || vma->begin >= end) {
-            is_continuous &= prev->end >= end;
+        if (!vma || end <= vma->begin) {
+            is_continuous &= end <= prev->end;
             break;
         }
 
@@ -219,9 +219,9 @@ static int _vma_bkeep_remove(uintptr_t begin, uintptr_t end, bool is_internal,
     while (vma && vma->begin < end) {
         if (!!(vma->flags & VMA_INTERNAL) != is_internal) {
             if (is_internal) {
-                log_warning("LibOS tried to free a user vma!\n");
+                log_warning("LibOS tried to free a user vma!");
             } else {
-                log_warning("user app tried to free an internal vma!\n");
+                log_warning("user app tried to free an internal vma!");
             }
             return -EACCES;
         }
@@ -234,7 +234,7 @@ static int _vma_bkeep_remove(uintptr_t begin, uintptr_t end, bool is_internal,
     if (vma->begin < begin) {
         if (end < vma->end) {
             if (!new_vma_ptr) {
-                log_warning("need an additional vma to free this range!\n");
+                log_warning("need an additional vma to free this range!");
                 return -ENOMEM;
             }
             struct shim_vma* new_vma = *new_vma_ptr;
@@ -303,7 +303,7 @@ static void* _vma_malloc(size_t size) {
                                 &vmas_to_free);
         spinlock_unlock(&vma_tree_lock);
         if (ret < 0) {
-            log_error("Removing a vma we just created failed with %d!\n", ret);
+            log_error("Removing a vma we just created failed with %d!", ret);
             BUG();
         }
 
@@ -441,7 +441,7 @@ static struct shim_vma* alloc_vma(void) {
         struct shim_vma tmp_vma = {0};
         /* vma cache is empty, as we checked it before. */
         if (!add_to_thread_vma_cache(&tmp_vma)) {
-            log_error("Failed to add tmp vma to cache!\n");
+            log_error("Failed to add tmp vma to cache!");
             BUG();
         }
         if (!enlarge_mem_mgr(vma_mgr, size_align_up(DEFAULT_VMA_COUNT))) {
@@ -451,7 +451,7 @@ static struct shim_vma* alloc_vma(void) {
 
         struct shim_vma* vma_migrate = get_mem_obj_from_mgr(vma_mgr);
         if (!vma_migrate) {
-            log_error("Failed to allocate a vma right after enlarge_mem_mgr!\n");
+            log_error("Failed to allocate a vma right after enlarge_mem_mgr!");
             BUG();
         }
 
@@ -553,23 +553,23 @@ int init_vma(void) {
         assert(init_vmas[i].begin <= init_vmas[i].end);
         /* Skip empty areas. */
         if (init_vmas[i].begin == init_vmas[i].end) {
-            log_debug("Skipping bookkeeping of empty region at 0x%lx (comment: \"%s\")\n",
+            log_debug("Skipping bookkeeping of empty region at 0x%lx (comment: \"%s\")",
                       init_vmas[i].begin, init_vmas[i].comment);
             continue;
         }
         if (!IS_ALLOC_ALIGNED(init_vmas[i].begin) || !IS_ALLOC_ALIGNED(init_vmas[i].end)) {
-            log_error("Unaligned VMA region: 0x%lx-0x%lx (%s)\n", init_vmas[i].begin,
+            log_error("Unaligned VMA region: 0x%lx-0x%lx (%s)", init_vmas[i].begin,
                       init_vmas[i].end, init_vmas[i].comment);
             ret = -EINVAL;
             break;
         }
         ret = _bkeep_initial_vma(&init_vmas[i]);
         if (ret < 0) {
-            log_error("Failed to bookkeep initial VMA region 0x%lx-0x%lx (%s)\n",
+            log_error("Failed to bookkeep initial VMA region 0x%lx-0x%lx (%s)",
                       init_vmas[i].begin, init_vmas[i].end, init_vmas[i].comment);
             break;
         }
-        log_debug("Initial VMA region 0x%lx-0x%lx (%s) bookkeeped\n", init_vmas[i].begin,
+        log_debug("Initial VMA region 0x%lx-0x%lx (%s) bookkeeped", init_vmas[i].begin,
                   init_vmas[i].end, init_vmas[i].comment);
     }
     spinlock_unlock(&vma_tree_lock);
@@ -600,20 +600,20 @@ int init_vma(void) {
             gap = ALLOC_ALIGN_DOWN(gap % gap_max_size);
             g_aslr_addr_top = (char*)g_aslr_addr_top - gap;
 
-            log_debug("ASLR top address adjusted to %p\n", g_aslr_addr_top);
+            log_debug("ASLR top address adjusted to %p", g_aslr_addr_top);
         } else {
-            log_warning("Not enough space to make meaningful address space randomization.\n");
+            log_warning("Not enough space to make meaningful address space randomization.");
         }
     }
 
     /* We need 1 vma to create the memmgr. */
     if (!add_to_thread_vma_cache(&init_vmas[0])) {
-        log_error("Failed to add tmp vma to cache!\n");
+        log_error("Failed to add tmp vma to cache!");
         BUG();
     }
     vma_mgr = create_mem_mgr(DEFAULT_VMA_COUNT);
     if (!vma_mgr) {
-        log_error("Failed to create VMA memory manager!\n");
+        log_error("Failed to create VMA memory manager!");
         return -ENOMEM;
     }
 
@@ -1074,29 +1074,34 @@ out:
     return ret;
 }
 
-bool is_in_adjacent_user_vmas(void* addr, size_t length) {
+struct adj_visitor_ctx {
+    int prot;
+    bool is_ok;
+};
+
+static bool adj_visitor(struct shim_vma* vma, void* visitor_arg) {
+    struct adj_visitor_ctx* ctx = visitor_arg;
+    bool is_ok = !(vma->flags & (VMA_INTERNAL | VMA_UNMAPPED));
+    is_ok &= (vma->prot & ctx->prot) == ctx->prot;
+    ctx->is_ok &= is_ok;
+    return is_ok;
+}
+
+bool is_in_adjacent_user_vmas(const void* addr, size_t length, int prot) {
     uintptr_t begin = (uintptr_t)addr;
     uintptr_t end = begin + length;
-    bool ret = false;
+    assert(begin <= end);
+
+    struct adj_visitor_ctx ctx = {
+        .prot = prot,
+        .is_ok = true,
+    };
 
     spinlock_lock(&vma_tree_lock);
-    struct shim_vma* vma = _lookup_vma(begin);
-    if (!vma || begin < vma->begin || (vma->flags & (VMA_INTERNAL | VMA_UNMAPPED))) {
-        goto out;
-    }
-
-    while (vma->end < end) {
-        struct shim_vma* next = _get_next_vma(vma);
-        if (!next || vma->end != next->begin || (next->flags & (VMA_INTERNAL | VMA_UNMAPPED))) {
-            goto out;
-        }
-        vma = next;
-    }
-
-    ret = true;
-out:
+    bool is_continuous = _traverse_vmas_in_range(begin, end, adj_visitor, &ctx);
     spinlock_unlock(&vma_tree_lock);
-    return ret;
+
+    return is_continuous && ctx.is_ok;
 }
 
 static size_t dump_all_vmas_with_buf(struct shim_vma_info* infos, size_t max_count,
@@ -1279,7 +1284,7 @@ BEGIN_RS_FUNC(vma) {
     void* need_mapped = (void*)GET_CP_ENTRY(ADDR);
     CP_REBASE(vma->file);
 
-    DEBUG_RS("vma: %p-%p flags 0x%x prot 0x%08x comment \"%s\"\n", vma->addr,
+    DEBUG_RS("vma: %p-%p flags 0x%x prot 0x%08x comment \"%s\"", vma->addr,
              vma->addr + vma->length, vma->flags, vma->prot, vma->comment);
 
     int ret = bkeep_mmap_fixed(vma->addr, vma->length, vma->prot, vma->flags | MAP_FIXED, vma->file,
@@ -1289,7 +1294,7 @@ BEGIN_RS_FUNC(vma) {
 
     if (!(vma->flags & VMA_UNMAPPED)) {
         if (vma->file) {
-            struct shim_mount* fs = vma->file->fs;
+            struct shim_fs* fs = vma->file->fs;
             get_handle(vma->file);
 
             if (need_mapped < vma->addr + vma->length) {
@@ -1324,18 +1329,10 @@ BEGIN_RS_FUNC(vma) {
         }
 
         if (need_mapped < vma->addr + vma->length) {
-            log_error("vma %p-%p cannot be allocated!\n", need_mapped, vma->addr + vma->length);
+            log_error("vma %p-%p cannot be allocated!", need_mapped, vma->addr + vma->length);
             return -ENOMEM;
         }
     }
-
-    if (vma->file)
-        DEBUG_RS("%p-%p,size=%ld,prot=%08x,flags=%08x,off=%ld,path=%s,uri=%s", vma->addr,
-                 vma->addr + vma->length, vma->length, vma->prot, vma->flags, vma->file_offset,
-                 qstrgetstr(&vma->file->path), qstrgetstr(&vma->file->uri));
-    else
-        DEBUG_RS("%p-%p,size=%ld,prot=%08x,flags=%08x,off=%ld", vma->addr, vma->addr + vma->length,
-                 vma->length, vma->prot, vma->flags, vma->file_offset);
 }
 END_RS_FUNC(vma)
 
@@ -1362,7 +1359,7 @@ END_CP_FUNC_NO_RS(all_vmas)
 
 
 static void debug_print_vma(struct shim_vma* vma) {
-    log_debug("[0x%lx-0x%lx] prot=0x%x flags=0x%x%s%s file=%p (offset=%ld)%s%s\n",
+    log_debug("[0x%lx-0x%lx] prot=0x%x flags=0x%x%s%s file=%p (offset=%ld)%s%s",
               vma->begin, vma->end,
               vma->prot,
               vma->flags & ~(VMA_INTERNAL | VMA_UNMAPPED),

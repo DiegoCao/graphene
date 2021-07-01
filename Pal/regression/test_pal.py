@@ -55,7 +55,7 @@ class TC_00_BasicSet2(RegressionTestCase):
 
     def test_Pie(self):
         stdout, stderr = self.run_binary(['Pie'])
-        self.assertIn('start program: file:Pie', stderr)
+        self.assertIn('start program: Pie', stderr)
         self.assertIn('Hello World', stdout)
 
     def test_Process4(self):
@@ -80,12 +80,6 @@ class TC_00_BasicSet2(RegressionTestCase):
         self.assertIn('Leave main thread', stderr)
         self.assertIn('Leave thread', stderr)
 
-    def test_Sleep(self):
-        _, stderr = self.run_binary(['Sleep'], timeout=3)
-        self.assertIn('Enter Main Thread', stderr)
-        self.assertIn('Sleeping 3000000 microsecond...', stderr)
-        self.assertIn('Leave Main Thread', stderr)
-
     def test_Tcp(self):
         _, stderr = self.run_binary(['Tcp'])
         self.assertIn('start time = ', stderr)
@@ -102,22 +96,6 @@ class TC_00_BasicSet2(RegressionTestCase):
         self.assertIn('Hello World', stderr)
         self.assertIn('wall time = ', stderr)
 
-    def test_Wait(self):
-        _, stderr = self.run_binary(['Wait'])
-        self.assertIn('Enter Main Thread', stderr)
-        self.assertIn('DkStreamsWaitEvents did not return any events', stderr)
-        self.assertIn('Enter thread 2', stderr)
-        self.assertIn('Enter thread 1', stderr)
-        self.assertIn('Leave thread 2', stderr)
-        self.assertIn('Leave thread 1', stderr)
-
-    def test_Yield(self):
-        _, stderr = self.run_binary(['Yield'])
-        self.assertIn('Enter Parent Thread', stderr)
-        self.assertIn('Enter Child Thread', stderr)
-        self.assertIn('child yielded', stderr)
-        self.assertIn('parent yielded', stderr)
-
 
 class TC_01_Bootstrap(RegressionTestCase):
     def test_100_basic_boostrapping(self):
@@ -125,9 +103,6 @@ class TC_01_Bootstrap(RegressionTestCase):
 
         # Basic Bootstrapping
         self.assertIn('User Program Started', stderr)
-
-        # Control Block: Executable Name
-        self.assertIn('Loaded Executable: file:Bootstrap', stderr)
 
         # One Argument Given
         self.assertIn('# of Arguments: 1', stderr)
@@ -222,17 +197,14 @@ class TC_02_Symbols(RegressionTestCase):
         'DkStreamGetName',
         'DkStreamChangeName',
         'DkThreadCreate',
-        'DkThreadDelayExecution',
         'DkThreadYieldExecution',
         'DkThreadExit',
         'DkThreadResume',
         'DkSetExceptionHandler',
-        'DkMutexCreate',
-        'DkMutexRelease',
         'DkEventCreate',
         'DkEventSet',
         'DkEventClear',
-        'DkSynchronizationObjectWait',
+        'DkEventWait',
         'DkStreamsWaitEvents',
         'DkObjectClose',
         'DkSystemTimeQuery',
@@ -401,17 +373,6 @@ class TC_20_SingleProcess(RegressionTestCase):
         _, stderr = self.run_binary(['Event'])
         self.assertIn('TEST OK', stderr)
 
-    def test_210_semaphore(self):
-        _, stderr = self.run_binary(['Semaphore'])
-
-        # Semaphore: Timeout on Locked Semaphores
-        self.assertIn('Locked binary semaphore timed out (1000).', stderr)
-        self.assertIn('Locked binary semaphore timed out (0).', stderr)
-
-        # Semaphore: Acquire Unlocked Semaphores
-        self.assertIn('Locked binary semaphore successfully (-1).', stderr)
-        self.assertIn('Locked binary semaphore successfully (0).', stderr)
-
     def test_300_memory(self):
         _, stderr = self.run_binary(['Memory'])
 
@@ -577,13 +538,6 @@ class TC_21_ProcessCreation(RegressionTestCase):
         self.assertEqual(counter['Process Read 1: Hello World 1'], 3)
         self.assertEqual(counter['Process Write 2 OK'], 3)
         self.assertEqual(counter['Process Read 2: Hello World 2'], 3)
-
-    @unittest.skip("Temporarily broken, TODO: reenable after finishing loader rework")
-    def test_200_process2(self):
-        # Process Creation with a Different Binary
-        _, stderr = self.run_binary(['Process2'])
-        counter = collections.Counter(stderr.split('\n'))
-        self.assertEqual(counter['User Program Started'], 1)
 
     def test_300_process3(self):
         # Process Creation without Executable

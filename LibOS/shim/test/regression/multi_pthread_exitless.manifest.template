@@ -1,6 +1,6 @@
 loader.preload = "file:{{ graphene.libos }}"
 loader.env.LD_LIBRARY_PATH = "/lib"
-libos.entrypoint = "file:multi_pthread"
+libos.entrypoint = "multi_pthread"
 loader.argv0_override = "multi_pthread"
 
 fs.mount.lib.type = "chroot"
@@ -14,5 +14,5 @@ sgx.trusted_files.multi_pthread = "file:multi_pthread"
 sgx.thread_num = 8
 sgx.rpc_thread_num = 8
 
-sgx.nonpie_binary = 1
-sgx.enable_stats = 1
+sgx.nonpie_binary = true
+sgx.enable_stats = true

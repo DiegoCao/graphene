@@ -36,14 +36,11 @@
 /Preload1.so
 /Preload2.so
 /Process
-/Process2
 /Process3
 /Process4
 /Segment
 /Select
-/Semaphore
 /SendHandle
-/Sleep
 /Socket
 /Symbols
 /Tcp
@@ -51,8 +48,6 @@
 /Thread2
 /Thread2_exitless
 /Udp
-/Wait
-/Yield
 /normalize_path
 
 /test_file_0

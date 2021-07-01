@@ -11,12 +11,11 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
 
-int _DkProcessCreate(PAL_HANDLE* handle, const char* exec_uri, const char** args) {
+int _DkProcessCreate(PAL_HANDLE* handle, const char** args) {
     return -PAL_ERROR_NOTIMPLEMENTED;
 }
 

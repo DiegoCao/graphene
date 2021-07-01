@@ -6,19 +6,20 @@
 
 #include "assert.h"
 #include "linux_utils.h"
-#include "pal_debug.h"
+#include "pal.h"
 #include "pal_internal.h"
 #include "pal_linux.h"
 #include "perm.h"
 #include "sgx_log.h"
 
+/* NOTE: We could add "untrusted-pal" prefix to the below strings for more fine-grained log info */
 static const char* log_level_to_prefix[] = {
-    [PAL_LOG_NONE]    = "", // not a valid entry actually (no public wrapper uses this log level)
-    [PAL_LOG_ERROR]   = "error: ",
-    [PAL_LOG_WARNING] = "warning: ",
-    [PAL_LOG_DEBUG]   = "debug: ",
-    [PAL_LOG_TRACE]   = "trace: ",
-    [PAL_LOG_ALL]     = "", // same as for PAL_LOG_NONE
+    [LOG_LEVEL_NONE]    = "",
+    [LOG_LEVEL_ERROR]   = "error: ",
+    [LOG_LEVEL_WARNING] = "warning: ",
+    [LOG_LEVEL_DEBUG]   = "debug: ",
+    [LOG_LEVEL_TRACE]   = "trace: ",
+    [LOG_LEVEL_ALL]     = "", // not a valid entry actually (no public wrapper uses this log level)
 };
 
 int g_urts_log_level = PAL_LOG_DEFAULT_LEVEL;
@@ -52,20 +53,12 @@ static void print_to_fd(int fd, const char* prefix, const char* fmt, va_list ap)
     if (prefix)
         buf_puts(&buf, prefix);
     buf_vprintf(&buf, fmt, ap);
+    buf_printf(&buf, "\n");
     buf_flush(&buf);
-    // No error handling, as `_urts_log` doesn't return errors anyways.
+    // No error handling, as `pal_log` doesn't return errors anyways.
 }
 
-// TODO: Remove this and always use log_*.
-void pal_printf(const char* fmt, ...) {
-    va_list ap;
-
-    va_start(ap, fmt);
-    print_to_fd(g_urts_log_fd, /*prefix=*/NULL, fmt, ap);
-    va_end(ap);
-}
-
-void _urts_log(int level, const char* fmt, ...) {
+void pal_log(int level, const char* fmt, ...) {
     if (level <= g_urts_log_level) {
         va_list ap;
         va_start(ap, fmt);
@@ -73,11 +66,4 @@ void _urts_log(int level, const char* fmt, ...) {
         print_to_fd(g_urts_log_fd, log_level_to_prefix[level], fmt, ap);
         va_end(ap);
     }
-}
-
-void urts_log_always(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    print_to_fd(g_urts_log_fd, /*prefix=*/NULL, fmt, ap);
-    va_end(ap);
 }

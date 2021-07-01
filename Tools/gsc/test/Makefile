@@ -1,13 +1,16 @@
 DISTRIBUTIONS ?= ubuntu18.04
 
 TESTCASES ?= python3 python3-trusted-args base-python3 hello-world nodejs bash numpy pytorch
-MAXTESTNUM ?= 12
+MAXTESTNUM ?= 11
 TESTS = $(foreach D,$(DISTRIBUTIONS),$(foreach T,$(TESTCASES),$D-$T))
 
 GRAPHENE_REPO ?= https://github.com/oscarlab/graphene.git
-GRAPHENE_BRANCH ?= master
-SGXDRIVER_REPO ?= https://github.com/01org/linux-sgx-driver.git
-SGXDRIVER_BRANCH ?= sgx_driver_1.9
+GRAPHENE_BRANCH ?= "2e737e69f076c60918f87d6829bb769925e75fec" # last working commit
+
+# the below default values assume Linux 5.11+ with built-in SGX driver; see ../config.yaml.template
+# for different options (legacy driver, out-of-tree DCAP driver, in-kernel driver)
+SGXDRIVER_REPO ?=
+SGXDRIVER_BRANCH ?=
 
 DOCKER_BUILD_FLAGS ?= --rm --no-cache
 GSC_BUILD_FLAGS ?= --rm --no-cache
@@ -16,9 +19,9 @@ ENV_VARS ?=
 IMAGE_SUFFIX ?=
 
 # use "isgx" for legacy driver, "sgx/enclave" for DCAP driver, "sgx_enclave" for in-kernel driver
-INTEL_SGX_DEVICE ?= isgx
-# "gsgx" is needed on Linux before v5.9 (before FSGSBASE was merged), otherwise leave empty
-ADDITIONAL_DEVICES ?= --device=/dev/gsgx
+INTEL_SGX_DEVICE ?= sgx_enclave
+# use "--device=/dev/gsgx" on Linux 5.8- (before FSGSBASE was merged), otherwise leave empty
+ADDITIONAL_DEVICES ?=
 # use if AESM daemon from the host is needed (e.g. for remote attestation), otherwise leave empty
 ADDITIONAL_VOLUMES ?= --volume /var/run/aesmd/aesm.socket:/var/run/aesmd/aesm.socket
 
@@ -136,18 +139,12 @@ test-3-%: gsc-%-python3-trusted-args
 
 .PHONY: test-4-%
 test-4-%: gsc-%-python3
-	docker run $(addprefix -e , $(ENV_VARS)) $(DEVICES_VOLUMES) $(addsuffix $(IMAGE_SUFFIX), gsc-$*-python3) /graphene/Examples/scripts/fibonacci.py  2>&1 | tee out
-	grep -q "fib2              55" out
-	$(RM) out
-
-.PHONY: test-5-%
-test-5-%: gsc-%-python3
 	docker run $(addprefix -e , $(ENV_VARS)) $(DEVICES_VOLUMES) $(addsuffix $(IMAGE_SUFFIX), gsc-$*-python3) -c 'import os;os.system("ls")' 2>&1 | tee out
 	grep -q "entrypoint.manifest.sgx" out
 	$(RM) out
 
-.PHONY: test-6-%
-test-6-%: gsc-%-python3
+.PHONY: test-5-%
+test-5-%: gsc-%-python3
 	docker run $(addprefix -e , $(ENV_VARS)) $(DEVICES_VOLUMES) -d -p 8005:8005 $(addsuffix $(IMAGE_SUFFIX), gsc-$*-python3) /graphene/Examples/scripts/dummy-web-server.py 8005 | tee c.id
 	sleep 30
 	wget -q http://localhost:8005/ -O output
@@ -155,38 +152,38 @@ test-6-%: gsc-%-python3
 	cat c.id | head -n 1 | xargs docker container rm -f >/dev/null 2>/dev/null
 	$(RM) c.id output
 
-.PHONY: test-7-%
-test-7-%: gsc-%-hello-world
+.PHONY: test-6-%
+test-6-%: gsc-%-hello-world
 	docker run $(addprefix -e , $(ENV_VARS)) $(DEVICES_VOLUMES) $(addsuffix $(IMAGE_SUFFIX), gsc-$*-hello-world)  2>&1 | tee out
 	grep -q "Hello World!" out
 	$(RM) out
 
-.PHONY: test-8-%
-test-8-%: gsc-%-nodejs
+.PHONY: test-7-%
+test-7-%: gsc-%-nodejs
 	docker run $(addprefix -e , $(ENV_VARS)) $(DEVICES_VOLUMES) $(addsuffix $(IMAGE_SUFFIX), gsc-$*-nodejs) -e 'console.log("HelloWorld");' 2>&1 | tee out
 	grep -q "HelloWorld" out
 	$(RM) out
 
-.PHONY: test-9-%
-test-9-%: gsc-%-nodejs
+.PHONY: test-8-%
+test-8-%: gsc-%-nodejs
 	docker run $(addprefix -e , $(ENV_VARS)) $(DEVICES_VOLUMES) $(addsuffix $(IMAGE_SUFFIX), gsc-$*-nodejs) /graphene/Examples/helloworld.js 2>&1 | tee out
 	grep -q "Hello World" out
 	$(RM) out
 
-.PHONY: test-10-%
-test-10-%: gsc-%-numpy
+.PHONY: test-9-%
+test-9-%: gsc-%-numpy
 	docker run $(addprefix -e , $(ENV_VARS)) $(DEVICES_VOLUMES) $(addsuffix $(IMAGE_SUFFIX), gsc-$*-numpy) /graphene/Examples/scripts/test-numpy.py 2>&1 | tee out
 	grep -q "numpy version:" out
 	$(RM) out
 
-.PHONY: test-11-%
-test-11-%: gsc-%-bash
+.PHONY: test-10-%
+test-10-%: gsc-%-bash
 	docker run $(addprefix -e , $(ENV_VARS)) $(DEVICES_VOLUMES) $(addsuffix $(IMAGE_SUFFIX), gsc-$*-bash) -c 'ls' 2>&1 | tee out
 	grep -q "entrypoint.manifest.sgx" out
 	$(RM) out
 
-.PHONY: test-12-%
-test-12-%: gsc-%-pytorch
+.PHONY: test-11-%
+test-11-%: gsc-%-pytorch
 	touch result.txt
 	docker run $(addprefix -e , $(ENV_VARS)) $(DEVICES_VOLUMES) -v$${PWD}/result.txt:/graphene/Examples/result.txt $(addsuffix $(IMAGE_SUFFIX), gsc-$*-pytorch) pytorchexample.py
 	grep -q "('Labrador retriever'" result.txt

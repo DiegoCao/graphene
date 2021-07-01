@@ -27,12 +27,17 @@ static int g_clear_thread_exit = 1;
 static int g_ready = 0;
 
 static void thread_func(void* arg) {
+    PAL_HANDLE sleep_handle = NULL;
+    CHECK(DkEventCreate(&sleep_handle, /*init_signaled=*/false, /*auto_clear=*/false));
+
     PAL_HANDLE event = (PAL_HANDLE)arg;
     set(&g_ready, 1);
     wait_for(&g_ready, 2);
 
-    if (DkThreadDelayExecution(TIME_US_IN_S) != TIME_US_IN_S) {
-        pal_printf("Error: unexpected short sleep\n");
+    uint64_t timeout = TIME_US_IN_S;
+    int ret = DkEventWait(sleep_handle, &timeout);
+    if (ret != -PAL_ERROR_TRYAGAIN || timeout != 0) {
+        pal_printf("Error: unexpected short sleep, remaining time: %lu\n", timeout);
         DkProcessExit(1);
     }
 
@@ -46,12 +51,13 @@ int main(void) {
     CHECK(DkEventCreate(&event, /*init_signaled=*/true, /*auto_clear=*/true));
 
     /* Event is already set, should not sleep. */
-    CHECK(DkSynchronizationObjectWait(event, NO_TIMEOUT));
+    CHECK(DkEventWait(event, /*timeout=*/NULL));
 
     uint64_t start = 0;
     CHECK(DkSystemTimeQuery(&start));
     /* Sleep for one second. */
-    int ret = DkSynchronizationObjectWait(event, TIME_US_IN_S);
+    uint64_t timeout = TIME_US_IN_S;
+    int ret = DkEventWait(event, &timeout);
     if (ret != -PAL_ERROR_TRYAGAIN) {
         CHECK(-1);
     }
@@ -75,7 +81,7 @@ int main(void) {
     set(&g_ready, 2);
 
     CHECK(DkSystemTimeQuery(&start));
-    CHECK(DkSynchronizationObjectWait(event, NO_TIMEOUT));
+    CHECK(DkEventWait(event, /*timeout=*/NULL));
     CHECK(DkSystemTimeQuery(&end));
 
     if (end < start) {

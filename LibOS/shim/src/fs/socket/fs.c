@@ -96,7 +96,7 @@ static ssize_t socket_write(struct shim_handle* hdl, const void* buf, size_t cou
                 .si_code = SI_USER,
             };
             if (kill_current_proc(&info) < 0) {
-                log_error("socket_write: failed to deliver a signal\n");
+                log_error("socket_write: failed to deliver a signal");
             }
         }
 
@@ -126,11 +126,6 @@ static int socket_hstat(struct shim_handle* hdl, struct stat* stat) {
     stat->st_size = (off_t)attr.pending_size;
     stat->st_mode = S_IFSOCK;
 
-    return 0;
-}
-
-static int socket_checkout(struct shim_handle* hdl) {
-    hdl->fs = NULL;
     return 0;
 }
 
@@ -198,7 +193,7 @@ static off_t socket_poll(struct shim_handle* hdl, int poll_type) {
 
 out:
     if (ret < 0) {
-        log_error("socket_poll failed (%ld)\n", ret);
+        log_error("socket_poll failed (%ld)", ret);
         sock->error = -ret;
     }
 
@@ -242,12 +237,11 @@ struct shim_fs_ops socket_fs_ops = {
     .read     = &socket_read,
     .write    = &socket_write,
     .hstat    = &socket_hstat,
-    .checkout = &socket_checkout,
     .poll     = &socket_poll,
     .setflags = &socket_setflags,
 };
 
-struct shim_mount socket_builtin_fs = {
-    .type   = "socket",
+struct shim_fs socket_builtin_fs = {
+    .name   = "socket",
     .fs_ops = &socket_fs_ops,
 };

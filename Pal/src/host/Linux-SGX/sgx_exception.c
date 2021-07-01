@@ -142,16 +142,16 @@ static void handle_sync_signal(int signum, siginfo_t* info, struct ucontext* uc)
     unsigned long rip = ucontext_get_ip(uc);
     switch (signum) {
         case SIGSEGV:
-            urts_log_error("Segmentation Fault in Untrusted Code (RIP = %08lx)\n", rip);
+            log_error("Segmentation Fault in Untrusted Code (RIP = %08lx)", rip);
             break;
         case SIGILL:
-            urts_log_error("Illegal Instruction in Untrusted Code (RIP = %08lx)\n", rip);
+            log_error("Illegal Instruction in Untrusted Code (RIP = %08lx)", rip);
             break;
         case SIGFPE:
-            urts_log_error("Arithmetic Exception in Untrusted Code (RIP = %08lx)\n", rip);
+            log_error("Arithmetic Exception in Untrusted Code (RIP = %08lx)", rip);
             break;
         case SIGBUS:
-            urts_log_error("Memory Mapping Exception in Untrusted Code (RIP = %08lx)\n", rip);
+            log_error("Memory Mapping Exception in Untrusted Code (RIP = %08lx)", rip);
             break;
     }
     INLINE_SYSCALL(exit_group, 1, 1);
@@ -246,4 +246,12 @@ int sgx_signal_setup(void) {
     ret = 0;
 err:
     return ret;
+}
+
+/* The below function is used by stack protector's __stack_chk_fail(), _FORTIFY_SOURCE's *_chk()
+ * functions and by assert.h's assert() defined in the common library. Thus it might be called by
+ * any PAL execution context, including this untrusted context. */
+noreturn void pal_abort(void) {
+    INLINE_SYSCALL(exit_group, 1, 1);
+    die_or_inf_loop();
 }

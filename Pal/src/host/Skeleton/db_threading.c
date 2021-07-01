@@ -7,7 +7,6 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -16,10 +15,6 @@
    inside the current process. The arguments callback and param
    specify the starting function and parameters */
 int _DkThreadCreate(PAL_HANDLE* handle, int (*callback)(void*), const void* param) {
-    return -PAL_ERROR_NOTIMPLEMENTED;
-}
-
-int _DkThreadDelayExecution(uint64_t* duration) {
     return -PAL_ERROR_NOTIMPLEMENTED;
 }
 

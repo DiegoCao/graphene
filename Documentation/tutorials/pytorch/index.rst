@@ -190,8 +190,8 @@ command-line arguments and environment variables into the enclave. We
 keep these work-arounds in this tutorial for simplicity, but this configuration
 must not be used in production::
 
-   loader.insecure__use_cmdline_argv = 1
-   loader.insecure__use_host_env = 1
+   loader.insecure__use_cmdline_argv = true
+   loader.insecure__use_host_env = true
 
 We mount the entire glibc host-level directory to the ``/lib`` directory seen
 inside Graphene. This trick allows to transparently replace standard C libraries
@@ -405,8 +405,8 @@ In real deployments, the user must replace this ``wrap-key`` with her own
 We also re-use the ``pf_crypt`` utility (with its ``libsgx_util.so`` helper
 library and required mbedTLS libraries) that encrypts/decrypts the files::
 
-   cp ../ra-tls-secret-prov/libsgx_util.so .
-   cp ../ra-tls-secret-prov/libmbed*.so* .
+   cp ../ra-tls-secret-prov/libs/libsgx_util.so .
+   cp ../ra-tls-secret-prov/libs/libmbed*.so* .
    cp ../ra-tls-secret-prov/pf_crypt .
 
 Let's also make sure that ``alexnet-pretrained.pt`` network-model file exists
@@ -434,7 +434,7 @@ The user must prepare the secret provisioning server and start it. For this,
 copy the secret provisioning executable and its helper library from
 ``Examples/ra-tls-secret-prov`` to the current directory::
 
-   cp ../ra-tls-secret-prov/libsecret_prov_verify_dcap.so .
+   cp ../ra-tls-secret-prov/libs/libsecret_prov_verify_dcap.so .
    cp ../ra-tls-secret-prov/secret_prov_server_dcap .
 
 Also, copy the server-identifying certificates so that in-Graphene secret
@@ -493,7 +493,7 @@ re-use the same ``certs/`` directory and specify ``localhost``. For more info on
 the used environment variables and other manifest options, see `here
 <https://github.com/oscarlab/graphene/tree/master/Pal/src/host/Linux-SGX/tools#secret-provisioning-libraries>`__::
 
-   sgx.remote_attestation = 1
+   sgx.remote_attestation = true
 
    loader.env.LD_PRELOAD = "libsecret_prov_attest.so"
    loader.env.SECRET_PROVISION_CONSTRUCTOR = "1"
@@ -509,7 +509,7 @@ the SGX enclave, Graphene instance, and the application running in it to the
 remote secret-provisioning server. Graphene needs to locate this library, so
 let's copy it to our working directory::
 
-   cp ../ra-tls-secret-prov/libsecret_prov_attest.so ./
+   cp ../ra-tls-secret-prov/libs/libsecret_prov_attest.so ./
 
 Building and Executing End-To-End PyTorch Example
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

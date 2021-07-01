@@ -7,14 +7,12 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
 
-/* Stream handler table: this table corresponds to all the
-   handle type supported by PAL. Threads, Semaphores and Events
-   are not streams, so they need no handler */
+/* Stream handler table: this table corresponds to all the handle type supported by PAL. Threads
+ * are not streams, so they need no handler. */
 extern struct handle_ops g_file_ops;
 extern struct handle_ops g_pipe_ops;
 extern struct handle_ops g_pipeprv_ops;
@@ -25,7 +23,6 @@ extern struct handle_ops g_udp_ops;
 extern struct handle_ops g_udpsrv_ops;
 extern struct handle_ops g_thread_ops;
 extern struct handle_ops g_proc_ops;
-extern struct handle_ops g_mutex_ops;
 extern struct handle_ops g_event_ops;
 extern struct handle_ops g_eventfd_ops;
 
@@ -43,7 +40,6 @@ const struct handle_ops* g_pal_handle_ops[PAL_HANDLE_TYPE_BOUND] = {
     [pal_type_udpsrv]  = &g_udpsrv_ops,
     [pal_type_process] = &g_proc_ops,
     [pal_type_thread]  = &g_thread_ops,
-    [pal_type_mutex]   = &g_mutex_ops,
     [pal_type_event]   = &g_event_ops,
     [pal_type_eventfd] = &g_eventfd_ops,
 };
@@ -302,17 +298,19 @@ int DkStreamWrite(PAL_HANDLE handle, PAL_NUM offset, PAL_NUM* count, PAL_PTR buf
    of streams by their URI */
 int _DkStreamAttributesQuery(const char* uri, PAL_STREAM_ATTR* attr) {
     struct handle_ops* ops = NULL;
-    char* type             = NULL;
+    char* type = NULL;
 
     int ret = parse_stream_uri(&uri, &type, &ops);
-
     if (ret < 0)
         return ret;
 
-    if (!ops->attrquery)
-        return -PAL_ERROR_NOTSUPPORT;
+    if (!ops->attrquery) {
+        ret = -PAL_ERROR_NOTSUPPORT;
+        goto out;
+    }
 
     ret = ops->attrquery(type, uri, attr);
+out:
     free(type);
     return ret;
 }
@@ -402,6 +400,7 @@ int DkStreamGetName(PAL_HANDLE handle, PAL_PTR buffer, PAL_NUM size) {
 /* _DkStreamMap for internal use. Map specific handle to certain memory,
    with given protection, offset and size */
 int _DkStreamMap(PAL_HANDLE handle, void** paddr, int prot, uint64_t offset, uint64_t size) {
+    assert(IS_ALLOC_ALIGNED(offset));
     void* addr = *paddr;
     int ret;
 
@@ -425,6 +424,9 @@ int _DkStreamMap(PAL_HANDLE handle, void** paddr, int prot, uint64_t offset, uin
 int DkStreamMap(PAL_HANDLE handle, PAL_PTR* addr, PAL_FLG prot, PAL_NUM offset, PAL_NUM size) {
     assert(addr);
     void* map_addr = *addr;
+
+    /* TODO: we must not allow NULL addresses here, but sendfile() in LibOS does it -- it must be
+     *       re-written and then this function should enforce `map_addr != NULL` */
 
     if (!handle) {
         return -PAL_ERROR_INVAL;
@@ -531,12 +533,11 @@ int DkReceiveHandle(PAL_HANDLE handle, PAL_HANDLE* cargo) {
 
 int DkStreamChangeName(PAL_HANDLE hdl, PAL_STR uri) {
     struct handle_ops* ops = NULL;
-    char* type             = NULL;
+    char* type = NULL;
     int ret;
 
     if (uri) {
         ret = parse_stream_uri(&uri, &type, &ops);
-
         if (ret < 0) {
             return ret;
         }
@@ -545,11 +546,12 @@ int DkStreamChangeName(PAL_HANDLE hdl, PAL_STR uri) {
     const struct handle_ops* hops = HANDLE_OPS(hdl);
 
     if (!hops || !hops->rename || (ops && hops != ops)) {
-        free(type);
-        return -PAL_ERROR_NOTSUPPORT;
+        ret = -PAL_ERROR_NOTSUPPORT;
+        goto out;
     }
 
     ret = hops->rename(hdl, type, uri);
+out:
     free(type);
     return ret;
 }

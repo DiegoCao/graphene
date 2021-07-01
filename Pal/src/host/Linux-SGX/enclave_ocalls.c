@@ -27,9 +27,9 @@
 #include <stdint.h>
 
 #include "api.h"
+#include "cpu.h"
 #include "ecall_types.h"
 #include "ocall_types.h"
-#include "pal_debug.h"
 #include "pal_internal.h"
 #include "pal_linux.h"
 #include "pal_linux_error.h"
@@ -110,7 +110,7 @@ static long sgx_exitless_ocall(uint64_t code, void* ms) {
 
             WRITE_ONCE(ms->ms_futex, &req->lock.lock);
             WRITE_ONCE(ms->ms_op, FUTEX_WAIT_PRIVATE);
-            WRITE_ONCE(ms->ms_timeout_us, -1); /* never time out */
+            WRITE_ONCE(ms->ms_timeout_us, (uint64_t)-1); /* never time out */
 
             do {
                 /* at this point lock = LOCKED_*; before waiting on futex, need to move lock to
@@ -145,6 +145,11 @@ noreturn void ocall_exit(int exitcode, int is_exitgroup) {
 
     sgx_prepare_ustack();
     ms = sgx_alloc_on_ustack_aligned(sizeof(*ms), alignof(*ms));
+    if (!ms) {
+        /* We can't really recover from here. Should be unreachable without the host doing malicious
+         * things. */
+        die_or_inf_loop();
+    }
     WRITE_ONCE(ms->ms_exitcode, exitcode);
     WRITE_ONCE(ms->ms_is_exitgroup, is_exitgroup);
 
@@ -351,7 +356,7 @@ int ocall_cpuid(unsigned int leaf, unsigned int subleaf, unsigned int values[4])
 
 int ocall_open(const char* pathname, int flags, unsigned short mode) {
     int retval = 0;
-    size_t len = pathname ? strlen(pathname) + 1 : 0;
+    size_t path_size = pathname ? strlen(pathname) + 1 : 0;
     ms_ocall_open_t* ms;
 
     void* old_ustack = sgx_prepare_ustack();
@@ -363,7 +368,7 @@ int ocall_open(const char* pathname, int flags, unsigned short mode) {
 
     WRITE_ONCE(ms->ms_flags, flags);
     WRITE_ONCE(ms->ms_mode, mode);
-    void* untrusted_pathname = sgx_copy_to_ustack(pathname, len);
+    void* untrusted_pathname = sgx_copy_to_ustack(pathname, path_size);
     if (!untrusted_pathname) {
         sgx_reset_ustack(old_ustack);
         return -EPERM;
@@ -391,8 +396,12 @@ int ocall_close(int fd) {
 
     WRITE_ONCE(ms->ms_fd, fd);
 
-    /* note that close() must not be retried on -EINTR, see e.g. https://lwn.net/Articles/576478 */
-    retval = sgx_exitless_ocall(OCALL_CLOSE, ms);
+    /* We should never restart host-level `close` syscall on errors (including `EINTR`), but
+     * `sgx_ocall_close` does not forward any errors (always returns `0`), so this can only be
+     * an injected `EINTR`. */
+    do {
+        retval = sgx_exitless_ocall(OCALL_CLOSE, ms);
+    } while (retval == -EINTR);
 
     sgx_reset_ustack(old_ustack);
     return retval;
@@ -756,7 +765,7 @@ int ocall_ftruncate(int fd, uint64_t length) {
 
 int ocall_mkdir(const char* pathname, unsigned short mode) {
     int retval = 0;
-    size_t len = pathname ? strlen(pathname) + 1 : 0;
+    size_t path_size = pathname ? strlen(pathname) + 1 : 0;
     ms_ocall_mkdir_t* ms;
 
     void* old_ustack = sgx_prepare_ustack();
@@ -767,7 +776,7 @@ int ocall_mkdir(const char* pathname, unsigned short mode) {
     }
 
     WRITE_ONCE(ms->ms_mode, mode);
-    void* untrusted_pathname = sgx_copy_to_ustack(pathname, len);
+    void* untrusted_pathname = sgx_copy_to_ustack(pathname, path_size);
     if (!untrusted_pathname) {
         sgx_reset_ustack(old_ustack);
         return -EPERM;
@@ -850,17 +859,18 @@ int ocall_resume_thread(void* tcs) {
 int ocall_clone_thread(void) {
     int retval = 0;
     void* dummy = NULL;
+    /* FIXME: if there was an EINTR, there may be an untrusted thread left over */
     do {
-        /* FIXME: if there was an EINTR, there may be an untrusted thread left over */
-        retval = sgx_exitless_ocall(OCALL_CLONE_THREAD, dummy);
+        /* clone must happen in the context of current (enclave) thread, cannot use exitless;
+         * in particular, the new (enclave) thread must have the same signal mask as the current
+         * enclave thread (and NOT signal mask of the RPC thread) */
+        retval = sgx_ocall(OCALL_CLONE_THREAD, dummy);
     } while (retval == -EINTR);
     return retval;
 }
 
-int ocall_create_process(const char* uri, size_t nargs, const char** args, int* stream_fd,
-                         unsigned int* pid) {
+int ocall_create_process(size_t nargs, const char** args, int* stream_fd, unsigned int* pid) {
     int retval = 0;
-    size_t ulen = strlen(uri) + 1;
     ms_ocall_create_process_t* ms;
 
     void* old_ustack = sgx_prepare_ustack();
@@ -870,17 +880,10 @@ int ocall_create_process(const char* uri, size_t nargs, const char** args, int* 
         return -EPERM;
     }
 
-    void* untrusted_uri = sgx_copy_to_ustack(uri, ulen);
-    if (!untrusted_uri) {
-        sgx_reset_ustack(old_ustack);
-        return -EPERM;
-    }
-    WRITE_ONCE(ms->ms_uri, untrusted_uri);
-
     WRITE_ONCE(ms->ms_nargs, nargs);
     for (size_t i = 0; i < nargs; i++) {
-        size_t len = args[i] ? strlen(args[i]) + 1 : 0;
-        void* unstrusted_arg = args[i] ? sgx_copy_to_ustack(args[i], len) : NULL;
+        size_t size = args[i] ? strlen(args[i]) + 1 : 0;
+        void* unstrusted_arg = args[i] ? sgx_copy_to_ustack(args[i], size) : NULL;
 
         if (args[i] && !unstrusted_arg) {
             sgx_reset_ustack(old_ustack);
@@ -905,7 +908,7 @@ int ocall_create_process(const char* uri, size_t nargs, const char** args, int* 
     return retval;
 }
 
-int ocall_futex(uint32_t* futex, int op, int val, int64_t timeout_us) {
+int ocall_futex(uint32_t* futex, int op, int val, uint64_t* timeout_us) {
     int retval = 0;
     ms_ocall_futex_t* ms;
 
@@ -928,7 +931,7 @@ int ocall_futex(uint32_t* futex, int op, int val, int64_t timeout_us) {
     WRITE_ONCE(ms->ms_futex, futex);
     WRITE_ONCE(ms->ms_op, op);
     WRITE_ONCE(ms->ms_val, val);
-    WRITE_ONCE(ms->ms_timeout_us, timeout_us);
+    WRITE_ONCE(ms->ms_timeout_us, timeout_us ? *timeout_us : (uint64_t)-1);
 
     if (op == FUTEX_WAIT) {
         /* With `FUTEX_WAIT` this thread is most likely going to sleep, so there is no point in
@@ -937,6 +940,18 @@ int ocall_futex(uint32_t* futex, int op, int val, int64_t timeout_us) {
     } else {
         assert(op == FUTEX_WAKE);
         retval = sgx_exitless_ocall(OCALL_FUTEX, ms);
+    }
+
+    if (timeout_us) {
+        uint64_t remaining_time = READ_ONCE(ms->ms_timeout_us);
+        if (retval == -ETIMEDOUT) {
+            remaining_time = 0;
+        }
+        if (remaining_time > *timeout_us) {
+            retval = -EPERM;
+        } else {
+            *timeout_us = remaining_time;
+        }
     }
 
     sgx_reset_ustack(old_ustack);
@@ -1344,35 +1359,13 @@ int ocall_gettime(uint64_t* microsec) {
     return retval;
 }
 
-int ocall_sleep(uint64_t* microsec) {
-    int retval = 0;
-    ms_ocall_sleep_t* ms;
-
+void ocall_sched_yield(void) {
     void* old_ustack = sgx_prepare_ustack();
-    ms = sgx_alloc_on_ustack_aligned(sizeof(*ms), alignof(*ms));
-    if (!ms) {
-        retval = -EPERM;
-        goto out;
-    }
 
-    WRITE_ONCE(ms->ms_microsec, microsec ? *microsec : 0);
+    /* NOTE: no reason to use exitless for `sched_yield` and it always succeeds. */
+    (void)sgx_ocall(OCALL_SCHED_YIELD, NULL);
 
-    /* NOTE: no reason to use exitless for sleep() */
-    retval = sgx_ocall(OCALL_SLEEP, ms);
-    if (microsec) {
-        if (retval) {
-            uint64_t untrusted_microsec_remaining = READ_ONCE(ms->ms_microsec);
-            if (*microsec < untrusted_microsec_remaining) {
-                retval = -EPERM;
-                goto out;
-            }
-            *microsec -= untrusted_microsec_remaining;
-        }
-    }
-
-out:
     sgx_reset_ustack(old_ustack);
-    return retval;
 }
 
 int ocall_poll(struct pollfd* fds, size_t nfds, int64_t timeout_us) {
@@ -1415,8 +1408,8 @@ out:
 
 int ocall_rename(const char* oldpath, const char* newpath) {
     int retval = 0;
-    int oldlen = oldpath ? strlen(oldpath) + 1 : 0;
-    int newlen = newpath ? strlen(newpath) + 1 : 0;
+    size_t old_size = oldpath ? strlen(oldpath) + 1 : 0;
+    size_t new_size = newpath ? strlen(newpath) + 1 : 0;
     ms_ocall_rename_t* ms;
 
     void* old_ustack = sgx_prepare_ustack();
@@ -1426,8 +1419,8 @@ int ocall_rename(const char* oldpath, const char* newpath) {
         return -EPERM;
     }
 
-    void* untrusted_oldpath = sgx_copy_to_ustack(oldpath, oldlen);
-    void* untrusted_newpath = sgx_copy_to_ustack(newpath, newlen);
+    void* untrusted_oldpath = sgx_copy_to_ustack(oldpath, old_size);
+    void* untrusted_newpath = sgx_copy_to_ustack(newpath, new_size);
     if (!untrusted_oldpath || !untrusted_newpath) {
         sgx_reset_ustack(old_ustack);
         return -EPERM;
@@ -1445,7 +1438,7 @@ int ocall_rename(const char* oldpath, const char* newpath) {
 
 int ocall_delete(const char* pathname) {
     int retval = 0;
-    size_t len = pathname ? strlen(pathname) + 1 : 0;
+    size_t path_size = pathname ? strlen(pathname) + 1 : 0;
     ms_ocall_delete_t* ms;
 
     void* old_ustack = sgx_prepare_ustack();
@@ -1455,7 +1448,7 @@ int ocall_delete(const char* pathname) {
         return -EPERM;
     }
 
-    void* untrusted_pathname = sgx_copy_to_ustack(pathname, len);
+    void* untrusted_pathname = sgx_copy_to_ustack(pathname, path_size);
     if (!untrusted_pathname) {
         sgx_reset_ustack(old_ustack);
         return -EPERM;
@@ -1474,7 +1467,7 @@ int ocall_debug_map_add(const char* name, void* addr) {
     int retval = 0;
 
 #ifdef DEBUG
-    size_t len = strlen(name) + 1;
+    size_t size = strlen(name) + 1;
     ms_ocall_debug_map_add_t* ms;
 
     void* old_ustack = sgx_prepare_ustack();
@@ -1484,7 +1477,7 @@ int ocall_debug_map_add(const char* name, void* addr) {
         return -EPERM;
     }
 
-    void* untrusted_name = sgx_copy_to_ustack(name, len);
+    void* untrusted_name = sgx_copy_to_ustack(name, size);
     if (!untrusted_name) {
         sgx_reset_ustack(old_ustack);
         return -EPERM;

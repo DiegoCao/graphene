@@ -15,7 +15,6 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -117,9 +116,6 @@ __attribute__((__optimize__("-fno-stack-protector"))) int pal_thread_init(void* 
     return 0;
 }
 
-/* _DkThreadCreate for internal use. Create an internal thread
-   inside the current process. The arguments callback and param
-   specify the starting function and parameters */
 int _DkThreadCreate(PAL_HANDLE* handle, int (*callback)(void*), const void* param) {
     int ret = 0;
     PAL_HANDLE hdl = NULL;
@@ -183,31 +179,6 @@ err:
     return ret;
 }
 
-int _DkThreadDelayExecution(uint64_t* duration_us) {
-    struct timespec sleeptime;
-    struct timespec remainingtime;
-
-    const uint64_t VERY_LONG_TIME_IN_US = (uint64_t)1000000 * 60 * 60 * 24 * 365 * 128;
-    if (*duration_us > VERY_LONG_TIME_IN_US) {
-        /* avoid overflow with time_t */
-        sleeptime.tv_sec  = VERY_LONG_TIME_IN_US / 1000000;
-        sleeptime.tv_nsec = 0;
-    } else {
-        sleeptime.tv_sec  = *duration_us / 1000000;
-        sleeptime.tv_nsec = (*duration_us - sleeptime.tv_sec * (uint64_t)1000000) * 1000;
-    }
-
-    int ret = INLINE_SYSCALL(nanosleep, 2, &sleeptime, &remainingtime);
-
-    if (ret < 0) {
-        PAL_NUM remaining = remainingtime.tv_sec * 1000000 + remainingtime.tv_nsec / 1000;
-        *duration_us -= remaining;
-        return -PAL_ERROR_INTERRUPTED;
-    }
-
-    return 0;
-}
-
 /* PAL call DkThreadYieldExecution. Yield the execution
    of the current thread. */
 void _DkThreadYieldExecution(void) {
@@ -246,7 +217,7 @@ noreturn void _DkThreadExit(int* clear_child_tid) {
     /* To make sure the compiler doesn't touch the stack after it was freed, need inline asm:
      *   1. Unlock g_thread_stack_lock (so that other threads can start re-using this stack)
      *   2. Set *clear_child_tid = 0 if clear_child_tid != NULL
-     *      (we thus inform LibOS, where async helper thread is waiting on this to wake up parent)
+     *      (we thus inform LibOS, where async worker thread is waiting on this to wake up parent)
      *   3. Exit thread */
     static_assert(sizeof(g_thread_stack_lock.lock) == 4,
                   "unexpected g_thread_stack_lock.lock size");

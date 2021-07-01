@@ -16,14 +16,7 @@ from sys import stderr
 import toml
 
 from . import _CONFIG_PKGLIBDIR
-
-try:
-    from . import _offsets as offs # pylint: disable=import-error
-except ImportError:
-    # when we're in repo, _offsets does not exist and pal-sgx-sign sets sys.path
-    # so we can import as follows
-    import generated_offsets as offs # pylint: disable=import-error
-
+from . import _offsets as offs # pylint: disable=import-error,no-name-in-module
 
 class ManifestError(Exception):
     pass
@@ -655,8 +648,7 @@ argparser.add_argument('--depend', '-depend',
                        action='store_true', required=False,
                        help='Generate dependency for Makefile')
 
-if _CONFIG_PKGLIBDIR[0] != '@':
-    argparser.set_defaults(libpal=os.path.join(_CONFIG_PKGLIBDIR, 'sgx/libpal.so'))
+argparser.set_defaults(libpal=os.path.join(_CONFIG_PKGLIBDIR, 'sgx/libpal.so'))
 
 def parse_args(args):
     args = argparser.parse_args(args)
@@ -689,15 +681,15 @@ def read_manifest(path):
     sgx.setdefault('thread_num', DEFAULT_THREAD_NUM)
     sgx.setdefault('isvprodid', 0)
     sgx.setdefault('isvsvn', 0)
-    sgx.setdefault('remote_attestation', 0)
-    sgx.setdefault('debug', 1)
-    sgx.setdefault('require_avx', 0)
-    sgx.setdefault('require_avx512', 0)
-    sgx.setdefault('require_mpx', 0)
-    sgx.setdefault('require_pkru', 0)
-    sgx.setdefault('support_exinfo', 0)
-    sgx.setdefault('nonpie_binary', 0)
-    sgx.setdefault('enable_stats', 0)
+    sgx.setdefault('remote_attestation', False)
+    sgx.setdefault('debug', True)
+    sgx.setdefault('require_avx', False)
+    sgx.setdefault('require_avx512', False)
+    sgx.setdefault('require_mpx', False)
+    sgx.setdefault('require_pkru', False)
+    sgx.setdefault('support_exinfo', False)
+    sgx.setdefault('nonpie_binary', False)
+    sgx.setdefault('enable_stats', False)
 
     loader = manifest.setdefault('loader', {})
     loader.setdefault('preload', '')
@@ -735,9 +727,9 @@ def main_sign(manifest, args):
     print(f'    misc_select: {attr["misc_select"].hex()}')
     print(f'    date:        {attr["year"]:04d}-{attr["month"]:02d}-{attr["day"]:02d}')
 
-    if manifest_sgx['remote_attestation'] == 1:
+    if manifest_sgx['remote_attestation']:
         spid = manifest_sgx.get('ra_client_spid', '')
-        linkable = manifest_sgx.get('ra_client_linkable', 0)
+        linkable = manifest_sgx.get('ra_client_linkable', False)
         print('SGX remote attestation:')
         if not spid:
             print('    DCAP/ECDSA')
@@ -758,7 +750,7 @@ def main_sign(manifest, args):
     # Populate memory areas
     memory_areas = get_memory_areas(attr, args)
 
-    if manifest_sgx['nonpie_binary'] == 1:
+    if manifest_sgx['nonpie_binary']:
         enclave_base = offs.DEFAULT_ENCLAVE_BASE
         enclave_heap_min = offs.MMAP_MIN_ADDR
     else:

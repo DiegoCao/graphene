@@ -4,14 +4,15 @@ include Makefile.am
 CFLAGS += \
 	-I. \
 	-I../.. \
+	-I../../../../common/include \
+	-I../../../../common/include/arch/$(ARCH) \
+	-I../../../../common/src/crypto/mbedtls/include \
 	-I../../../include \
 	-I../../../include/pal \
 	-I../../../include/arch/$(ARCH) \
 	-I../../../include/arch/$(ARCH)/Linux \
 	-I../../../include/host/Linux-SGX \
 	-I../../../include/host/Linux-common \
-	-I../../../include/lib \
-	-I../../../lib/crypto/mbedtls/include \
 	-Iprotected-files
 
 # Some of the code uses alignof on expressions, which is a GNU extension.
@@ -31,7 +32,7 @@ CFLAGS += $(defs)
 ASFLAGS += $(defs)
 
 commons_objs_encl = bogomips.o
-commons_objs_urts = file_utils.o main_exec_path.o topo_info.o
+commons_objs_urts = debug_map.o file_utils.o main_exec_path.o timespec_utils.o topo_info.o
 
 enclave-objs = \
 	db_devices.o \
@@ -42,7 +43,6 @@ enclave-objs = \
 	db_main.o \
 	db_memory.o \
 	db_misc.o \
-	db_mutex.o \
 	db_object.o \
 	db_pipes.o \
 	db_process.o \

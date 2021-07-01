@@ -41,8 +41,8 @@ long shim_do_rt_sigreturn(void);
 long shim_do_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg);
 long shim_do_pread64(int fd, char* buf, size_t count, loff_t pos);
 long shim_do_pwrite64(int fd, char* buf, size_t count, loff_t pos);
-long shim_do_readv(int fd, const struct iovec* vec, int vlen);
-long shim_do_writev(int fd, const struct iovec* vec, int vlen);
+long shim_do_readv(unsigned long fd, const struct iovec* vec, unsigned long vlen);
+long shim_do_writev(unsigned long fd, const struct iovec* vec, unsigned long vlen);
 long shim_do_access(const char* file, mode_t mode);
 long shim_do_pipe(int* fildes);
 long shim_do_select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* errorfds,
@@ -54,7 +54,7 @@ long shim_do_madvise(unsigned long start, size_t len_in, int behavior);
 long shim_do_dup(unsigned int fd);
 long shim_do_dup2(unsigned int oldfd, unsigned int newfd);
 long shim_do_pause(void);
-long shim_do_nanosleep(const struct __kernel_timespec* rqtp, struct __kernel_timespec* rmtp);
+long shim_do_nanosleep(struct __kernel_timespec* req, struct __kernel_timespec* rem);
 long shim_do_getitimer(int which, struct __kernel_itimerval* value);
 long shim_do_alarm(unsigned int seconds);
 long shim_do_setitimer(int which, struct __kernel_itimerval* value,
@@ -88,19 +88,12 @@ long shim_do_waitid(int which, pid_t id, siginfo_t* infop, int options, struct _
 long shim_do_wait4(pid_t pid, int* stat_addr, int options, struct __kernel_rusage* ru);
 long shim_do_kill(pid_t pid, int sig);
 long shim_do_uname(struct new_utsname* buf);
-long shim_do_semget(key_t key, int nsems, int semflg);
-long shim_do_semop(int semid, struct sembuf* sops, unsigned int nsops);
-long shim_do_semctl(int semid, int semnum, int cmd, unsigned long arg);
-long shim_do_msgget(key_t key, int msgflg);
-long shim_do_msgsnd(int msqid, const void* msgp, size_t msgsz, int msgflg);
-long shim_do_msgrcv(int msqid, void* msgp, size_t msgsz, long msgtyp, int msgflg);
-long shim_do_msgctl(int msqid, int cmd, struct msqid_ds* buf);
 long shim_do_fcntl(int fd, int cmd, unsigned long arg);
 long shim_do_fsync(int fd);
 long shim_do_fdatasync(int fd);
 long shim_do_truncate(const char* path, loff_t length);
 long shim_do_ftruncate(int fd, loff_t length);
-long shim_do_getdents(int fd, struct linux_dirent* buf, size_t count);
+long shim_do_getdents(int fd, struct linux_dirent* buf, unsigned int count);
 long shim_do_getcwd(char* buf, size_t size);
 long shim_do_chdir(const char* filename);
 long shim_do_fchdir(int fd);
@@ -132,6 +125,8 @@ long shim_do_setsid(void);
 long shim_do_getpgid(pid_t pid);
 long shim_do_getsid(pid_t pid);
 long shim_do_rt_sigpending(__sigset_t* set, size_t sigsetsize);
+long shim_do_rt_sigtimedwait(const __sigset_t* unblocked_ptr, siginfo_t* info,
+                             struct __kernel_timespec* timeout, size_t setsize);
 long shim_do_sigaltstack(const stack_t* ss, stack_t* oss);
 long shim_do_setpriority(int which, int who, int niceval);
 long shim_do_getpriority(int which, int who);
@@ -155,8 +150,6 @@ long shim_do_futex(int* uaddr, int op, int val, void* utime, int* uaddr2, int va
 long shim_do_sched_setaffinity(pid_t pid, unsigned int cpumask_size, unsigned long* user_mask_ptr);
 long shim_do_sched_getaffinity(pid_t pid, unsigned int cpumask_size, unsigned long* user_mask_ptr);
 long shim_do_set_tid_address(int* tidptr);
-long shim_do_semtimedop(int semid, struct sembuf* sops, unsigned int nsops,
-                        const struct timespec* timeout);
 long shim_do_epoll_create(int size);
 long shim_do_getdents64(int fd, struct linux_dirent64* buf, size_t count);
 long shim_do_epoll_wait(int epfd, struct __kernel_epoll_event* events, int maxevents,
@@ -164,8 +157,8 @@ long shim_do_epoll_wait(int epfd, struct __kernel_epoll_event* events, int maxev
 long shim_do_epoll_ctl(int epfd, int op, int fd, struct __kernel_epoll_event* event);
 long shim_do_clock_gettime(clockid_t which_clock, struct timespec* tp);
 long shim_do_clock_getres(clockid_t which_clock, struct timespec* tp);
-long shim_do_clock_nanosleep(clockid_t clock_id, int flags, const struct __kernel_timespec* rqtp,
-                             struct __kernel_timespec* rmtp);
+long shim_do_clock_nanosleep(clockid_t clock_id, int flags, struct __kernel_timespec* req,
+                             struct __kernel_timespec* rem);
 long shim_do_exit_group(int error_code);
 long shim_do_tgkill(int tgid, int pid, int sig);
 long shim_do_mbind(void* start, unsigned long len, int mode, unsigned long* nmask,

@@ -32,7 +32,7 @@
 /* TODO: 1024 handles/FDs is a small number for high-load servers (e.g., Linux has ~3M) */
 #define MAX_EPOLL_HANDLES 1024
 
-struct shim_mount epoll_builtin_fs;
+struct shim_fs epoll_builtin_fs;
 
 long shim_do_epoll_create1(int flags) {
     if ((flags & ~EPOLL_CLOEXEC))
@@ -43,7 +43,7 @@ long shim_do_epoll_create1(int flags) {
         return -ENOMEM;
 
     hdl->type = TYPE_EPOLL;
-    set_handle_fs(hdl, &epoll_builtin_fs);
+    hdl->fs = &epoll_builtin_fs;
 
     struct shim_epoll_handle* epoll = &hdl->info.epoll;
     epoll->fds_count = 0;
@@ -146,10 +146,8 @@ long shim_do_epoll_ctl(int epfd, int op, int fd, struct __kernel_epoll_event* ev
         return -EINVAL;
 
     if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD)
-        if (test_user_memory(event, sizeof(*event), false)) {
-            /* surprisingly, man(epoll_ctl) does not specify EFAULT if event is invalid so
-             * we re-use EINVAL; also note that EPOLL_CTL_DEL ignores event completely */
-            return -EINVAL;
+        if (!is_user_memory_readable(event, sizeof(*event))) {
+            return -EFAULT;
         }
 
     struct shim_handle* epoll_hdl = get_fd_handle(epfd, NULL, cur->handle_map);
@@ -199,7 +197,7 @@ long shim_do_epoll_ctl(int epfd, int op, int fd, struct __kernel_epoll_event* ev
                 goto out;
             }
 
-            log_debug("add fd %d (handle %p) to epoll handle %p\n", fd, hdl, epoll);
+            log_debug("add fd %d (handle %p) to epoll handle %p", fd, hdl, epoll);
             epoll_item->fd        = fd;
             epoll_item->events    = event->events;
             epoll_item->data      = event->data;
@@ -242,7 +240,7 @@ long shim_do_epoll_ctl(int epfd, int op, int fd, struct __kernel_epoll_event* ev
                         __atomic_store_n(&handle->needs_et_poll_out, true, __ATOMIC_RELEASE);
                     }
 
-                    log_debug("modified fd %d at epoll handle %p\n", fd, epoll);
+                    log_debug("modified fd %d at epoll handle %p", fd, epoll);
                     notify_epoll_waiters(epoll);
                     goto out;
                 }
@@ -256,7 +254,7 @@ long shim_do_epoll_ctl(int epfd, int op, int fd, struct __kernel_epoll_event* ev
             LISTP_FOR_EACH_ENTRY(epoll_item, &epoll->fds, list) {
                 if (epoll_item->fd == fd) {
                     struct shim_handle* hdl = epoll_item->handle;
-                    log_debug("delete fd %d (handle %p) from epoll handle %p\n", fd, hdl, epoll);
+                    log_debug("delete fd %d (handle %p) from epoll handle %p", fd, hdl, epoll);
 
                     /* unregister hdl (corresponding to FD) in epoll (corresponding to EPFD):
                      * - unbind hdl from epoll-item via the `back` list
@@ -295,7 +293,7 @@ long shim_do_epoll_wait(int epfd, struct __kernel_epoll_event* events, int maxev
     if (maxevents <= 0)
         return -EINVAL;
 
-    if (!events || test_user_memory(events, sizeof(*events) * maxevents, true))
+    if (!is_user_memory_writable(events, sizeof(*events) * maxevents))
         return -EFAULT;
 
     struct shim_handle* epoll_hdl = get_fd_handle(epfd, NULL, NULL);
@@ -414,6 +412,11 @@ long shim_do_epoll_wait(int epfd, struct __kernel_epoll_event* events, int maxev
         if (error && error != -EAGAIN) {
             unlock(&epoll_hdl->lock);
             put_handle(epoll_hdl);
+            if (error == -EINTR) {
+                /* `epoll_wait` and `epoll_pwait` are not restarted after being interrupted by
+                 * a signal handler. */
+                error = -ERESTARTNOHAND;
+            }
             return error;
         } else if (event_handle_update) {
             /* retry if epoll was updated concurrently (similar to Linux semantics) */
@@ -496,8 +499,8 @@ struct shim_fs_ops epoll_fs_ops = {
     .close = &epoll_close,
 };
 
-struct shim_mount epoll_builtin_fs = {
-    .type   = "epoll",
+struct shim_fs epoll_builtin_fs = {
+    .name   = "epoll",
     .fs_ops = &epoll_fs_ops,
 };
 
@@ -509,7 +512,7 @@ BEGIN_CP_FUNC(epoll_item) {
     LISTP_TYPE(shim_epoll_item)* new_list = (LISTP_TYPE(shim_epoll_item)*)objp;
     struct shim_epoll_item* epoll_item;
 
-    log_debug("checkpoint epoll: %p -> %p (base = 0x%08lx)\n", old_list, new_list, base);
+    log_debug("checkpoint epoll: %p -> %p (base = 0x%08lx)", old_list, new_list, base);
 
     INIT_LISTP(new_list);
 
@@ -546,10 +549,6 @@ BEGIN_RS_FUNC(epoll_item) {
         CP_REBASE(epoll_item->handle);
         CP_REBASE(epoll_item->back);
         CP_REBASE(epoll_item->list);
-
-        DEBUG_RS("fd=%d,path=%s,type=%s,uri=%s", epoll_item->fd,
-                 qstrgetstr(&epoll_item->handle->path), epoll_item->handle->fs_type,
-                 qstrgetstr(&epoll_item->handle->uri));
     }
 }
 END_RS_FUNC(epoll_item)

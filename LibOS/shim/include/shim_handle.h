@@ -22,7 +22,7 @@
 #include "list.h"
 #include "pal.h"
 #include "shim_defs.h"
-#include "shim_sysv.h"
+#include "shim_sync.h"
 #include "shim_types.h"
 
 /* Handle types. Many of these are used by a single filesystem. */
@@ -40,8 +40,6 @@ enum shim_handle_type {
     TYPE_SOCK,       /* sockets, used by `socket` filesystem */
 
     /* Special handles: */
-    TYPE_SEM,        /* System V semaphores, see `shim_semget.c` */
-    TYPE_MSG,        /* System V messages, see `shim_msgget.c` */
     TYPE_EPOLL,      /* epoll handles, see `shim_epoll.c` */
     TYPE_EVENTFD,    /* eventfd handles, used by `eventfd` filesystem */
 };
@@ -63,7 +61,6 @@ struct shim_file_data {
     struct atomic_int version;
     bool queried;
     enum shim_file_type type;
-    mode_t mode;
     struct atomic_int size;
     struct shim_qstr host_uri;
     unsigned long atime;
@@ -79,45 +76,12 @@ struct shim_file_handle {
     enum shim_file_type type;
     off_t size;
     off_t marker;
+
+    struct sync_handle* sync;
 };
 
 #define FILE_HANDLE_DATA(hdl)  ((hdl)->info.file.data)
 #define FILE_DENTRY_DATA(dent) ((struct shim_file_data*)(dent)->data)
-
-struct shim_dev_ops {
-    /* open: provide a filename relative to the mount point and flags,
-       modify the shim handle */
-    int (*open)(struct shim_handle* hdl, const char* name, int flags);
-
-    /* close: clean up the file state inside the handle */
-    int (*close)(struct shim_handle* hdl);
-
-    /* read: the content from the file opened as handle */
-    ssize_t (*read)(struct shim_handle* hdl, void* buf, size_t count);
-
-    /* write: the content from the file opened as handle */
-    ssize_t (*write)(struct shim_handle* hdl, const void* buf, size_t count);
-
-    /* flush: flush out user buffer */
-    int (*flush)(struct shim_handle* hdl);
-
-    /* seek: the content from the file opened as handle */
-    off_t (*seek)(struct shim_handle* hdl, off_t offset, int whence);
-
-    int (*truncate)(struct shim_handle* hdl, uint64_t len);
-
-    int (*mode)(const char* name, mode_t* mode);
-
-    /* stat, hstat: get status of the file */
-    int (*stat)(const char* name, struct stat* buf);
-    int (*hstat)(struct shim_handle* hdl, struct stat* buf);
-};
-
-int dev_update_dev_ops(struct shim_handle* hdl);
-
-struct shim_dev_handle {
-    struct shim_dev_ops dev_ops;
-};
 
 struct shim_pipe_handle {
     bool ready_for_ops; /* true for pipes, false for FIFOs that were mknod'ed but not open'ed */
@@ -197,71 +161,11 @@ struct shim_sock_handle {
     }* peek_buffer;
 };
 
-struct shim_dirent {
-    struct shim_dirent* next;
-    unsigned long ino; /* Inode number */
-    unsigned char type;
-    char name[]; /* File name (null-terminated) */
-};
-
-#define SHIM_DIRENT_SIZE      offsetof(struct shim_dirent, name)
-#define SHIM_DIRENT_ALIGNMENT alignof(struct shim_dirent)
-/* Size of struct shim_dirent instance together with alignment,
- * which might be different depending on the length of the name field */
-#define SHIM_DIRENT_ALIGNED_SIZE(len) ALIGN_UP(SHIM_DIRENT_SIZE + (len), SHIM_DIRENT_ALIGNMENT)
-
 struct shim_dir_handle {
-    int offset;
-    struct shim_dentry* dotdot;
-    struct shim_dentry* dot;
-    struct shim_dentry** buf;
-    struct shim_dentry** ptr;
-};
-
-struct msg_type;
-struct msg_item;
-struct msg_client;
-
-#define MAX_SYSV_CLIENTS 32
-
-DEFINE_LIST(shim_msg_handle);
-struct shim_msg_handle {
-    unsigned long msqkey; /* msg queue key from user */
-    IDTYPE msqid;         /* msg queue identifier */
-    bool owned;           /* owned by current process */
-    int perm;        /* access permissions */
-    bool deleted;    /* marking the queue deleted */
-    int nmsgs;       /* number of msgs */
-    int currentsize; /* current size in bytes */
-    struct msg_qobj* queue;
-    int queuesize;
-    int queueused;
-    struct msg_qobj* freed;
-    PAL_HANDLE event; /* event for waiting */
-    int ntypes;
-    int maxtypes;
-    struct msg_type* types;
-    LIST_TYPE(shim_msg_handle) key_hlist;
-    LIST_TYPE(shim_msg_handle) qid_hlist;
-};
-
-struct sem_objs;
-
-DEFINE_LIST(shim_sem_handle);
-struct shim_sem_handle {
-    unsigned long semkey;
-    IDTYPE semid;
-    bool owned;
-    int perm;
-    bool deleted;
-    PAL_HANDLE event;
-    int nsems;
-    struct sem_obj* sems;
-    int nreqs;
-    LISTP_TYPE(sem_ops) migrated;
-    LIST_TYPE(shim_sem_handle) list;
-    LIST_TYPE(shim_sem_handle) key_hlist;
-    LIST_TYPE(shim_sem_handle) sid_hlist;
+    /* The first two dentries are always "." and ".." */
+    struct shim_dentry** dents;
+    size_t count;
+    size_t pos;
 };
 
 struct shim_str_data {
@@ -306,7 +210,7 @@ struct shim_epoll_handle {
     LISTP_TYPE(shim_epoll_item) fds;
 };
 
-struct shim_mount;
+struct shim_fs;
 struct shim_qstr;
 struct shim_dentry;
 
@@ -318,9 +222,7 @@ struct shim_handle {
 
     REFTYPE ref_count;
 
-    char fs_type[8];
-    struct shim_mount* fs;
-    struct shim_qstr path;
+    struct shim_fs* fs;
     struct shim_dentry* dentry;
 
     /* If this handle is registered for any epoll handle, this list contains
@@ -342,15 +244,13 @@ struct shim_handle {
      * by using assert()) */
     union {
         struct shim_file_handle file;    /* TYPE_FILE */
-        struct shim_dev_handle dev;      /* TYPE_DEV */
+        /* (no data) */                  /* TYPE_DEV */
         struct shim_str_handle str;      /* TYPE_STR */
         /* (no data) */                  /* TYPE_PSEUDO */
 
         struct shim_pipe_handle pipe;    /* TYPE_PIPE */
         struct shim_sock_handle sock;    /* TYPE_SOCK */
 
-        struct shim_sem_handle sem;      /* TYPE_SEM */
-        struct shim_msg_handle msg;      /* TYPE_MSG */
         struct shim_epoll_handle epoll;  /* TYPE_EPOLL */
         /* (no data) */                  /* TYPE_EVENTFD */
     } info;
@@ -426,6 +326,8 @@ int walk_handle_map(int (*callback)(struct shim_fd_handle*, struct shim_handle_m
 
 int init_handle(void);
 int init_important_handles(void);
+
+int open_executable(struct shim_handle* hdl, const char* path);
 
 int get_file_size(struct shim_handle* file, uint64_t* size);
 

@@ -16,15 +16,15 @@
 #include "ecall_types.h"
 #include "list.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
 #include "pal_linux.h"
 #include "pal_linux_defs.h"
 #include "pal_linux_error.h"
+#include "spinlock.h"
 
-static PAL_LOCK g_thread_list_lock = LOCK_INIT;
+static spinlock_t g_thread_list_lock = INIT_SPINLOCK_UNLOCKED;
 DEFINE_LISTP(pal_handle_thread);
 static LISTP_TYPE(pal_handle_thread) g_thread_list = LISTP_INIT;
 
@@ -54,7 +54,7 @@ static PAL_IDX pal_assign_tid(void) {
 __attribute__((__optimize__("-fno-stack-protector"))) void pal_start_thread(void) {
     struct pal_handle_thread *new_thread = NULL, *tmp;
 
-    _DkInternalLock(&g_thread_list_lock);
+    spinlock_lock(&g_thread_list_lock);
     LISTP_FOR_EACH_ENTRY(tmp, &g_thread_list, list)
         if (!tmp->tcs) {
             new_thread = tmp;
@@ -63,7 +63,7 @@ __attribute__((__optimize__("-fno-stack-protector"))) void pal_start_thread(void
                              __ATOMIC_RELEASE);
             break;
         }
-    _DkInternalUnlock(&g_thread_list_lock);
+    spinlock_unlock(&g_thread_list_lock);
 
     if (!new_thread)
         return;
@@ -81,7 +81,7 @@ __attribute__((__optimize__("-fno-stack-protector"))) void pal_start_thread(void
     uint64_t stack_protector_canary;
     int ret = _DkRandomBitsRead(&stack_protector_canary, sizeof(stack_protector_canary));
     if (ret < 0) {
-        log_error("_DkRandomBitsRead() failed (%d)\n", ret);
+        log_error("_DkRandomBitsRead() failed (%d)", ret);
         _DkProcessExit(1);
     }
     pal_set_tcb_stack_canary(stack_protector_canary);
@@ -92,11 +92,11 @@ __attribute__((__optimize__("-fno-stack-protector"))) void pal_start_thread(void
     /* UNREACHABLE */
 }
 
-/* _DkThreadCreate for internal use. Create an internal thread
-   inside the current process. The arguments callback and param
-   specify the starting function and parameters */
 int _DkThreadCreate(PAL_HANDLE* handle, int (*callback)(void*), const void* param) {
+    int ret;
     PAL_HANDLE new_thread = malloc(HANDLE_SIZE(thread));
+    if (!new_thread)
+        return -PAL_ERROR_NOMEM;
     SET_HANDLE_TYPE(new_thread, thread);
     /*
      * tid will be filled later by pal_start_thread()
@@ -106,36 +106,44 @@ int _DkThreadCreate(PAL_HANDLE* handle, int (*callback)(void*), const void* para
     new_thread->thread.tcs = NULL;
     INIT_LIST_HEAD(&new_thread->thread, list);
     struct thread_param* thread_param = malloc(sizeof(struct thread_param));
+    if (!thread_param) {
+        ret = -PAL_ERROR_NOMEM;
+        goto out_err;
+    }
     thread_param->callback = callback;
     thread_param->param    = param;
     new_thread->thread.param = (void*)thread_param;
 
-    _DkInternalLock(&g_thread_list_lock);
+    spinlock_lock(&g_thread_list_lock);
     LISTP_ADD_TAIL(&new_thread->thread, &g_thread_list, list);
-    _DkInternalUnlock(&g_thread_list_lock);
+    spinlock_unlock(&g_thread_list_lock);
 
-    int ret = ocall_clone_thread();
-    if (ret < 0)
-        return unix_to_pal_error(ret);
+    ret = ocall_clone_thread();
+    if (ret < 0) {
+        ret = unix_to_pal_error(ret);
+        spinlock_lock(&g_thread_list_lock);
+        LISTP_DEL(&new_thread->thread, &g_thread_list, list);
+        spinlock_unlock(&g_thread_list_lock);
+        goto out_err;
+    }
 
     /* There can be subtle race between the parent and child so hold the parent until child updates
-       its tcs. */
+     * its tcs. */
     while (!__atomic_load_n(&new_thread->thread.tcs, __ATOMIC_ACQUIRE))
         CPU_RELAX();
 
     *handle = new_thread;
     return 0;
-}
-
-int _DkThreadDelayExecution(uint64_t* duration_us) {
-    int ret = ocall_sleep(duration_us);
-    return ret < 0 ? unix_to_pal_error(ret) : ret;
+out_err:
+    free(thread_param);
+    free(new_thread);
+    return ret;
 }
 
 /* PAL call DkThreadYieldExecution. Yield the execution
    of the current thread. */
 void _DkThreadYieldExecution(void) {
-    ocall_sleep(NULL);
+    ocall_sched_yield();
 }
 
 /* _DkThreadExit for internal use: Thread exiting */
@@ -150,9 +158,9 @@ noreturn void _DkThreadExit(int* clear_child_tid) {
 
     /* main thread is not part of the g_thread_list */
     if (exiting_thread != &g_pal_control.first_thread->thread) {
-        _DkInternalLock(&g_thread_list_lock);
+        spinlock_lock(&g_thread_list_lock);
         LISTP_DEL(exiting_thread, &g_thread_list, list);
-        _DkInternalUnlock(&g_thread_list_lock);
+        spinlock_unlock(&g_thread_list_lock);
     }
 
     ocall_exit(0, /*is_exitgroup=*/false);

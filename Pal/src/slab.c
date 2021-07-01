@@ -6,17 +6,18 @@
  */
 
 #include "api.h"
-#include "pal_debug.h"
+#include "pal.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
+#include "spinlock.h"
 
 static size_t g_slab_alignment;
-static PAL_LOCK g_slab_mgr_lock = LOCK_INIT;
+static spinlock_t g_slab_mgr_lock = INIT_SPINLOCK_UNLOCKED;
 
-#define SYSTEM_LOCK()   _DkInternalLock(&g_slab_mgr_lock)
-#define SYSTEM_UNLOCK() _DkInternalUnlock(&g_slab_mgr_lock)
-#define SYSTEM_LOCKED() _DkInternalIsLocked(&g_slab_mgr_lock)
+#define SYSTEM_LOCK()   spinlock_lock(&g_slab_mgr_lock)
+#define SYSTEM_UNLOCK() spinlock_unlock(&g_slab_mgr_lock)
+#define SYSTEM_LOCKED() spinlock_is_locked(&g_slab_mgr_lock)
 
 #if STATIC_SLAB == 1
 #define POOL_SIZE 64 * 1024 * 1024
@@ -72,7 +73,7 @@ static inline void* __malloc(size_t size) {
     int ret = _DkVirtualMemoryAlloc(&addr, ALLOC_ALIGN_UP(size), PAL_ALLOC_INTERNAL,
               PAL_PROT_READ | PAL_PROT_WRITE);
     if (ret < 0) {
-        log_error("*** Out-of-memory in PAL (try increasing `loader.pal_internal_mem_size`) ***\n");
+        log_error("*** Out-of-memory in PAL (try increasing `loader.pal_internal_mem_size`) ***");
         _DkProcessExit(ENOMEM);
     }
     return addr;
@@ -129,7 +130,7 @@ void* malloc(size_t size) {
          * If malloc() failed internally, we cannot handle the
          * condition and must terminate the current process.
          */
-        log_error("******** Out-of-memory in PAL ********\n");
+        log_error("******** Out-of-memory in PAL ********");
         _DkProcessExit(ENOMEM);
     }
     return ptr;

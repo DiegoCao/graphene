@@ -8,6 +8,8 @@
 #   e.g., use 'LDFLAGS-libsysdb.so=...' to specify libsysdb.so-specific linker flags
 #
 
+SCRIPTSDIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
 ifeq ("$(origin V)", "command line")
   BUILD_VERBOSE = $(V)
 endif
@@ -32,10 +34,6 @@ echo-cmd = $(if $($(quiet)cmd_$(1)), echo '  $(call escsq,$($(quiet)cmd_$(1)))';
 cmd = @$(echo-cmd) $(cmd_$(1))
 
 
-# pal map
-PAL_SYMBOL_FILE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/../Pal/src/pal-symbols
-PAL_SYMBOLS = $(shell sed -e 's|$$|;|g' $(PAL_SYMBOL_FILE))
-
 quiet_cmd_generated_offsets_s = [ $@ ]
       cmd_generated_offsets_s = $(CC) $(CFLAGS) -MD -MP -MF $@.d $(defs) -S $< -o $@
 
@@ -45,26 +43,9 @@ CLEAN_FILES += generated-offsets.s generated-offsets.s.d
 
 -include generated-offsets.s.d
 
-# Convert inline assembly into preprocessor directives.
-# The source line is something like:
-#     .ascii "GENERATED_INTEGER SHIM_TCB_OFF $8 "
-# (see the DEFINE macro Pal/include/pal/generated-offsets-build.h)
-#
-# Because of clang compatibility, we need to:
-# - generate the numbers with prefix ($) and strip it here, as clang doesn't support "%p"
-#   in inline assembly
-# - recognize both tab and space [ \t] after ".ascii"
-
 quiet_cmd_asm_offsets_h = [ $@ ]
       cmd_asm_offsets_h = \
-	(set -e; \
-	 echo "/* DO NOT MODIFY. THIS FILE WAS AUTO-GENERATED. */"; \
-	 echo "\#ifndef _ASM_OFFSETS_H_"; \
-	 echo "\#define _ASM_OFFSETS_H_"; \
-	 echo ""; \
-	 awk '/\.ascii[ \t]"GENERATED_INTEGER/{print "\#ifndef " $$3 "\n\#define " $$3 " " substr($$4,2) "\n\#endif"}' $^; \
-	 echo ""; \
-	 echo "\#endif") > $@
+    $(SCRIPTSDIR)/gen-offsets.py --output-h $@ $<
 
 asm-offsets.h: generated-offsets.s
 	$(call cmd,asm_offsets_h)
@@ -72,10 +53,7 @@ CLEAN_FILES += asm-offsets.h
 
 quiet_cmd_generated_offsets_py = [ $@ ]
       cmd_generated_offsets_py = \
-	(set -e; \
-	 echo "\# DO NOT MODIFY. THIS FILE WAS AUTO-GENERATED."; \
-	 echo ""; \
-	 awk '/\.ascii[ \t]"GENERATED_INTEGER/{print $$3 " = " substr($$4,2)}' $^) > $@
+    $(SCRIPTSDIR)/gen-offsets.py --output-py $@ $<
 
 generated_offsets.py: generated-offsets.s
 	$(call cmd,generated_offsets_py)
@@ -159,10 +137,11 @@ quiet_cmd_manifest = [ $@ ]
       cmd_manifest = \
   $(if $(2),graphene-manifest $(3) -Dentrypoint=$(2) $< > $@,cp -f $< $@)
 
+# pal map
+PAL_SYMBOL_FILE := $(SCRIPTSDIR)/../Pal/src/pal-symbols
 quiet_cmd_pal_map = [ $@ ]
       cmd_pal_map = \
-	(echo "/* DO NOT MODIFY. THIS FILE WAS AUTO-GENERATED. */"; \
-	 sed -e 's|\$$(PAL_SYMBOLS)|$(PAL_SYMBOLS)|g' $<) > $@
+    $(SCRIPTSDIR)/gen-pal-map.py $(PAL_SYMBOL_FILE) $< $@
 
 pal.map: pal.map.template $(PAL_SYMBOL_FILE)
 	$(call cmd,pal_map)

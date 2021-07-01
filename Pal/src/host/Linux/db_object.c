@@ -12,24 +12,11 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
 #include "pal_linux.h"
 #include "pal_linux_defs.h"
-
-/* Wait on a synchronization handle and return 0 if this handle's event was triggered or error
- * code otherwise (e.g., due to timeout). */
-int _DkSynchronizationObjectWait(PAL_HANDLE handle, int64_t timeout_us) {
-    assert(IS_HANDLE_TYPE(handle, mutex) || IS_HANDLE_TYPE(handle, event));
-
-    const struct handle_ops* ops = HANDLE_OPS(handle);
-    if (!ops || !ops->wait)
-        return -PAL_ERROR_NOTIMPLEMENTED;
-
-    return ops->wait(handle, timeout_us);
-}
 
 /* Wait for specific events on all handles in the handle array and return multiple events
  * (including errors) reported by the host. Return 0 on success, PAL error on failure. */
@@ -64,7 +51,7 @@ int _DkStreamsWaitEvents(size_t count, PAL_HANDLE* handle_array, PAL_FLG* events
         for (size_t j = 0; j < MAX_FDS; j++) {
             PAL_FLG flags = HANDLE_HDR(hdl)->flags;
 
-            /* hdl might be a mutex/event/non-pollable object, simply ignore it */
+            /* hdl might be a event/non-pollable object, simply ignore it */
             if (hdl->generic.fds[j] == PAL_IDX_POISON)
                 continue;
 

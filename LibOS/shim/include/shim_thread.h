@@ -134,10 +134,29 @@ struct shim_thread_queue {
 };
 
 int init_threading(void);
+int init_id_ranges(IDTYPE preload_tid);
 
 static inline bool is_internal(struct shim_thread* thread) {
-    return thread->tid >= INTERNAL_TID_BASE;
+    return thread->tid == 0;
 }
+
+/*!
+ * \brief Allocates new ID
+ *
+ * \param remove_from_owned if `true`, ID is removed from owned and locally tracked IDs
+ *
+ * \returns new ID on success, `0` on failure (`0` is an invalid ID)
+ *
+ * If \p remove_from_owned is `true`, the returned ID cannot be freed with #release_id since it's
+ * no longer locally tracked. You probably want to call #ipc_change_id_owner afterwards.
+ */
+IDTYPE get_new_id(bool remove_from_owned);
+/*!
+ * \brief Releases (frees) previously allocated ID
+ *
+ * \param id ID to release
+ */
+void release_id(IDTYPE id);
 
 void free_signal_queue(struct shim_signal_queue* queue);
 
@@ -182,35 +201,25 @@ static inline void set_cur_thread(struct shim_thread* thread) {
     log_setprefix(tcb);
 }
 
-static inline void thread_setwait(struct shim_thread** queue, struct shim_thread* thread) {
-    if (!thread)
-        thread = get_cur_thread();
-    DkEventClear(thread->scheduler_event);
-    if (queue) {
-        get_thread(thread);
-        *queue = thread;
-    }
+static inline void thread_prepare_wait(void) {
+    struct shim_thread* cur_thread = get_cur_thread();
+    assert(!is_internal(cur_thread));
+    DkEventClear(cur_thread->scheduler_event);
 }
 
-static inline int thread_sleep(uint64_t timeout_us, bool ignore_pending_signals) {
+static inline int thread_wait(uint64_t* timeout_us, bool ignore_pending_signals) {
     struct shim_thread* cur_thread = get_cur_thread();
-
-    if (!cur_thread)
-        return -EINVAL;
-
-    PAL_HANDLE event = cur_thread->scheduler_event;
-    if (!event)
-        return -EINVAL;
+    assert(!is_internal(cur_thread));
 
     if (!ignore_pending_signals && have_pending_signals()) {
         return -EINTR;
     }
 
-    return pal_to_unix_errno(DkSynchronizationObjectWait(event, timeout_us));
+    int ret = DkEventWait(cur_thread->scheduler_event, timeout_us);
+    return ret == -PAL_ERROR_TRYAGAIN ? -ETIMEDOUT : pal_to_unix_errno(ret);
 }
 
 static inline void thread_wakeup(struct shim_thread* thread) {
-    // TODO: handle errors
     DkEventSet(thread->scheduler_event);
 }
 
@@ -263,6 +272,12 @@ static inline void wake_queue(struct wake_queue_head* queue) {
  */
 struct shim_thread* lookup_thread(IDTYPE tid);
 
+/*!
+ * \brief Create a new thread structure, which is a copy of the current thread
+ *
+ * `tid` field is not initialized (i.e. is `0`) and it is the caller's responsibility to initialize
+ * it.
+ */
 struct shim_thread* get_new_thread(void);
 struct shim_thread* get_new_internal_thread(void);
 

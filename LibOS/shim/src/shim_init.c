@@ -12,7 +12,6 @@
 #include "api.h"
 #include "hex.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_error.h"
 #include "shim_checkpoint.h"
 #include "shim_context.h"
@@ -23,6 +22,7 @@
 #include "shim_ipc.h"
 #include "shim_lock.h"
 #include "shim_process.h"
+#include "shim_sync.h"
 #include "shim_table.h"
 #include "shim_tcb.h"
 #include "shim_thread.h"
@@ -37,30 +37,11 @@ static_assert(sizeof(shim_tcb_t) <= PAL_LIBOS_TCB_SIZE,
 const toml_table_t* g_manifest_root = NULL;
 const PAL_CONTROL* g_pal_control = NULL;
 
-/* TODO: Currently copied from log_always(). Ideally, LibOS's implementation of warn() should call a
- *       va_list version of log_always(). */
-static int buf_write_all(const char* str, size_t size, void* arg) {
-    __UNUSED(arg);
-    DkDebugLog((PAL_PTR)str, size);
-    return 0;
-}
-
-void warn(const char* format, ...) {
-    struct print_buf buf = INIT_PRINT_BUF(buf_write_all);
-
-    buf_puts(&buf, shim_get_tcb()->log_prefix);
-
-    va_list ap;
-    va_start(ap, format);
-    buf_vprintf(&buf, format, ap);
-    va_end(ap);
-
-    buf_flush(&buf);
-}
-
-noreturn void __abort(void) {
+/* This function is used by stack protector's __stack_chk_fail(), _FORTIFY_SOURCE's *_chk()
+ * functions and by assert.h's assert() defined in the common library. Thus it might be called by
+ * any thread, even internal. */
+noreturn void shim_abort(void) {
     DEBUG_BREAK_ON_FAILURE();
-    /* `__abort` might be called by any thread, even internal. */
     DkProcessExit(1);
 }
 
@@ -123,7 +104,7 @@ void* allocate_stack(size_t size, size_t protect_size, bool user) {
     size = ALLOC_ALIGN_UP(size);
     protect_size = ALLOC_ALIGN_UP(protect_size);
 
-    log_debug("Allocating stack at %p (size = %ld)\n", stack, size);
+    log_debug("Allocating stack at %p (size = %ld)", stack, size);
 
     if (!user) {
         stack = system_malloc(size + protect_size);
@@ -242,11 +223,11 @@ static int populate_stack(void* stack, size_t stack_size, const char** argv, con
      * located adjacently and (2) in increasing order. */
     const char** new_argv = stack_low_addr;
     for (const char** a = argv; *a; a++) {
-        size_t len = strlen(*a) + 1;
-        const char** argv_ptr = ALLOCATE_FROM_LOW_ADDR(sizeof(const char*)); /* ptr to argv[i] */
-        memcpy(argv_str, *a, len);                                           /* argv[i] string */
+        size_t size = strlen(*a) + 1;
+        const char** argv_ptr = ALLOCATE_FROM_LOW_ADDR(sizeof(const char*));  /* ptr to argv[i] */
+        memcpy(argv_str, *a, size);                                           /* argv[i] string */
         *argv_ptr = argv_str;
-        argv_str += len;
+        argv_str += size;
     }
     *((const char**)ALLOCATE_FROM_LOW_ADDR(sizeof(const char*))) = NULL;
 
@@ -259,11 +240,11 @@ static int populate_stack(void* stack, size_t stack_size, const char** argv, con
 
     const char** new_envp = stack_low_addr;
     for (const char** e = envp; *e; e++) {
-        size_t len = strlen(*e) + 1;
+        size_t size = strlen(*e) + 1;
         const char** envp_ptr = ALLOCATE_FROM_LOW_ADDR(sizeof(const char*)); /* ptr to envp[i] */
-        memcpy(envp_str, *e, len);                                           /* envp[i] string */
+        memcpy(envp_str, *e, size);                                          /* envp[i] string */
         *envp_ptr = envp_str;
-        envp_str += len;
+        envp_str += size;
     }
     *((const char**)ALLOCATE_FROM_LOW_ADDR(sizeof(const char*))) = NULL;
 
@@ -311,7 +292,7 @@ int init_stack(const char** argv, const char** envp, const char*** out_argp,
     ret = toml_sizestring_in(g_manifest_root, "sys.stack.size", get_rlimit_cur(RLIMIT_STACK),
                              &stack_size);
     if (ret < 0) {
-        log_error("Cannot parse \'sys.stack.size\' (the value must be put in double quotes!)\n");
+        log_error("Cannot parse \'sys.stack.size\' (the value must be put in double quotes!)");
         return -EINVAL;
     }
 
@@ -385,7 +366,7 @@ static int read_environs(const char** envp) {
     do {                                                                     \
         int _err = CALL_INIT(func, ##__VA_ARGS__);                           \
         if (_err < 0) {                                                      \
-            log_error("Error during shim_init() in " #func " (%d)\n", _err); \
+            log_error("Error during shim_init() in " #func " (%d)", _err);   \
             DkProcessExit(-_err);                                            \
         }                                                                    \
     } while (0)
@@ -402,10 +383,10 @@ noreturn void* shim_init(int argc, void* args) {
 
     log_setprefix(shim_get_tcb());
 
-    log_debug("Host: %s\n", g_pal_control->host_type);
+    log_debug("Host: %s", g_pal_control->host_type);
 
     if (!IS_POWER_OF_2(ALLOC_ALIGNMENT)) {
-        log_error("Error during shim_init(): PAL allocation alignment not a power of 2\n");
+        log_error("Error during shim_init(): PAL allocation alignment not a power of 2");
         DkProcessExit(EINVAL);
     }
 
@@ -414,7 +395,7 @@ noreturn void* shim_init(int argc, void* args) {
     shim_xstate_init();
 
     if (!create_lock(&__master_lock)) {
-        log_error("Error during shim_init(): failed to allocate __master_lock\n");
+        log_error("Error during shim_init(): failed to allocate __master_lock");
         DkProcessExit(ENOMEM);
     }
 
@@ -430,14 +411,14 @@ noreturn void* shim_init(int argc, void* args) {
     RUN_INIT(init_dcache);
     RUN_INIT(init_handle);
 
-    log_debug("Shim loaded at %p, ready to initialize\n", &__load_address);
+    log_debug("Shim loaded at %p, ready to initialize", &__load_address);
 
     if (g_pal_control->parent_process) {
         struct checkpoint_hdr hdr;
 
         int ret = read_exact(g_pal_control->parent_process, &hdr, sizeof(hdr));
         if (ret < 0) {
-            log_error("shim_init: failed to read the whole checkpoint header: %d\n", ret);
+            log_error("shim_init: failed to read the whole checkpoint header: %d", ret);
             DkProcessExit(1);
         }
 
@@ -451,7 +432,11 @@ noreturn void* shim_init(int argc, void* args) {
     RUN_INIT(init_threading);
     RUN_INIT(init_mount);
     RUN_INIT(init_important_handles);
-    RUN_INIT(init_async);
+
+    /* Update log prefix after we initialized `g_process.exec` */
+    log_setprefix(shim_get_tcb());
+
+    RUN_INIT(init_async_worker);
 
     const char** new_argp;
     elf_auxv_t* new_auxv;
@@ -464,12 +449,15 @@ noreturn void* shim_init(int argc, void* args) {
     if (g_pal_control->parent_process) {
         int ret = connect_to_process(g_process_ipc_ids.parent_vmid);
         if (ret < 0) {
-            log_error("shim_init: failed to establish IPC connection to parent: %d\n", ret);
+            log_error("shim_init: failed to establish IPC connection to parent: %d", ret);
             DkProcessExit(1);
         }
-        ret = request_leader_connect_back();
+
+        /* This has also a (very much desired) side effect of the IPC leader making a connection to
+         * this process, so that it's included in all broadcast messages. */
+        ret = ipc_change_id_owner(g_process.pid, g_self_vmid);
         if (ret < 0) {
-            log_error("shim_init: failed to request an IPC connection from IPC leader: %d\n", ret);
+            log_debug("shim_init: failed to change child process PID ownership: %d", ret);
             DkProcessExit(1);
         }
 
@@ -477,7 +465,7 @@ noreturn void* shim_init(int argc, void* args) {
         IDTYPE child_vmid = g_self_vmid;
         ret = write_exact(g_pal_control->parent_process, &child_vmid, sizeof(child_vmid));
         if (ret < 0) {
-            log_error("shim_init: failed to write child_vmid: %d\n", ret);
+            log_error("shim_init: failed to write child_vmid: %d", ret);
             DkProcessExit(1);
         }
 
@@ -485,12 +473,18 @@ noreturn void* shim_init(int argc, void* args) {
         char dummy_c = 0;
         ret = read_exact(g_pal_control->parent_process, &dummy_c, sizeof(dummy_c));
         if (ret < 0) {
-            log_error("shim_init: failed to read parent's confirmation: %d\n", ret);
+            log_error("shim_init: failed to read parent's confirmation: %d", ret);
             DkProcessExit(1);
         }
+    } else { /* !g_pal_control->parent_process */
+        RUN_INIT(init_sync_server);
     }
 
-    log_debug("Shim process initialized\n");
+    /* Note that in the main process, we initialize both sync server and sync client, and the client
+     * communicates with server over a "loopback" IPC connection. */
+    RUN_INIT(init_sync_client);
+
+    log_debug("Shim process initialized");
 
     shim_tcb_t* cur_tcb = shim_get_tcb();
 
@@ -557,7 +551,7 @@ int create_pipe(char* name, char* uri, size_t size, PAL_HANDLE* hdl, struct shim
                 return ret;
         }
 
-        log_debug("Creating pipe: " URI_PREFIX_PIPE_SRV "%s\n", pipename);
+        log_debug("Creating pipe: " URI_PREFIX_PIPE_SRV "%s", pipename);
         len = snprintf(uri, size, URI_PREFIX_PIPE_SRV "%s", pipename);
         if (len >= size)
             return -ERANGE;

@@ -9,6 +9,7 @@
 #ifndef PAL_H
 #define PAL_H
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -90,16 +91,6 @@ typedef union pal_handle {
 
 #include "pal-arch.h"
 
-/*! Log level */
-enum {
-    PAL_LOG_NONE    = 0,
-    PAL_LOG_ERROR   = 1,
-    PAL_LOG_WARNING = 2,
-    PAL_LOG_DEBUG   = 3,
-    PAL_LOG_TRACE   = 4,
-    PAL_LOG_ALL     = 5,
-};
-
 /********** PAL TYPE DEFINITIONS **********/
 enum {
     pal_type_file,
@@ -115,7 +106,6 @@ enum {
     pal_type_udpsrv,
     pal_type_process,
     pal_type_thread,
-    pal_type_mutex,
     pal_type_event,
     pal_type_eventfd,
     PAL_HANDLE_TYPE_BOUND,
@@ -144,7 +134,6 @@ typedef struct PAL_CONTROL_ {
      */
 
     toml_table_t* manifest_root; /*!< program manifest */
-    PAL_STR executable;          /*!< initial executable name. TODO: remove from PAL */
     PAL_HANDLE parent_process;   /*!< handle of parent process */
     PAL_HANDLE first_thread;     /*!< handle of first thread */
     int log_level;               /*!< what log messages to enable */
@@ -248,13 +237,17 @@ int DkVirtualMemoryProtect(PAL_PTR addr, PAL_NUM size, PAL_FLG prot);
 #define PAL_PROCESS_MASK 0x0
 
 /*!
- * \brief Create a new process to run a separate executable.
+ * \brief Create a new process.
  *
- * \param exec_uri the URI of the executable to be loaded in the new process.
  * \param args an array of strings -- the arguments to be passed to the new process.
  * \param[out] handle on success contains the process handle.
+ *
+ * Loads and executes the same binary as currently executed one (`loader.preload` in case of LibOS,
+ * or `pal.entrypoint` in PAL regression tests), and passes the new arguments.
+ *
+ * TODO: `args` is only used by PAL regression tests, and should be removed at some point.
  */
-int DkProcessCreate(PAL_STR exec_uri, PAL_STR* args, PAL_HANDLE* handle);
+int DkProcessCreate(PAL_STR* args, PAL_HANDLE* handle);
 
 /*!
  * \brief Terminate all threads in the process immediately.
@@ -526,13 +519,6 @@ int DkStreamChangeName(PAL_HANDLE handle, PAL_STR uri);
 int DkThreadCreate(PAL_PTR addr, PAL_PTR param, PAL_HANDLE* handle);
 
 /*!
- * \brief Suspend the current thread for a certain duration
- *
- * \param duration the duration in microseconds
- */
-PAL_NUM DkThreadDelayExecution(PAL_NUM duration);
-
-/*!
  * \brief Yield the current thread such that the host scheduler can reschedule it.
  */
 void DkThreadYieldExecution(void);
@@ -620,21 +606,6 @@ void DkSetExceptionHandler(PAL_EVENT_HANDLER handler, PAL_NUM event);
  */
 
 /*!
- * \brief Create a mutex with the given `initialCount`.
- *
- * Destroy a mutex using DkObjectClose.
- *
- * \param initialCount 0 is unlocked, 1 is locked
- * \param[out] handle on success contains the mutex handle
- */
-int DkMutexCreate(PAL_NUM initialCount, PAL_HANDLE* handle);
-
-/*!
- * \brief Unlock the given mutex.
- */
-void DkMutexRelease(PAL_HANDLE mutexHandle);
-
-/*!
  * \brief Create an event handle
  *
  * \param[out] handle on success `*handle` contains pointer to the event handle
@@ -643,7 +614,7 @@ void DkMutexRelease(PAL_HANDLE mutexHandle);
  *
  * Creates a handle to an event that resembles WinAPI synchronization events. A thread can set
  * (signal) the event using #DkEventSet, clear (unset) it using #DkEventClear or wait until
- * the event becomes set (signaled) using #DkSynchronizationObjectWait.
+ * the event becomes set (signaled) using #DkEventWait.
  */
 int DkEventCreate(PAL_HANDLE* handle, bool init_signaled, bool auto_clear);
 
@@ -651,6 +622,8 @@ int DkEventCreate(PAL_HANDLE* handle, bool init_signaled, bool auto_clear);
  * \brief Set (signal) an event.
  *
  * If the event is already set, does nothing.
+ *
+ * This function has release semantics and synchronizes with #DkEventWait.
  */
 void DkEventSet(PAL_HANDLE handle);
 
@@ -665,14 +638,24 @@ void DkEventClear(PAL_HANDLE handle);
 #define NO_TIMEOUT ((PAL_NUM)-1)
 
 /*!
- * \brief Wait on a synchronization handle.
+ * \brief Wait for an event handle.
  *
- * \param timeout_us is the maximum time that the API should wait (in
- *  microseconds), or #NO_TIMEOUT to indicate it is to be blocked until the
- *  handle's event is triggered.
- * \return 0 if this handle's event was triggered, negative error code otherwise
+ * \param handle handle to wait on, must be of "event" type
+ * \param[in,out] timeout_us timeout for the wait
+ *
+ * \return 0 if the event was triggered, negative error code otherwise (#PAL_ERROR_TRYAGAIN in case
+ *         of timeout triggering)
+ *
+ * \p timeout_us points to a value that specifies the maximal time (in microseconds) that this
+ * function should sleep if this event is not signaled in the meantime. Specifying `NULL` blocks
+ * indefinitely. Note that in any case this function can return earlier, e.g. if a signal has
+ * arrived, but this will be indicated by the returned error code.
+ * After returning (both successful and not), \p timeout_us will contain the remaining time (time
+ * that need to pass before we hit original \p timeout_us).
+ *
+ * This function has acquire semantics and synchronizes with #DkEventSet.
  */
-int DkSynchronizationObjectWait(PAL_HANDLE handle, PAL_NUM timeout_us);
+int DkEventWait(PAL_HANDLE handle, uint64_t* timeout_us);
 
 enum PAL_WAIT {
     PAL_WAIT_SIGNAL = 1, /*!< ignored in events */
@@ -838,7 +821,10 @@ int DkSetProtectedFilesKey(PAL_PTR pf_key_hex);
  *
  * \param[out] values the array of the results
  */
-int DkCpuIdRetrieve(PAL_IDX leaf, PAL_IDX subleaf, PAL_IDX values[PAL_CPUID_WORD_NUM]);
+int DkCpuIdRetrieve(PAL_IDX leaf, PAL_IDX subleaf, PAL_IDX values[CPUID_WORD_NUM]);
 #endif
+
+void DkDebugMapAdd(PAL_STR uri, PAL_PTR start_addr);
+void DkDebugMapRemove(PAL_PTR start_addr);
 
 #endif /* PAL_H */

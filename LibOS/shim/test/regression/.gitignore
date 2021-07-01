@@ -16,7 +16,7 @@
 /debug_log_file
 /debug_log_inline
 /debug_regs-x86_64
-/dev
+/devfs
 /device
 /double_fork
 /env_from_file
@@ -47,6 +47,7 @@
 /futex_wake_op
 /getcwd
 /getdents
+/getdents_lseek
 /getsockname
 /getsockopt
 /gettimeofday
@@ -57,6 +58,7 @@
 /init_fail2
 /kill_all
 /large_dir_read
+/large_file
 /large_mmap
 /madvise
 /mkfifo
@@ -94,6 +96,7 @@
 /spinlock
 /stat_invalid_args
 /syscall
+/syscall_restart
 /sysfs_common
 /tcp_ipv6_v6only
 /tcp_msg_peek

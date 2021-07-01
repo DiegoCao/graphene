@@ -76,7 +76,7 @@ static const char* const g_cpu_flags[] = {
 };
 
 int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
-    unsigned int words[PAL_CPUID_WORD_NUM];
+    unsigned int words[CPUID_WORD_NUM];
     int rv = 0;
 
     const size_t VENDOR_ID_SIZE = 13;
@@ -86,9 +86,9 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
 
     cpuid(0, 0, words);
 
-    FOUR_CHARS_VALUE(&vendor_id[0], words[PAL_CPUID_WORD_EBX]);
-    FOUR_CHARS_VALUE(&vendor_id[4], words[PAL_CPUID_WORD_EDX]);
-    FOUR_CHARS_VALUE(&vendor_id[8], words[PAL_CPUID_WORD_ECX]);
+    FOUR_CHARS_VALUE(&vendor_id[0], words[CPUID_WORD_EBX]);
+    FOUR_CHARS_VALUE(&vendor_id[4], words[CPUID_WORD_EDX]);
+    FOUR_CHARS_VALUE(&vendor_id[8], words[CPUID_WORD_ECX]);
     vendor_id[VENDOR_ID_SIZE - 1] = '\0';
     ci->cpu_vendor = vendor_id;
 
@@ -99,11 +99,11 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
         goto out_vendor_id;
     }
     cpuid(0x80000002, 0, words);
-    memcpy(&brand[ 0], words, sizeof(unsigned int) * PAL_CPUID_WORD_NUM);
+    memcpy(&brand[ 0], words, sizeof(unsigned int) * CPUID_WORD_NUM);
     cpuid(0x80000003, 0, words);
-    memcpy(&brand[16], words, sizeof(unsigned int) * PAL_CPUID_WORD_NUM);
+    memcpy(&brand[16], words, sizeof(unsigned int) * CPUID_WORD_NUM);
     cpuid(0x80000004, 0, words);
-    memcpy(&brand[32], words, sizeof(unsigned int) * PAL_CPUID_WORD_NUM);
+    memcpy(&brand[32], words, sizeof(unsigned int) * CPUID_WORD_NUM);
     brand[BRAND_SIZE - 1] = '\0';
     ci->cpu_brand = brand;
 
@@ -128,7 +128,7 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
     /* TODO: correctly support offline cores */
     if (possible_logical_cores > 0 && possible_logical_cores > online_logical_cores) {
          log_warning("some CPUs seem to be offline; Graphene doesn't take this into account which "
-                     "may lead to subpar performance\n");
+                     "may lead to subpar performance");
     }
 
     int core_siblings = get_hw_resource("/sys/devices/system/cpu/cpu0/topology/core_siblings_list",
@@ -159,7 +159,7 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
                  "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", idx);
         cpu_socket[idx] = get_hw_resource(filename, /*count=*/false);
         if (cpu_socket[idx] < 0) {
-            log_warning("Cannot read %s\n", filename);
+            log_warning("Cannot read %s", filename);
             rv = unix_to_pal_error(cpu_socket[idx]);
             goto out_phy_id;
         }
@@ -167,16 +167,17 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
     ci->cpu_socket = cpu_socket;
 
     cpuid(1, 0, words);
-    ci->cpu_family   = BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EAX], 8, 12);
-    ci->cpu_model    = BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EAX], 4, 8);
-    ci->cpu_stepping = BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EAX], 0, 4);
+    ci->cpu_family   = BIT_EXTRACT_LE(words[CPUID_WORD_EAX], 8, 12);
+    ci->cpu_model    = BIT_EXTRACT_LE(words[CPUID_WORD_EAX], 4, 8);
+    ci->cpu_stepping = BIT_EXTRACT_LE(words[CPUID_WORD_EAX], 0, 4);
 
     if (!memcmp(vendor_id, "GenuineIntel", 12) || !memcmp(vendor_id, "AuthenticAMD", 12)) {
-        ci->cpu_family += BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EAX], 20, 28);
-        ci->cpu_model  += BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EAX], 16, 20) << 4;
+        ci->cpu_family += BIT_EXTRACT_LE(words[CPUID_WORD_EAX], 20, 28);
+        ci->cpu_model  += BIT_EXTRACT_LE(words[CPUID_WORD_EAX], 16, 20) << 4;
     }
 
-    int flen = 0, fmax = 80;
+    size_t flen = 0;
+    size_t fmax = 80;
     char* flags = malloc(fmax);
     if (!flags) {
         rv = -PAL_ERROR_NOMEM;
@@ -187,8 +188,8 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
         if (!g_cpu_flags[i])
             continue;
 
-        if (BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EDX], i, i + 1)) {
-            int len = strlen(g_cpu_flags[i]);
+        if (BIT_EXTRACT_LE(words[CPUID_WORD_EDX], i, i + 1)) {
+            size_t len = strlen(g_cpu_flags[i]);
             if (flen + len + 1 > fmax) {
                 char* new_flags = malloc(fmax * 2);
                 if (!new_flags) {
@@ -211,7 +212,7 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
 
     ci->cpu_bogomips = get_bogomips();
     if (ci->cpu_bogomips == 0.0) {
-        log_warning("bogomips could not be retrieved, passing 0.0 to the application\n");
+        log_warning("bogomips could not be retrieved, passing 0.0 to the application");
     }
 
     return rv;

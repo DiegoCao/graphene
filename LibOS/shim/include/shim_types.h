@@ -1,6 +1,7 @@
 #ifndef _SHIM_TYPES_H_
 #define _SHIM_TYPES_H_
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -332,15 +333,13 @@ struct linux_file_handle {
     unsigned char f_handle[0];
 };
 
-#ifdef __x86_64__
 typedef Elf64_auxv_t elf_auxv_t;
-#else
-typedef Elf64_auxv_t elf_auxv_t;
-#endif
 
 /* typedef for shim internal types */
-typedef unsigned int IDTYPE;
+typedef uint32_t IDTYPE;
+#define IDTYPE_MAX UINT32_MAX
 typedef uint16_t FDTYPE;
+#define FDTYPE_MAX UINT16_MAX
 typedef uint64_t HASHTYPE;
 
 typedef struct atomic_int REFTYPE;

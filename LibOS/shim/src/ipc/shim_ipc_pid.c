@@ -1,432 +1,415 @@
 /* SPDX-License-Identifier: LGPL-3.0-or-later */
-/* Copyright (C) 2014 Stony Brook University
- * Copyright (C) 2021 Intel Corporation
+/* Copyright (C) 2021 Intel Corporation
  *                    Borys Popławski <borysp@invisiblethingslab.com>
  */
 
-/*
- * This file contains functions and callbacks to handle IPC of PID namespace.
- */
+/* This file contains code for management of global ID ranges. */
 
-#include <errno.h>
-
-#include "pal.h"
-#include "pal_error.h"
-#include "shim_checkpoint.h"
-#include "shim_fs.h"
-#include "shim_internal.h"
+#include "api.h"
+#include "assert.h"
+#include "avl_tree.h"
 #include "shim_ipc.h"
 #include "shim_lock.h"
-#include "shim_process.h"
-#include "shim_thread.h"
+#include "shim_types.h"
 
-int init_ns_pid(void) {
-    struct shim_thread* cur_thread = get_cur_thread();
-    /* This function should be called only in initialization (but after process and main thread are
-     * initialized), so we should have only one thread, whose tid is equal to the process pid. */
-    assert(cur_thread->tid == g_process.pid);
+/* Represents a range of ids `[start; end]` (i.e. `end` is included). There is no representation of
+ * an empty range, but it's not needed. */
+struct id_range {
+    struct avl_tree_node node;
+    IDTYPE start;
+    IDTYPE end;
+    IDTYPE owner;
+};
 
-    return add_ipc_subrange(cur_thread->tid, g_self_vmid);
+struct ipc_id_range_msg {
+    IDTYPE start;
+    IDTYPE end;
+};
+
+struct ipc_id_owner_msg {
+    IDTYPE id;
+    IDTYPE owner;
+};
+
+static bool id_range_cmp(struct avl_tree_node* _a, struct avl_tree_node* _b) {
+    struct id_range* a = container_of(_a, struct id_range, node);
+    struct id_range* b = container_of(_b, struct id_range, node);
+    /*
+     * This is equivalent to:
+     * ```return a->start <= b->start;```
+     * because overlapping ranges in one tree are disallowed, but it also enables easy lookups of
+     * ranges overlapping any given point.
+     */
+    return a->start <= b->end;
 }
 
-static int ipc_pid_kill_send(enum kill_type type, IDTYPE sender, IDTYPE dest_pid, IDTYPE target,
-                             int sig) {
-    int ret;
+/* These are ranges of all used IDs. This tree is only meaningful in IPC leader.
+ * No two ranges in this tree shall overlap. */
+static struct avl_tree g_id_owners_tree = { .cmp = id_range_cmp };
+static struct shim_lock g_id_owners_tree_lock;
+static IDTYPE g_last_id = 0;
 
-    IDTYPE dest = 0;
-    if (type == KILL_ALL) {
-        if (g_process_ipc_ids.leader_vmid) {
-            dest = g_process_ipc_ids.leader_vmid;
+int init_ipc_ids(void) {
+    if (!create_lock(&g_id_owners_tree_lock)) {
+        return -ENOMEM;
+    }
+    return 0;
+}
+
+/* If a free range was found, sets `*start` and `*end` and returns `true`, if nothing was found
+ * returns `false`. If a range was returned, it is not larger than `MAX_RANGE_SIZE`. */
+static bool _find_free_id_range(IDTYPE* start, IDTYPE* end) {
+    assert(locked(&g_id_owners_tree_lock));
+    static_assert(!IS_SIGNED(IDTYPE), "IDTYPE must be unsigned");
+    IDTYPE next_id = g_last_id + 1 ?: 1;
+
+    struct id_range dummy = {
+        .start = next_id,
+        .end = next_id,
+    };
+    struct avl_tree_node* node = avl_tree_lower_bound(&g_id_owners_tree, &dummy.node);
+    while (node) {
+        struct id_range* range = container_of(node, struct id_range, node);
+        if (next_id < range->start) {
+            /* `next_id` does not overlap any existing range. */
+            *start = next_id;
+            if (__builtin_add_overflow(next_id, MAX_RANGE_SIZE - 1, end)) {
+                *end = IDTYPE_MAX;
+            }
+            *end = MIN(*end, range->start - 1);
+            return true;
         }
-    } else {
-        ret = find_owner(dest_pid, &dest);
-        if (ret < 0) {
-            return ret;
+        /* `next_id` overlaps `range`. */
+        assert(next_id <= range->end);
+        if (range->end == IDTYPE_MAX) {
+            /* No ids available in range `[g_last_id + 1, IDTYPE_MAX]`. If wrapping is needed, set
+             * `g_last_id` and call this function again. */
+            return false;
         }
+        next_id = range->end + 1;
+        node = avl_tree_next(node);
+    }
+    /* There are no ids greater or equal to `next_id`. */
+    *start = next_id;
+    if (__builtin_add_overflow(next_id, MAX_RANGE_SIZE - 1, end)) {
+        *end = IDTYPE_MAX;
+    }
+    return true;
+}
+
+static int alloc_id_range(IDTYPE owner, IDTYPE* start, IDTYPE* end) {
+    assert(owner);
+    struct id_range* new_range = malloc(sizeof(*new_range));
+    if (!new_range) {
+        return -ENOMEM;
     }
 
-    size_t total_msg_size    = get_ipc_msg_size(sizeof(struct shim_ipc_pid_kill));
-    struct shim_ipc_msg* msg = __alloca(total_msg_size);
-    init_ipc_msg(msg, IPC_MSG_PID_KILL, total_msg_size, dest);
-
-    struct shim_ipc_pid_kill* msgin = (struct shim_ipc_pid_kill*)&msg->msg;
-    msgin->sender                   = sender;
-    msgin->type                     = type;
-    msgin->id                       = target;
-    msgin->signum                   = sig;
-
-    if (type == KILL_ALL && !g_process_ipc_ids.leader_vmid) {
-        log_debug("IPC broadcast: IPC_MSG_PID_KILL(%u, %d, %u, %d)\n", sender, type, dest_pid, sig);
-        ret = broadcast_ipc(msg, /*exclude_id=*/0);
-    } else {
-        log_debug("IPC send to %u: IPC_MSG_PID_KILL(%u, %d, %u, %d)\n", dest, sender, type,
-                  dest_pid, sig);
-        ret = send_ipc_message(msg, dest);
+    lock(&g_id_owners_tree_lock);
+    bool found = _find_free_id_range(start, end);
+    if (!found) {
+        /* No id found, try wrapping around. */
+        g_last_id = 0;
+        found = _find_free_id_range(start, end);
     }
 
+    int ret = 0;
+    if (found) {
+        assert(*start && *end);
+        new_range->start = *start;
+        new_range->end = *end;
+        new_range->owner = owner;
+        avl_tree_insert(&g_id_owners_tree, &new_range->node);
+        g_last_id = *end;
+    } else {
+        free(new_range);
+        ret = -EAGAIN;
+    }
+    unlock(&g_id_owners_tree_lock);
     return ret;
 }
 
-int ipc_kill_process(IDTYPE sender, IDTYPE target, int sig) {
-    return ipc_pid_kill_send(KILL_PROCESS, sender, target, target, sig);
+static int change_id_owner(IDTYPE id, IDTYPE new_owner) {
+    struct id_range* new_range1 = malloc(sizeof(*new_range1));
+    if (!new_range1) {
+        return -ENOMEM;
+    }
+    struct id_range* new_range2 = malloc(sizeof(*new_range1));
+    if (!new_range2) {
+        free(new_range1);
+        return -ENOMEM;
+    }
+    new_range1->start = id;
+    new_range1->end = id;
+    new_range1->owner = new_owner;
+
+    lock(&g_id_owners_tree_lock);
+    struct id_range dummy = {
+        .start = id,
+        .end = id,
+    };
+    struct avl_tree_node* node = avl_tree_lower_bound(&g_id_owners_tree, &dummy.node);
+    if (!node) {
+        log_debug("ID %u unknown!", id);
+        BUG();
+    }
+    struct id_range* range = container_of(node, struct id_range, node);
+    if (id < range->start || range->end < id) {
+        log_debug("ID %u unknown!", id);
+        BUG();
+    }
+
+    /* These `range` modifications are in place since we know they won't change the position of
+     * `range` inside `g_id_owners_tree`. Otherwise we would have to remove it, modify and then
+     * re-add. */
+    if (range->start == range->end) {
+        assert(id == range->start);
+        range->owner = new_owner;
+    } else if (range->start == id) {
+        range->start++;
+        avl_tree_insert(&g_id_owners_tree, &new_range1->node);
+        new_range1 = NULL;
+    } else if (range->end == id) {
+        range->end--;
+        avl_tree_insert(&g_id_owners_tree, &new_range1->node);
+        new_range1 = NULL;
+    } else {
+        assert(range->end - range->start + 1 >= 3);
+        new_range2->start = id + 1;
+        new_range2->end = range->end;
+        new_range2->owner = range->owner;
+        range->end = id - 1;
+        avl_tree_insert(&g_id_owners_tree, &new_range1->node);
+        avl_tree_insert(&g_id_owners_tree, &new_range2->node);
+        new_range1 = NULL;
+        new_range2 = NULL;
+    }
+
+    unlock(&g_id_owners_tree_lock);
+    free(new_range1);
+    free(new_range2);
+    return 0;
 }
 
-int ipc_kill_thread(IDTYPE sender, IDTYPE dest_pid, IDTYPE target, int sig) {
-    return ipc_pid_kill_send(KILL_THREAD, sender, dest_pid, target, sig);
+static void release_id_range(IDTYPE start, IDTYPE end) {
+    lock(&g_id_owners_tree_lock);
+    struct id_range dummy = {
+        .start = start,
+        .end = end,
+    };
+    struct avl_tree_node* node = avl_tree_find(&g_id_owners_tree, &dummy.node);
+    if (!node) {
+        log_debug("Releasing invalid ID range!");
+        BUG();
+    }
+    struct id_range* range = container_of(node, struct id_range, node);
+    assert(range->start == start && range->end == end);
+    avl_tree_delete(&g_id_owners_tree, &range->node);
+
+    unlock(&g_id_owners_tree_lock);
+    free(range);
 }
 
-int ipc_kill_pgroup(IDTYPE sender, IDTYPE pgid, int sig) {
-    return ipc_pid_kill_send(KILL_PGROUP, sender, pgid, pgid, sig);
+static IDTYPE find_id_owner(IDTYPE id) {
+    IDTYPE owner = 0;
+
+    struct id_range dummy = {
+        .start = id,
+        .end = id,
+    };
+    lock(&g_id_owners_tree_lock);
+    struct avl_tree_node* node = avl_tree_lower_bound(&g_id_owners_tree, &dummy.node);
+    if (!node) {
+        goto out;
+    }
+    struct id_range* range = container_of(node, struct id_range, node);
+    if (id < range->start || range->end < id) {
+        goto out;
+    }
+    owner = range->owner;
+
+out:
+    unlock(&g_id_owners_tree_lock);
+    return owner;
 }
 
-int ipc_kill_all(IDTYPE sender, int sig) {
-    return ipc_pid_kill_send(KILL_ALL, sender, /*dest_pid=*/0, /*target=*/0, sig);
+int ipc_alloc_id_range(IDTYPE* out_start, IDTYPE* out_end) {
+    if (!g_process_ipc_ids.leader_vmid) {
+        return alloc_id_range(g_self_vmid, out_start, out_end);
+    }
+
+    size_t msg_size = get_ipc_msg_size(0);
+    struct shim_ipc_msg* msg = malloc(msg_size);
+    if (!msg) {
+        return -ENOMEM;
+    }
+    init_ipc_msg(msg, IPC_MSG_ALLOC_ID_RANGE, msg_size);
+
+    log_debug("%s: sending a request", __func__);
+
+    void* resp = NULL;
+    int ret = ipc_send_msg_and_get_response(g_process_ipc_ids.leader_vmid, msg, &resp);
+    if (ret < 0) {
+        goto out;
+    }
+
+    struct ipc_id_range_msg* range = resp;
+    if (range->start && range->end) {
+        *out_start = range->start;
+        *out_end = range->end;
+        ret = 0;
+    } else {
+        ret = -EAGAIN;
+    }
+
+    log_debug("%s: got a response: [%u..%u]", __func__, range->start, range->end);
+
+out:
+    free(resp);
+    free(msg);
+    return ret;
 }
 
-int ipc_pid_kill_callback(struct shim_ipc_msg* msg, IDTYPE src) {
-    struct shim_ipc_pid_kill* msgin = (struct shim_ipc_pid_kill*)msg->msg;
+int ipc_alloc_id_range_callback(IDTYPE src, void* data, uint64_t seq) {
+    __UNUSED(data);
+    IDTYPE start = 0;
+    IDTYPE end = 0;
+    int ret = alloc_id_range(src, &start, &end);
+    if (ret < 0) {
+        start = 0;
+        end = 0;
+    }
 
-    log_debug("IPC callback from %u: IPC_MSG_PID_KILL(%u, %d, %u, %d)\n", msg->src,
-              msgin->sender, msgin->type, msgin->id, msgin->signum);
+    log_debug("%s: %d", __func__, ret);
 
-    if (msgin->signum == 0) {
-        /* If signal number is 0, then no signal is sent, but process existence is still checked. */
+    struct ipc_id_range_msg range = {
+        .start = start,
+        .end = end,
+    };
+    size_t msg_size = get_ipc_msg_size(sizeof(range));
+    struct shim_ipc_msg* msg = __alloca(msg_size);
+    init_ipc_response(msg, seq, msg_size);
+    memcpy(&msg->data, &range, sizeof(range));
+
+    return ipc_send_message(src, msg);
+}
+
+int ipc_release_id_range(IDTYPE start, IDTYPE end) {
+    if (!g_process_ipc_ids.leader_vmid) {
+        release_id_range(start, end);
         return 0;
     }
 
-    int ret = 0;
-
-    switch (msgin->type) {
-        case KILL_THREAD:
-            ret = do_kill_thread(msgin->sender, g_process.pid, msgin->id, msgin->signum);
-            break;
-        case KILL_PROCESS:
-            assert(g_process.pid == msgin->id);
-            ret = do_kill_proc(msgin->sender, msgin->id, msgin->signum);
-            break;
-        case KILL_PGROUP:
-            ret = do_kill_pgroup(msgin->sender, msgin->id, msgin->signum);
-            break;
-        case KILL_ALL:
-            if (!g_process_ipc_ids.leader_vmid) {
-                ret = broadcast_ipc(msg, src);
-                if (ret < 0) {
-                    break;
-                }
-            }
-            ret = do_kill_proc(msgin->sender, g_process.pid, msgin->signum);
-            break;
-    }
-    return ret;
-}
-
-int ipc_pid_getstatus_send(IDTYPE dest, int npids, IDTYPE* pids, struct pid_status** status) {
-    size_t total_msg_size =
-        get_ipc_msg_with_ack_size(sizeof(struct shim_ipc_pid_getstatus) + sizeof(IDTYPE) * npids);
-    struct shim_ipc_msg_with_ack* msg = __alloca(total_msg_size);
-    init_ipc_msg_with_ack(msg, IPC_MSG_PID_GETSTATUS, total_msg_size, dest);
-    msg->private = status;
-
-    struct shim_ipc_pid_getstatus* msgin = (struct shim_ipc_pid_getstatus*)&msg->msg.msg;
-    msgin->npids                         = npids;
-    memcpy(msgin->pids, pids, sizeof(IDTYPE) * npids);
-
-    log_debug("ipc send to %u: IPC_MSG_PID_GETSTATUS(%d, [%u, ...])\n", dest, npids, pids[0]);
-
-    return send_ipc_message_with_ack(msg, dest, NULL);
-}
-
-struct thread_status {
-    int npids;
-    IDTYPE* pids;
-    int nstatus;
-    struct pid_status* status;
-};
-
-static int check_thread(struct shim_thread* thread, void* arg) {
-    struct thread_status* status = (struct thread_status*)arg;
-    int ret = 0;
-
-    lock(&thread->lock);
-
-    for (int i = 0; i < status->npids; i++)
-        if (status->pids[i] == thread->tid) {
-            status->status[status->nstatus].pid  = thread->tid;
-            status->status[status->nstatus].tgid = g_process.pid;
-            status->status[status->nstatus].pgid = __atomic_load_n(&g_process.pgid,
-                                                                   __ATOMIC_ACQUIRE);
-            status->nstatus++;
-            ret = 1;
-            goto out;
-        }
-
-out:
-    unlock(&thread->lock);
-    return ret;
-}
-
-int ipc_pid_getstatus_callback(struct shim_ipc_msg* msg, IDTYPE src) {
-    __UNUSED(src);
-    struct shim_ipc_pid_getstatus* msgin = (struct shim_ipc_pid_getstatus*)msg->msg;
-    int ret = 0;
-
-    log_debug("ipc callback from %u: IPC_MSG_PID_GETSTATUS(%d, [%u, ...])\n", msg->src,
-              msgin->npids, msgin->pids[0]);
-
-    struct thread_status status;
-    status.npids   = msgin->npids;
-    status.pids    = msgin->pids;
-    status.nstatus = 0;
-    status.status  = __alloca(sizeof(struct pid_status) * msgin->npids);
-
-    ret = walk_thread_list(&check_thread, &status, /*one_shot=*/false);
-    if (ret < 0 && ret != -ESRCH)
-        goto out;
-
-    assert(src == msg->src);
-    ret = ipc_pid_retstatus_send(msg->src, status.nstatus, status.status, msg->seq);
-out:
-    return ret;
-}
-
-int ipc_pid_retstatus_send(IDTYPE dest, int nstatus, struct pid_status* status, unsigned long seq) {
-    size_t total_msg_size = get_ipc_msg_size(sizeof(struct shim_ipc_pid_retstatus) +
-                                             sizeof(struct pid_status) * nstatus);
-    struct shim_ipc_msg* msg = __alloca(total_msg_size);
-    init_ipc_msg(msg, IPC_MSG_PID_RETSTATUS, total_msg_size, dest);
-
-    struct shim_ipc_pid_retstatus* msgin = (struct shim_ipc_pid_retstatus*)&msg->msg;
-
-    msgin->nstatus = nstatus;
-    memcpy(msgin->status, status, sizeof(struct pid_status) * nstatus);
-    msg->seq = seq;
-
-    if (nstatus)
-        log_debug("ipc send to %u: IPC_MSG_PID_RETSTATUS(%d, [%u, ...])\n", dest, nstatus,
-                  status[0].pid);
-    else
-        log_debug("ipc send to %u: IPC_MSG_PID_RETSTATUS(0, [])\n", dest);
-
-    return send_ipc_message(msg, dest);
-}
-
-struct retstatus_args {
-    struct pid_status* status;
-    int retval;
-};
-
-static void set_msg_retstatus(struct shim_ipc_msg_with_ack* req_msg, void* _data) {
-    if (!req_msg) {
-        return;
-    }
-
-    struct retstatus_args* data = _data;
-
-    struct pid_status** status = (struct pid_status**)req_msg->private;
-    if (status) {
-        *status = data->status;
-        req_msg->retval = data->retval;
-        data->status = NULL;
-    }
-
-    assert(req_msg->thread);
-    thread_wakeup(req_msg->thread);
-}
-
-int ipc_pid_retstatus_callback(struct shim_ipc_msg* msg, IDTYPE src) {
-    struct shim_ipc_pid_retstatus* msgin = (struct shim_ipc_pid_retstatus*)msg->msg;
-
-    if (msgin->nstatus)
-        log_debug("ipc callback from %u: IPC_MSG_PID_RETSTATUS(%d, [%u, ...])\n", msg->src,
-              msgin->nstatus, msgin->status[0].pid);
-    else
-        log_debug("ipc callback from %u: IPC_MSG_PID_RETSTATUS(0, [])\n", msg->src);
-
-    struct retstatus_args data = {
-        .retval = msgin->nstatus
+    struct ipc_id_range_msg range = {
+        .start = start,
+        .end = end,
     };
-    data.status = malloc_copy(msgin->status, sizeof(*data.status) * msgin->nstatus);
-    if (!data.status) {
-        data.retval = 0;
+    size_t msg_size = get_ipc_msg_size(sizeof(range));
+    struct shim_ipc_msg* msg = malloc(msg_size);
+    if (!msg) {
+        return -ENOMEM;
     }
+    init_ipc_msg(msg, IPC_MSG_RELEASE_ID_RANGE, msg_size);
+    memcpy(&msg->data, &range, sizeof(range));
 
-    ipc_msg_response_handle(src, msg->seq, set_msg_retstatus, &data);
+    log_debug("%s: sending a request: [%u..%u]", __func__, start, end);
 
-    free(data.status);
+    int ret = ipc_send_message(g_process_ipc_ids.leader_vmid, msg);
+    log_debug("%s: ipc_send_message: %d", __func__, ret);
+    free(msg);
+    return ret;
+}
+
+int ipc_release_id_range_callback(IDTYPE src, void* data, uint64_t seq) {
+    __UNUSED(src);
+    __UNUSED(seq);
+    struct ipc_id_range_msg* range = data;
+    release_id_range(range->start, range->end);
+    log_debug("%s: release_id_range(%u..%u)", __func__, range->start, range->end);
     return 0;
 }
 
-static const char* pid_meta_code_str[4] = {
-    "CRED",
-    "EXEC",
-    "CWD",
-    "ROOT",
-};
+int ipc_change_id_owner(IDTYPE id, IDTYPE new_owner) {
+    if (!g_process_ipc_ids.leader_vmid) {
+        return change_id_owner(id, new_owner);
+    }
 
-int ipc_pid_getmeta_send(IDTYPE pid, enum pid_meta_code code, void** data) {
-    IDTYPE dest;
-    int ret;
+    struct ipc_id_owner_msg owner_msg = {
+        .id = id,
+        .owner = new_owner,
+    };
+    size_t msg_size = get_ipc_msg_size(sizeof(owner_msg));
+    struct shim_ipc_msg* msg = malloc(msg_size);
+    if (!msg) {
+        return -ENOMEM;
+    }
+    init_ipc_msg(msg, IPC_MSG_CHANGE_ID_OWNER, msg_size);
+    memcpy(&msg->data, &owner_msg, sizeof(owner_msg));
 
-    if ((ret = find_owner(pid, &dest)) < 0)
+    log_debug("%s: sending a request (%u..%u)", __func__, id, new_owner);
+
+    int ret = ipc_send_msg_and_get_response(g_process_ipc_ids.leader_vmid, msg, /*resp=*/NULL);
+    log_debug("%s: ipc_send_msg_and_get_response: %d", __func__, ret);
+    free(msg);
+    return ret;
+}
+
+int ipc_change_id_owner_callback(IDTYPE src, void* data, uint64_t seq) {
+    struct ipc_id_owner_msg* owner_msg = data;
+    int ret = change_id_owner(owner_msg->id, owner_msg->owner);
+    log_debug("%s: change_id_owner(%u..%u): %d", __func__, owner_msg->id, owner_msg->owner, ret);
+    if (ret < 0) {
         return ret;
+    }
 
-    size_t total_msg_size = get_ipc_msg_with_ack_size(sizeof(struct shim_ipc_pid_getmeta));
-    struct shim_ipc_msg_with_ack* msg = __alloca(total_msg_size);
-    init_ipc_msg_with_ack(msg, IPC_MSG_PID_GETMETA, total_msg_size, dest);
-    msg->private = data;
-
-    struct shim_ipc_pid_getmeta* msgin = (struct shim_ipc_pid_getmeta*)&msg->msg.msg;
-    msgin->pid  = pid;
-    msgin->code = code;
-
-    log_debug("ipc send to %u: IPC_MSG_PID_GETMETA(%u, %s)\n", dest, pid, pid_meta_code_str[code]);
-
-    return send_ipc_message_with_ack(msg, dest, NULL);
+    /* Respond with a dummy empty message. */
+    size_t msg_size = get_ipc_msg_size(0);
+    struct shim_ipc_msg* msg = __alloca(msg_size);
+    init_ipc_response(msg, seq, msg_size);
+    return ipc_send_message(src, msg);
 }
 
-int ipc_pid_getmeta_callback(struct shim_ipc_msg* msg, IDTYPE src) {
-    __UNUSED(src);
-    struct shim_ipc_pid_getmeta* msgin = (struct shim_ipc_pid_getmeta*)msg->msg;
-    int ret = 0;
+int ipc_get_id_owner(IDTYPE id, IDTYPE* out_owner) {
+    if (!g_process_ipc_ids.leader_vmid) {
+        *out_owner = find_id_owner(id);
+        return 0;
+    }
 
-    log_debug("ipc callback from %u: IPC_MSG_PID_GETMETA(%u, %s)\n", msg->src, msgin->pid,
-              pid_meta_code_str[msgin->code]);
+    size_t msg_size = get_ipc_msg_size(sizeof(id));
+    struct shim_ipc_msg* msg = malloc(msg_size);
+    if (!msg) {
+        return -ENOMEM;
+    }
+    init_ipc_msg(msg, IPC_MSG_GET_ID_OWNER, msg_size);
+    memcpy(&msg->data, &id, sizeof(id));
 
-    struct shim_thread* thread = lookup_thread(msgin->pid);
-    void* data                 = NULL;
-    size_t datasize            = 0;
-    size_t bufsize             = 0;
+    log_debug("%s: sending a request: %u", __func__, id);
 
-    if (!thread) {
-        ret = -ESRCH;
+    void* resp = NULL;
+    int ret = ipc_send_msg_and_get_response(g_process_ipc_ids.leader_vmid, msg, &resp);
+    if (ret < 0) {
         goto out;
     }
 
-    switch (msgin->code) {
-        case PID_META_CRED:
-            lock(&thread->lock);
-            bufsize            = sizeof(IDTYPE) * 2;
-            data               = __alloca(bufsize);
-            datasize           = bufsize;
-            ((IDTYPE*)data)[0] = thread->uid;
-            ((IDTYPE*)data)[1] = thread->gid;
-            unlock(&thread->lock);
-            break;
-        case PID_META_EXEC:
-            lock(&g_process.fs_lock);
-            if (!g_process.exec || !g_process.exec->dentry) {
-                unlock(&g_process.fs_lock);
-                ret = -ENOENT;
-                break;
-            }
-            bufsize = dentry_get_path_size(g_process.exec->dentry);
-            data = __alloca(bufsize);
-            datasize = bufsize - 1;
-            dentry_get_path(g_process.exec->dentry, data);
-            unlock(&g_process.fs_lock);
-            break;
-        case PID_META_CWD:
-            lock(&g_process.fs_lock);
-            if (!g_process.cwd) {
-                unlock(&g_process.fs_lock);
-                ret = -ENOENT;
-                break;
-            }
-            bufsize = dentry_get_path_size(g_process.cwd);
-            data = __alloca(bufsize);
-            datasize = bufsize - 1;
-            dentry_get_path(g_process.cwd, data);
-            unlock(&g_process.fs_lock);
-            break;
-        case PID_META_ROOT:
-            lock(&g_process.fs_lock);
-            if (!g_process.root) {
-                unlock(&g_process.fs_lock);
-                ret = -ENOENT;
-                break;
-            }
-            bufsize = dentry_get_path_size(g_process.root);
-            data = __alloca(bufsize);
-            datasize = bufsize - 1;
-            dentry_get_path(g_process.root, data);
-            unlock(&g_process.fs_lock);
-            break;
-        default:
-            ret = -EINVAL;
-            break;
-    }
+    *out_owner = *(IDTYPE*)resp;
+    ret = 0;
 
-    put_thread(thread);
+    log_debug("%s: got a response: %u", __func__, *out_owner);
 
-    if (ret < 0)
-        goto out;
-
-    assert(src == msg->src);
-    ret = ipc_pid_retmeta_send(msg->src, msgin->pid, msgin->code, data, datasize, msg->seq);
 out:
+    free(resp);
+    free(msg);
     return ret;
 }
 
-int ipc_pid_retmeta_send(IDTYPE dest, IDTYPE pid, enum pid_meta_code code, const void* data,
-                         int datasize, unsigned long seq) {
-    size_t total_msg_size    = get_ipc_msg_size(sizeof(struct shim_ipc_pid_retmeta) + datasize);
-    struct shim_ipc_msg* msg = __alloca(total_msg_size);
-    init_ipc_msg(msg, IPC_MSG_PID_RETMETA, total_msg_size, dest);
-    struct shim_ipc_pid_retmeta* msgin = (struct shim_ipc_pid_retmeta*)&msg->msg;
+int ipc_get_id_owner_callback(IDTYPE src, void* data, uint64_t seq) {
+    IDTYPE* id = data;
+    IDTYPE owner = find_id_owner(*id);
+    log_debug("%s: find_id_owner(%u): %u", __func__, *id, owner);
 
-    msgin->pid      = pid;
-    msgin->code     = code;
-    msgin->datasize = datasize;
-    memcpy(msgin->data, data, datasize);
-    msg->seq = seq;
+    size_t msg_size = get_ipc_msg_size(sizeof(owner));
+    struct shim_ipc_msg* msg = __alloca(msg_size);
+    init_ipc_response(msg, seq, msg_size);
+    memcpy(&msg->data, &owner, sizeof(owner));
 
-    log_debug("ipc send to %u: IPC_MSG_PID_RETMETA(%d, %s, %d)\n", dest, pid,
-              pid_meta_code_str[code], datasize);
-
-    return send_ipc_message(msg, dest);
-}
-
-struct retmeta_args {
-    void* data;
-    int retval;
-};
-
-static void set_msg_retmeta(struct shim_ipc_msg_with_ack* req_msg, void* _args) {
-    if (!req_msg) {
-        return;
-    }
-
-    struct retmeta_args* args = _args;
-
-    void** data = (void**)req_msg->private;
-    if (data) {
-        *data = args->data;
-        args->data = NULL;
-    }
-    req_msg->retval = args->retval;
-
-    assert(req_msg->thread);
-    thread_wakeup(req_msg->thread);
-}
-
-int ipc_pid_retmeta_callback(struct shim_ipc_msg* msg, IDTYPE src) {
-    struct shim_ipc_pid_retmeta* msgin = (struct shim_ipc_pid_retmeta*)msg->msg;
-
-    log_debug("ipc callback from %u: IPC_MSG_PID_RETMETA(%u, %s, %d)\n", msg->src, msgin->pid,
-              pid_meta_code_str[msgin->code], msgin->datasize);
-
-    struct retmeta_args args = {
-        .retval = msgin->datasize,
-    };
-    if (msgin->datasize) {
-        args.data = malloc_copy(msgin->data, msgin->datasize);
-        if (!args.data) {
-            args.retval = 0;
-        }
-    }
-
-    ipc_msg_response_handle(src, msg->seq, set_msg_retmeta, &args);
-
-    free(args.data);
-    return 0;
+    return ipc_send_message(src, msg);
 }

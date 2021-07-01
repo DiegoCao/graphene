@@ -3,9 +3,10 @@ include ../../Scripts/Makefile.rules
 
 CFLAGS	+= -fno-stack-protector -fno-builtin -nostdlib \
 	  -I. \
+	  -I../../common/include \
+	  -I../../common/include/arch/$(ARCH) \
 	  -I../include \
 	  -I../include/pal \
-	  -I../include/lib \
 	  -I../include/arch/$(ARCH) \
 	  -I../include/arch/$(ARCH)/$(PAL_HOST)
 
@@ -38,20 +39,15 @@ executables = \
 	Pie \
 	Pipe \
 	Process \
-	Process2 \
 	Process3 \
 	Process4 \
 	Select \
-	Semaphore \
 	SendHandle \
-	Sleep \
 	Socket \
 	Symbols \
 	Tcp \
 	Thread2 \
 	Udp \
-	Wait \
-	Yield \
 	normalize_path \
 	$(executables-$(ARCH))
 
@@ -76,9 +72,12 @@ target = \
 
 include ../../Scripts/manifest.mk
 graphene_lib = .lib/graphene-lib.a
-pal_lib ?= ../../Runtime/libpal-$(PAL_HOST).so
-
-RUNTIME_DIR = $(CURDIR)/../../Runtime
+ifneq ($(SGX),)
+graphene = sgx
+else
+graphene = direct
+endif
+pal_lib ?= $(shell graphene-manifest -c '{{ graphene.pkglibdir }}')/$(graphene)/libpal.so
 
 .PHONY: all
 all: $(target) $(call expand_target_to_sig,$(target)) \
@@ -97,18 +96,18 @@ crt_init/user_shared_start.o crt_init/user_start.o: crt_init-recurse
 CFLAGS-Pie = -fPIC -pie
 CFLAGS-AttestationReport = -I../src/host/Linux-SGX
 
-abort.o: CFLAGS += -fPIC
+utils.o: CFLAGS += -fPIC
 
 # workaround: File.manifest.template has strange reference
 # to ../regression/File
 ../regression/File: | File
 	@true
 
-LDLIBS-preloads = crt_init/user_shared_start.o abort.o $(graphene_lib) $(pal_lib)
+LDLIBS-preloads = crt_init/user_shared_start.o utils.o $(graphene_lib) $(pal_lib)
 $(preloads): %.so: %.c $(LDLIBS-preloads)
 	$(call cmd,csingle) -shared -fPIC $(LDLIBS-preloads)
 
-LDLIBS-executables = crt_init/user_start.o abort.o $(graphene_lib) $(pal_lib) $(preloads)
+LDLIBS-executables = crt_init/user_start.o utils.o $(graphene_lib) $(pal_lib) $(preloads)
 $(executables): %: %.c $(LDLIBS-executables)
 	$(call cmd,csingle) -no-pie $(LDLIBS-executables)
 
@@ -117,7 +116,7 @@ include $(wildcard *.d)
 endif
 
 $(graphene_lib):
-	$(MAKE) -C ../lib target=$(abspath .lib)/
+	$(MAKE) -C ../../common/src target=$(abspath .lib)/
 
 .PHONY: regression
 regression:

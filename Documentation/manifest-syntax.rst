@@ -55,6 +55,10 @@ Graphene outputs log messages of the following types:
 * ``trace``: More detailed information, such as all system calls requested by
   the application. Might contain a lot of noise.
 
+.. warning::
+   Only ``error`` log level is suitable for production. Other levels may leak
+   sensitive data.
+
 Preloaded libraries
 ^^^^^^^^^^^^^^^^^^^
 
@@ -71,10 +75,29 @@ Entrypoint
 
 ::
 
-   libos.entrypoint = "URI"
+   libos.entrypoint = "[PATH]"
 
 This specifies the first executable which is to be started when spawning a
-Graphene instance from this manifest file.
+Graphene instance from this manifest file. Needs to be a path inside Graphene
+pointing to a mounted file. Relative paths will be interpreted as starting from
+the current working directory (i.e. from ``/`` by default, or ``fs.start_dir``
+if specified).
+
+The recommended usage is to provide an absolute path, and mount the executable
+at that path. For example::
+
+   libos.entrypoint = "/usr/bin/python3.8"
+
+   fs.mount.python.type = "chroot"
+   fs.mount.python.path = "/usr/bin/python3.8"
+   fs.mount.python.uri = "file:/usr/bin/python3.8"
+   # Or, if using a binary from your local directory:
+   # fs.mount.python.uri = "file:python3.8"
+
+.. note ::
+   Earlier, ``libos.entrypoint`` was a PAL URI. If you used it with a relative
+   path, it's probably enough to remove ``file:`` prefix (convert
+   ``"file:hello"`` to ``"hello"``).
 
 Command-line arguments
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -92,7 +115,7 @@ invocation.
 
 ::
 
-   loader.insecure__use_cmdline_argv = 1
+   loader.insecure__use_cmdline_argv = true
 
 or
 
@@ -108,16 +131,18 @@ If you want your application to use commandline arguments you need to either set
 ``loader.argv_src_file`` is intended to point to either a trusted file or a
 protected file. The former allows to securely hardcode arguments (current
 manifest syntax doesn't allow to include them inline), the latter allows the
-arguments to be provided at runtime from an external (trusted) source. *NOTE:*
-Pointing to a protected file is currently not supported, due to the fact that
-PF wrap key provisioning currently happens after setting up arguments.
+arguments to be provided at runtime from an external (trusted) source.
+
+.. note ::
+   Pointing to a protected file is currently not supported, due to the fact that
+   PF wrap key provisioning currently happens after setting up arguments.
 
 Environment variables
 ^^^^^^^^^^^^^^^^^^^^^
 
 ::
 
-   loader.insecure__use_host_env = 1
+   loader.insecure__use_host_env = [true|false]
 
 By default, environment variables from the host will *not* be passed to the app.
 This can be overridden by the option above, but most applications and runtime
@@ -141,9 +166,12 @@ environment, which can be generated using :file:`Tools/argv_serializer`. This
 option is intended to point to either a trusted file or a protected file. The
 former allows to securely hardcode environments (in a more flexible way than
 ``loader.env.[ENVIRON]`` option), the latter allows the environments to be
-provided at runtime from an external (trusted) source. *NOTE:* Pointing to a
-protected file is currently not supported, due to the fact that PF wrap key
-provisioning currently happens after setting up environment variables.
+provided at runtime from an external (trusted) source.
+
+.. note ::
+   Pointing to a protected file is currently not supported, due to the fact that
+   PF wrap key provisioning currently happens after setting up environment
+   variables.
 
 If the same variable is set in both, then ``loader.env.[ENVIRON]`` takes
 precedence.
@@ -153,8 +181,8 @@ Disabling ASLR
 
 ::
 
-    loader.insecure__disable_aslr = [1|0]
-    (Default: 0)
+    loader.insecure__disable_aslr = [true|false]
+    (Default: false)
 
 This specifies whether to disable Address Space Layout Randomization (ASLR).
 Since disabling ASLR worsens security of the application, ASLR is enabled by
@@ -165,14 +193,14 @@ Check invalid pointers
 
 ::
 
-    libos.check_invalid_pointers = [1|0]
-    (Default: 1)
+    libos.check_invalid_pointers = [true|false]
+    (Default: true)
 
 This specifies whether to enable checks of invalid pointers on syscall
-invocations. In particular, when this manifest option is set to ``1``,
+invocations. In particular, when this manifest option is set to ``true``,
 Graphene's LibOS will return an EFAULT error code if a user-supplied buffer
-points to an invalid memory region. Setting this manifest option to ``0`` may
-improve performance for certain workloads but may also generate
+points to an invalid memory region. Setting this manifest option to ``false``
+may improve performance for certain workloads but may also generate
 ``SIGSEGV/SIGBUS`` exceptions for some applications that specifically use
 invalid pointers (though this is not expected for most real-world applications).
 
@@ -228,8 +256,8 @@ Allowing eventfd
 
 ::
 
-    sys.insecure__allow_eventfd = [1|0]
-    (Default: 0)
+    sys.insecure__allow_eventfd = [true|false]
+    (Default: false)
 
 This specifies whether to allow system calls `eventfd()` and `eventfd2()`. Since
 eventfd emulation currently relies on the host, these system calls are
@@ -240,8 +268,8 @@ External SIGTERM injection
 
 ::
 
-    sys.enable_sigterm_injection = [1|0]
-    (Default: 0)
+    sys.enable_sigterm_injection = [true|false]
+    (Default: false)
 
 This specifies whether to allow for a one-time injection of `SIGTERM` signal
 into Graphene. Could be useful to handle graceful shutdown.
@@ -318,11 +346,11 @@ Debug/production enclave
 
 ::
 
-    sgx.debug = [1|0]
-    (Default: 1)
+    sgx.debug = [true|false]
+    (Default: true)
 
-This syntax specifies whether the enclave can be debugged. Set it to ``1`` for
-a |~| debug enclave and to ``0`` for a |~| production enclave.
+This syntax specifies whether the enclave can be debugged. Set it to ``true``
+for a |~| debug enclave and to ``false`` for a |~| production enclave.
 
 Enclave size
 ^^^^^^^^^^^^
@@ -343,8 +371,8 @@ Non-PIE binaries
 
 ::
 
-    sgx.nonpie_binary = [1|0]
-    (Default: 0)
+    sgx.nonpie_binary = [true|false]
+    (Default: false)
 
 This setting tells Graphene whether to use a specially crafted memory layout,
 which is required to support non-relocatable binaries (non-PIE).
@@ -397,16 +425,16 @@ Optional CPU features (AVX, AVX512, MPX, PKRU)
 
 ::
 
-    sgx.require_avx    = [1|0]
-    sgx.require_avx512 = [1|0]
-    sgx.require_mpx    = [1|0]
-    sgx.require_pkru   = [1|0]
-    (Default: 0)
+    sgx.require_avx    = [true|false]
+    sgx.require_avx512 = [true|false]
+    sgx.require_mpx    = [true|false]
+    sgx.require_pkru   = [true|false]
+    (Default: false)
 
 This syntax ensures that the CPU features are available and enabled for the
 enclave. If the options are set in the manifest but the features are unavailable
-on the platform, enclave initialization should fail. If the options are unset,
-enclave initialization should succeed even if these features are unavailable on
+on the platform, enclave initialization will fail. If the options are unset,
+enclave initialization will succeed even if these features are unavailable on
 the platform.
 
 ISV Product ID and SVN
@@ -428,11 +456,15 @@ Allowed files
 
     sgx.allowed_files.[identifier] = "[URI]"
 
-This syntax specifies the files that are allowed to be loaded into the enclave
-unconditionally. These files are not cryptographically hashed and are thus not
-protected. It is insecure to allow files containing code or critical
-information; developers must not allow files blindly! Instead, use trusted or
-protected files.
+This syntax specifies the files that are allowed to be created or loaded into
+the enclave unconditionally. In other words, allowed files can be opened for
+reading/writing and can be created if they do not exist already. Allowed files
+are not cryptographically hashed and are thus not protected.
+
+.. warning::
+   It is insecure to allow files containing code or critical information;
+   developers must not allow files blindly! Instead, use trusted or protected
+   files.
 
 Trusted files
 ^^^^^^^^^^^^^
@@ -441,12 +473,14 @@ Trusted files
 
     sgx.trusted_files.[identifier] = "[URI]"
 
-This syntax specifies the files to be cryptographically hashed, and thus allowed
-to be loaded into the enclave. The signer tool will automatically generate
-hashes of these files and add them into the SGX-specific manifest
-(``.manifest.sgx``). This is especially useful for shared libraries:
-a |~| trusted library cannot be silently replaced by a malicious host because
-the hash verification will fail.
+This syntax specifies the files to be cryptographically hashed at build time,
+and allowed to be accessed by the app in runtime only if their hashes match.
+This implies that trusted files can be only opened for reading (not for writing)
+and cannot be created if they do not exist already. The signer tool will
+automatically generate hashes of these files and add them to the SGX-specific
+manifest (``.manifest.sgx``). Marking files as trusted is especially useful for
+shared libraries: a |~| trusted library cannot be silently replaced by a
+malicious host because the hash verification will fail.
 
 Protected files
 ^^^^^^^^^^^^^^^
@@ -462,7 +496,7 @@ Protected files guarantee data confidentiality and integrity (tamper
 resistance), as well as file swap protection (a protected file can only be
 accessed when in a specific path).
 
-URIs can be files or directories. If a directory is specified, all existing
+URI can be a file or a directory. If a directory is specified, all existing
 files/directories within it are registered as protected recursively (and are
 expected to be encrypted in the PF format). New files created in a protected
 directory are automatically treated as protected.
@@ -484,25 +518,29 @@ File check policy
 
 This syntax specifies the file check policy, determining the behavior of
 authentication when opening files. By default, only files explicitly listed as
-_trusted_files_ or _allowed_files_ declared in the manifest are allowed for
-access. If the file check policy is ``allow_all_but_log``, all files other than
-trusted and allowed are allowed for access, and Graphene-SGX emits a warning
-message for every such file. This is a convenient way to determine the set of
-files that the ported application uses.
+``trusted_files`` or ``allowed_files`` declared in the manifest are allowed for
+access.
+
+If the file check policy is ``allow_all_but_log``, all files other than trusted
+and allowed are allowed for access, and Graphene-SGX emits a warning message for
+every such file. Effectively, this policy operates on all unknown files as if
+they were listed as ``allowed_files``. (However, this policy still does not
+allow writing/creating files specified as trusted.) This policy is a convenient
+way to determine the set of files that the ported application uses.
 
 Attestation and quotes
 ^^^^^^^^^^^^^^^^^^^^^^
 
 ::
 
-    sgx.remote_attestation = [1|0]
-    (Default: 0)
+    sgx.remote_attestation = [true|false]
+    (Default: false)
 
-    sgx.ra_client_linkable = [1|0]
+    sgx.ra_client_linkable = [true|false]
     sgx.ra_client_spid     = "[HEX]"
 
 This syntax specifies the parameters for remote attestation. To enable it,
-``remote_attestation`` must be set to ``1``.
+``remote_attestation`` must be set to ``true``.
 
 For EPID based attestation, ``ra_client_linkable`` and ``ra_client_spid`` must
 be filled with your registered Intel SGX EPID Attestation Service credentials
@@ -517,8 +555,8 @@ Pre-heating enclave
 
 ::
 
-    sgx.preheat_enclave = [1|0]
-    (Default: 0)
+    sgx.preheat_enclave = [true|false]
+    (Default: false)
 
 When enabled, this option instructs Graphene to pre-fault all heap pages during
 initialization. This has a negative impact on the total run time, but shifts the
@@ -535,8 +573,8 @@ Enabling per-thread and process-wide SGX stats
 
 ::
 
-    sgx.enable_stats = [1|0]
-    (Default: 0)
+    sgx.enable_stats = [true|false]
+    (Default: false)
 
 This syntax specifies whether to enable SGX enclave-specific statistics:
 
@@ -554,9 +592,10 @@ This syntax specifies whether to enable SGX enclave-specific statistics:
    includes creating the enclave, adding enclave pages, measuring them and
    initializing the enclave.
 
-*Note:* this option is insecure and cannot be used with production enclaves
-(``sgx.debug = 0``). If the production enclave is started with this option set,
-Graphene will fail initialization of the enclave.
+.. warning::
+   This option is insecure and cannot be used with production enclaves
+   (``sgx.debug = false``). If a production enclave is started with this option
+   set, Graphene will fail initialization of the enclave.
 
 SGX profiling
 ^^^^^^^^^^^^^
@@ -579,9 +618,10 @@ sgx-perf.data``.
 
 See :ref:`sgx-profile` for more information.
 
-*Note:* this option is insecure and cannot be used with production enclaves
-(``sgx.debug = 0``). If the production enclave is started with this option set,
-Graphene will fail initialization of the enclave.
+.. warning::
+   This option is insecure and cannot be used with production enclaves
+   (``sgx.debug = false``). If a production enclave is started with this option
+   set, Graphene will fail initialization of the enclave.
 
 ::
 
@@ -597,15 +637,15 @@ Specifies what events to record:
 
 * ``ocall_outer``: Records the outer OCALL function, i.e. what OCALL handlers
   are going to be executed. Does not include stack information (cannot be used
-  with ``sgx.profile.with_stack = 1``).
+  with ``sgx.profile.with_stack = true``).
 
 See also :ref:`sgx-profile-ocall` for more detailed advice regarding the OCALL
 modes.
 
 ::
 
-    sgx.profile.with_stack = [1|0]
-    (Default: 0)
+    sgx.profile.with_stack = [true|false]
+    (Default: false)
 
 This syntax specifies whether to include stack information with the profiling
 data. This will enable ``perf report`` to show call chains. However, it will
@@ -623,5 +663,6 @@ lower overhead.
 Note that the accuracy is limited by how often the process is interrupted by
 Linux scheduler: the effective maximum is 250 samples per second.
 
-**Note**: This option applies only to ``aex`` mode. In the ``ocall_*`` modes,
-currently all samples are taken.
+.. note::
+   This option applies only to ``aex`` mode. In the ``ocall_*`` modes, currently
+   all samples are taken.

@@ -13,6 +13,7 @@
 #include "shim_internal.h"
 #include "shim_lock.h"
 #include "shim_thread.h"
+#include "stat.h"
 
 static struct shim_lock handle_mgr_lock;
 
@@ -45,57 +46,104 @@ static int init_tty_handle(struct shim_handle* hdl, bool write) {
     if (ret < 0)
         return ret;
 
-    set_handle_fs(hdl, dent->fs);
+    hdl->fs = dent->fs;
     hdl->dentry = dent;
-    dentry_get_path_into_qstr(dent, &hdl->path);
     return 0;
 }
 
-static inline int init_exec_handle(void) {
-    if (!g_pal_control->executable)
-        return 0;
+int open_executable(struct shim_handle* hdl, const char* path) {
+    struct shim_dentry* dent = NULL;
 
+    int ret = path_lookupat(/*start=*/NULL, path, LOOKUP_FOLLOW, &dent);
+    if (ret < 0) {
+        goto out;
+    }
+
+    if (dent->type != S_IFREG) {
+        ret = -EACCES;
+        goto out;
+    }
+
+    if (!(dent->perm & S_IXUSR)) {
+        ret = -EACCES;
+        goto out;
+    }
+
+    ret = dentry_open(hdl, dent, O_RDONLY);
+    if (ret < 0) {
+        goto out;
+    }
+
+    ret = 0;
+out:
+    if (dent)
+        put_dentry(dent);
+
+    return ret;
+}
+
+static int init_exec_handle(void) {
     lock(&g_process.fs_lock);
     if (g_process.exec) {
-        // TODO: This is only a temporary workaround, which should be deleted after removing exec
-        // handling from PAL. `g_pal_control->executable` is valid only until first execve - in such
-        // case it's stale, and g_process.exec is already initialized by shim_do_execve_rtld.
+        /* `g_process.exec` handle is already initialized if we did execve. See
+         * `shim_do_execve_rtld`. */
         unlock(&g_process.fs_lock);
         return 0;
     }
     unlock(&g_process.fs_lock);
 
-    struct shim_handle* exec = get_new_handle();
-    if (!exec)
-        return -ENOMEM;
+    /* Initialize `g_process.exec` based on `libos.entrypoint` manifest key. */
+    char* entrypoint = NULL;
+    const char* exec_path;
+    struct shim_handle* hdl = NULL;
+    int ret;
 
-    qstrsetstr(&exec->uri, g_pal_control->executable, strlen(g_pal_control->executable));
-    exec->type     = TYPE_FILE;
-    exec->flags    = O_RDONLY;
-    exec->acc_mode = MAY_READ;
+    /* Initialize `g_process.exec` based on `libos.entrypoint` manifest key. */
+    assert(g_manifest_root);
+    ret = toml_string_in(g_manifest_root, "libos.entrypoint", &entrypoint);
+    if (ret < 0) {
+        log_error("Cannot parse 'libos.entrypoint'");
+        ret = -EINVAL;
+        goto out;
+    }
+    if (!entrypoint) {
+        log_error("'libos.entrypoint' must be specified in the manifest");
+        ret = -EINVAL;
+        goto out;
+    }
 
-    struct shim_mount* fs = find_mount_from_uri(g_pal_control->executable);
-    if (fs) {
-        const char* p = g_pal_control->executable + fs->uri.len;
-        /* Lookup for `g_pal_control->executable` needs to be done under a given mount point which
-         * requires a relative path name. OTOH the one in manifest file can be absolute path. */
-        while (*p == '/') {
-            p++;
-        }
-        path_lookupat(fs->root, p, LOOKUP_FOLLOW, &exec->dentry);
-        set_handle_fs(exec, fs);
-        if (exec->dentry)
-            dentry_get_path_into_qstr(exec->dentry, &exec->path);
-        put_mount(fs);
-    } else {
-        set_handle_fs(exec, &chroot_builtin_fs);
+    exec_path = entrypoint;
+
+    if (strstartswith(exec_path, URI_PREFIX_FILE)) {
+        /* TODO: change to error after some deprecation period */
+        log_error("'libos.entrypoint' is now a Graphene path, not URI. "
+                  "Ignoring the 'file:' prefix.");
+        exec_path += strlen(URI_PREFIX_FILE);
+    }
+
+    hdl = get_new_handle();
+    if (!hdl) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    ret = open_executable(hdl, exec_path);
+    if (ret < 0) {
+        log_error("init_exec_handle: error opening executable: %d", ret);
+        goto out;
     }
 
     lock(&g_process.fs_lock);
-    g_process.exec = exec;
+    g_process.exec = hdl;
+    get_handle(hdl);
     unlock(&g_process.fs_lock);
 
-    return 0;
+    ret = 0;
+out:
+    free(entrypoint);
+    if (hdl)
+        put_handle(hdl);
+    return ret;
 }
 
 static struct shim_handle_map* get_new_handle_map(FDTYPE size);
@@ -381,12 +429,12 @@ int set_new_fd_handle_above_fd(FDTYPE fd, struct shim_handle* hdl, int fd_flags,
 }
 
 static inline __attribute__((unused)) const char* __handle_name(struct shim_handle* hdl) {
-    if (!qstrempty(&hdl->path))
-        return qstrgetstr(&hdl->path);
     if (!qstrempty(&hdl->uri))
         return qstrgetstr(&hdl->uri);
-    if (hdl->fs_type[0])
-        return hdl->fs_type;
+    if (hdl->dentry && !qstrempty(&hdl->dentry->name))
+        return qstrgetstr(&hdl->dentry->name);
+    if (hdl->fs)
+        return hdl->fs->name;
     return "(unknown)";
 }
 
@@ -394,7 +442,7 @@ void get_handle(struct shim_handle* hdl) {
 #ifdef DEBUG_REF
     int ref_count = REF_INC(hdl->ref_count);
 
-    log_debug("get handle %p(%s) (ref_count = %d)\n", hdl, __handle_name(hdl), ref_count);
+    log_debug("get handle %p(%s) (ref_count = %d)", hdl, __handle_name(hdl), ref_count);
 #else
     REF_INC(hdl->ref_count);
 #endif
@@ -410,32 +458,14 @@ void put_handle(struct shim_handle* hdl) {
     int ref_count = REF_DEC(hdl->ref_count);
 
 #ifdef DEBUG_REF
-    log_debug("put handle %p(%s) (ref_count = %d)\n", hdl, __handle_name(hdl), ref_count);
+    log_debug("put handle %p(%s) (ref_count = %d)", hdl, __handle_name(hdl), ref_count);
 #endif
 
     if (!ref_count) {
         delete_from_epoll_handles(hdl);
 
         if (hdl->is_dir) {
-            struct shim_dir_handle* dir = &hdl->dir_info;
-
-            if (dir->dot) {
-                put_dentry(dir->dot);
-                dir->dot = NULL;
-            }
-
-            if (dir->dotdot) {
-                put_dentry(dir->dotdot);
-                dir->dotdot = NULL;
-            }
-
-            if (dir->ptr != (void*)-1) {
-                while (dir->ptr && *dir->ptr) {
-                    struct shim_dentry* dent = *dir->ptr;
-                    put_dentry(dent);
-                    *(dir->ptr++) = NULL;
-                }
-            }
+            clear_directory_handle(hdl);
         }
 
         if (hdl->fs && hdl->fs->fs_ops && hdl->fs->fs_ops->close)
@@ -449,12 +479,11 @@ void put_handle(struct shim_handle* hdl) {
         if (hdl->fs && hdl->fs->fs_ops && hdl->fs->fs_ops->hput)
             hdl->fs->fs_ops->hput(hdl);
 
-        qstrfree(&hdl->path);
         qstrfree(&hdl->uri);
 
         if (hdl->pal_handle) {
 #ifdef DEBUG_REF
-            log_debug("handle %p closes PAL handle %p\n", hdl, hdl->pal_handle);
+            log_debug("handle %p closes PAL handle %p", hdl, hdl->pal_handle);
 #endif
             DkObjectClose(hdl->pal_handle); // TODO: handle errors
             hdl->pal_handle = NULL;
@@ -462,9 +491,6 @@ void put_handle(struct shim_handle* hdl) {
 
         if (hdl->dentry)
             put_dentry(hdl->dentry);
-
-        if (hdl->fs)
-            put_mount(hdl->fs);
 
         destroy_handle(hdl);
     }
@@ -663,31 +689,28 @@ BEGIN_CP_FUNC(handle) {
         new_hdl = (struct shim_handle*)(base + off);
 
         lock(&hdl->lock);
-        struct shim_mount* fs = hdl->fs;
-        *new_hdl              = *hdl;
+        *new_hdl = *hdl;
 
-        if (fs && fs->fs_ops && fs->fs_ops->checkout)
-            fs->fs_ops->checkout(new_hdl);
+        if (hdl->fs && hdl->fs->fs_ops && hdl->fs->fs_ops->checkout)
+            hdl->fs->fs_ops->checkout(new_hdl);
 
         new_hdl->dentry = NULL;
         REF_SET(new_hdl->ref_count, 0);
         clear_lock(&new_hdl->lock);
 
-        DO_CP_IN_MEMBER(qstr, new_hdl, path);
-        DO_CP_IN_MEMBER(qstr, new_hdl, uri);
+        DO_CP(fs, hdl->fs, &new_hdl->fs);
 
-        if (fs && fs != &fifo_builtin_fs && hdl->dentry) {
-            DO_CP_MEMBER(mount, hdl, new_hdl, fs);
-        } else {
-            new_hdl->fs = NULL;
-        }
+        DO_CP_IN_MEMBER(qstr, new_hdl, uri);
 
         if (hdl->dentry) {
             if (hdl->dentry->state & DENTRY_ISDIRECTORY) {
-                /* we don't checkpoint children dentries of a directory dentry, so need to list
-                 * directory again in child process; mark handle to indicate no cached dentries */
-                hdl->dir_info.buf = (void*)-1;
-                hdl->dir_info.ptr = (void*)-1;
+                /*
+                 * We don't checkpoint children dentries of a directory dentry, so the child process
+                 * will need to list the directory again. However, we keep `dir_info.pos` unchanged
+                 * so that `getdents/getdents64` will resume from the same place.
+                 */
+                new_hdl->dir_info.dents = NULL;
+                new_hdl->dir_info.count = 0;
             }
             DO_CP_MEMBER(dentry, hdl, new_hdl, dentry);
         }
@@ -702,6 +725,10 @@ BEGIN_CP_FUNC(handle) {
         INIT_LISTP(&new_hdl->epolls);
 
         switch (hdl->type) {
+            case TYPE_FILE:
+                if (hdl->info.file.sync)
+                    DO_CP(sync_handle, hdl->info.file.sync, &new_hdl->info.file.sync);
+                break;
             case TYPE_EPOLL:
                 /* `new_hdl->info.epoll.fds_count` stays the same - copied above. */
                 DO_CP(epoll_item, &hdl->info.epoll.fds, &new_hdl->info.epoll.fds);
@@ -740,31 +767,15 @@ BEGIN_RS_FUNC(handle) {
         return -ENOMEM;
     }
 
-    if (!hdl->fs) {
-        assert(hdl->fs_type);
-        search_builtin_fs(hdl->fs_type, &hdl->fs);
-        if (!hdl->fs) {
-            destroy_lock(&hdl->lock);
-            return -EINVAL;
-        }
-    } else {
-        get_mount(hdl->fs);
-    }
-
     if (hdl->dentry) {
         get_dentry(hdl->dentry);
     }
 
     switch (hdl->type) {
-        case TYPE_DEV:
-            /* for device handles, info.dev.dev_ops contains function pointers into LibOS; they may
-             * have become invalid due to relocation of LibOS text section in the child, update them
-             */
-            if (dev_update_dev_ops(hdl) < 0) {
-                return -EINVAL;
-            }
+        case TYPE_FILE:
+            CP_REBASE(hdl->info.file.sync);
             break;
-        case TYPE_EPOLL: ;
+        case TYPE_EPOLL: {
             int ret = create_event(&hdl->info.epoll.event);
             if (ret < 0) {
                 return ret;
@@ -778,15 +789,13 @@ BEGIN_RS_FUNC(handle) {
             }
             assert(hdl->info.epoll.fds_count == count);
             break;
+        }
         default:
             break;
     }
 
     if (hdl->fs && hdl->fs->fs_ops && hdl->fs->fs_ops->checkin)
         hdl->fs->fs_ops->checkin(hdl);
-
-    DEBUG_RS("path=%s,type=%s,uri=%s,flags=%03o", qstrgetstr(&hdl->path), hdl->fs_type,
-             qstrgetstr(&hdl->uri), hdl->flags);
 }
 END_RS_FUNC(handle)
 

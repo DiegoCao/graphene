@@ -34,16 +34,16 @@ long shim_do_rt_sigaction(int signum, const struct __kernel_sigaction* act,
             sigsetsize != sizeof(__sigset_t))
         return -EINVAL;
 
-    if (act && test_user_memory((void*)act, sizeof(*act), /*write=*/false))
+    if (act && !is_user_memory_readable(act, sizeof(*act)))
         return -EFAULT;
 
-    if (oldact && test_user_memory(oldact, sizeof(*oldact), /*write=*/true))
+    if (oldact && !is_user_memory_writable(oldact, sizeof(*oldact)))
         return -EFAULT;
 
     if (act && !(act->sa_flags & SA_RESTORER)) {
         /* XXX: This might not be true for all architectures (but is for x86_64)...
          * Check `shim_signal.c` if you update this! */
-        log_warning("rt_sigaction: SA_RESTORER flag is required!\n");
+        log_warning("rt_sigaction: SA_RESTORER flag is required!");
         return -EINVAL;
     }
 
@@ -92,10 +92,10 @@ long shim_do_rt_sigprocmask(int how, const __sigset_t* set, __sigset_t* oldset, 
     if (how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK)
         return -EINVAL;
 
-    if (set && test_user_memory((void*)set, sizeof(*set), false))
+    if (set && !is_user_memory_readable(set, sizeof(*set)))
         return -EFAULT;
 
-    if (oldset && test_user_memory(oldset, sizeof(*oldset), false))
+    if (oldset && !is_user_memory_readable(oldset, sizeof(*oldset)))
         return -EFAULT;
 
     struct shim_thread* cur = get_cur_thread();
@@ -136,10 +136,10 @@ out:
 }
 
 long shim_do_sigaltstack(const stack_t* ss, stack_t* oss) {
-    if (ss && test_user_memory((void*)ss, sizeof(*ss), /*write=*/false)) {
+    if (ss && !is_user_memory_readable(ss, sizeof(*ss))) {
         return -EFAULT;
     }
-    if (oss && test_user_memory(oss, sizeof(*oss), /*write=*/true)) {
+    if (oss && !is_user_memory_writable(oss, sizeof(*oss))) {
         return -EFAULT;
     }
 
@@ -187,7 +187,7 @@ long shim_do_rt_sigsuspend(const __sigset_t* mask_ptr, size_t setsize) {
     if (setsize != sizeof(sigset_t)) {
         return -EINVAL;
     }
-    if (test_user_memory((void*)mask_ptr, sizeof(*mask_ptr), false))
+    if (!is_user_memory_readable(mask_ptr, sizeof(*mask_ptr)))
         return -EFAULT;
 
     __sigset_t mask = *mask_ptr;
@@ -200,10 +200,10 @@ long shim_do_rt_sigsuspend(const __sigset_t* mask_ptr, size_t setsize) {
     set_sig_mask(current, &mask);
     unlock(&current->lock);
 
-    DkEventClear(current->scheduler_event);
+    thread_prepare_wait();
     while (!have_pending_signals()) {
-        int ret = thread_sleep(NO_TIMEOUT, /*ignore_pending_signals=*/false);
-        if (ret < 0 && ret != -EINTR && ret != -EAGAIN) {
+        int ret = thread_wait(/*timeout_us=*/NULL, /*ignore_pending_signals=*/false);
+        if (ret < 0 && ret != -EINTR) {
             return ret;
         }
     }
@@ -226,11 +226,91 @@ long shim_do_rt_sigsuspend(const __sigset_t* mask_ptr, size_t setsize) {
     return_from_syscall(context);
 }
 
+long shim_do_rt_sigtimedwait(const __sigset_t* unblocked_ptr, siginfo_t* info,
+                             struct __kernel_timespec* timeout, size_t setsize) {
+    int ret;
+
+    if (setsize != sizeof(sigset_t)) {
+        return -EINVAL;
+    }
+    if (!is_user_memory_readable(unblocked_ptr, sizeof(*unblocked_ptr))) {
+        return -EFAULT;
+    }
+    if (info && !is_user_memory_writable(info, sizeof(*info))) {
+        return -EFAULT;
+    }
+
+    if (timeout) {
+        if (!is_user_memory_readable(timeout, sizeof(*timeout))) {
+            return -EFAULT;
+        }
+        if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
+                (uint64_t)timeout->tv_nsec >= TIME_NS_IN_S) {
+            return -EINVAL;
+        }
+    }
+
+    __sigset_t unblocked = *unblocked_ptr;
+    clear_illegal_signals(&unblocked);
+
+    /* Note that the user of `rt_sigtimedwait()` is supposed to block the signals in `unblocked` set
+     * via a prior call to `sigprocmask()`, so that these signals can only occur as a response to
+     * `rt_sigtimedwait()`. Temporarily augment the current mask with these unblocked signals. */
+    __sigset_t new;
+    __sigset_t old;
+
+    struct shim_thread* current = get_cur_thread();
+    lock(&current->lock);
+    get_sig_mask(current, &old);
+    __signotset(&new, &old, &unblocked);
+    set_sig_mask(current, &new);
+    unlock(&current->lock);
+
+    uint64_t timeout_us = timeout ? timespec_to_us(timeout) : NO_TIMEOUT;
+    int thread_wait_res = -EINTR;
+
+    thread_prepare_wait();
+    while (!have_pending_signals()) {
+        thread_wait_res = thread_wait(timeout_us != NO_TIMEOUT ? &timeout_us : NULL,
+                                      /*ignore_pending_signals=*/false);
+        if (thread_wait_res == -ETIMEDOUT) {
+            break;
+        }
+    }
+
+    /* If `have_pending_signals()` spotted a signal, we just pray it was targeted directly at this
+     * thread or no other thread handles it first; see also `do_nanosleep()` in shim_sleep.c */
+
+    /* invert the set of unblocked signals to get the mask for popping one of requested signals */
+    __sigset_t all_blocked;
+    __sigfillset(&all_blocked);
+    __sigset_t mask;
+    __signotset(&mask, &all_blocked, &unblocked);
+
+    struct shim_signal signal = { 0 };
+    pop_unblocked_signal(&mask, &signal);
+
+    if (signal.siginfo.si_signo) {
+        if (info) {
+            *info = signal.siginfo;
+        }
+        ret = signal.siginfo.si_signo;
+    } else {
+        ret = (thread_wait_res == -ETIMEDOUT ? -EAGAIN : -EINTR);
+    }
+
+    lock(&current->lock);
+    set_sig_mask(current, &old);
+    unlock(&current->lock);
+
+    return ret;
+}
+
 long shim_do_rt_sigpending(__sigset_t* set, size_t sigsetsize) {
     if (sigsetsize != sizeof(*set))
         return -EINVAL;
 
-    if (test_user_memory(set, sigsetsize, /*write=*/true))
+    if (!is_user_memory_writable(set, sigsetsize))
         return -EFAULT;
 
     get_all_pending_signals(set);
@@ -328,10 +408,15 @@ int do_kill_pgroup(IDTYPE sender, IDTYPE pgid, int sig) {
         pgid = current_pgid;
     }
 
+    /* TODO: currently process groups are not supported. */
+#if 0
     int ret = ipc_kill_pgroup(sender, pgid, sig);
     if (ret < 0 && ret != -ESRCH) {
         return ret;
     }
+#else
+    int ret = -ENOSYS;
+#endif
 
     if (current_pgid != pgid) {
         return ret;

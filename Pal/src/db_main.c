@@ -11,7 +11,6 @@
 #include "api.h"
 #include "elf/elf.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -174,17 +173,17 @@ static void configure_logging(void) {
 
     if (log_level_str) {
         if (!strcmp(log_level_str, "none")) {
-            log_level = PAL_LOG_NONE;
+            log_level = LOG_LEVEL_NONE;
         } else if (!strcmp(log_level_str, "error")) {
-            log_level = PAL_LOG_ERROR;
+            log_level = LOG_LEVEL_ERROR;
         } else if (!strcmp(log_level_str, "warning")) {
-            log_level = PAL_LOG_WARNING;
+            log_level = LOG_LEVEL_WARNING;
         } else if (!strcmp(log_level_str, "debug")) {
-            log_level = PAL_LOG_DEBUG;
+            log_level = LOG_LEVEL_DEBUG;
         } else if (!strcmp(log_level_str, "trace")) {
-            log_level = PAL_LOG_TRACE;
+            log_level = LOG_LEVEL_TRACE;
         } else if (!strcmp(log_level_str, "all")) {
-            log_level = PAL_LOG_ALL;
+            log_level = LOG_LEVEL_ALL;
         } else {
             INIT_FAIL_MANIFEST(PAL_ERROR_DENIED, "Unknown 'loader.log_level'");
         }
@@ -196,7 +195,7 @@ static void configure_logging(void) {
     if (ret < 0)
         INIT_FAIL_MANIFEST(PAL_ERROR_DENIED, "Cannot parse 'loader.log_file'");
 
-    if (log_file && log_level > PAL_LOG_NONE) {
+    if (log_file && log_level > LOG_LEVEL_NONE) {
         ret = _DkInitDebugStream(log_file);
 
         if (ret < 0)
@@ -270,7 +269,6 @@ out_fail:
  * configuration for early initialization.
  */
 noreturn void pal_main(PAL_NUM instance_id,        /* current instance id */
-                       const char* exec_uri, // TODO: remove after migrating exec handling to LibOS.
                        PAL_HANDLE parent_process,  /* parent process if it's a child */
                        PAL_HANDLE first_thread,    /* first thread handle */
                        PAL_STR* arguments,         /* application arguments */
@@ -283,6 +281,8 @@ noreturn void pal_main(PAL_NUM instance_id,        /* current instance id */
     assert(g_pal_state.manifest_root);
     assert(g_pal_state.alloc_align && IS_POWER_OF_2(g_pal_state.alloc_align));
 
+    configure_logging();
+
     char* dummy_exec_str = NULL;
     ret = toml_string_in(g_pal_state.manifest_root, "loader.exec", &dummy_exec_str);
     if (ret < 0 || dummy_exec_str)
@@ -290,15 +290,13 @@ noreturn void pal_main(PAL_NUM instance_id,        /* current instance id */
                                    "manifest according to the current documentation.");
     free(dummy_exec_str);
 
-    bool disable_aslr = false;
-    int64_t disable_aslr_int64;
-    ret = toml_int_in(g_pal_state.manifest_root, "loader.insecure__disable_aslr",
-                      /*defaultval=*/0, &disable_aslr_int64);
-    if (ret < 0 || (disable_aslr_int64 != 0 && disable_aslr_int64 != 1)) {
+    bool disable_aslr;
+    ret = toml_bool_in(g_pal_state.manifest_root, "loader.insecure__disable_aslr",
+                       /*defaultval=*/false, &disable_aslr);
+    if (ret < 0) {
         INIT_FAIL_MANIFEST(PAL_ERROR_DENIED, "Cannot parse 'loader.insecure__disable_aslr' "
-                                             "(the value must be 0 or 1)");
+                                             "(the value must be `true` or `false`)");
     }
-    disable_aslr = !!disable_aslr_int64;
 
     /* Load argv */
     /* TODO: Add an option to specify argv inline in the manifest. This requires an upgrade to the
@@ -323,19 +321,19 @@ noreturn void pal_main(PAL_NUM instance_id,        /* current instance id */
         arguments[0] = argv0_override;
     }
 
-    int64_t use_cmdline_argv = 0;
-    ret = toml_int_in(g_pal_state.manifest_root, "loader.insecure__use_cmdline_argv",
-                      /*defaultval=*/0, &use_cmdline_argv);
-    if (ret < 0 || (use_cmdline_argv != 0 && use_cmdline_argv != 1)) {
-        INIT_FAIL_MANIFEST(PAL_ERROR_DENIED, "Cannot parse "
-                           "'loader.insecure__use_cmdline_argv' (the value must be 0 or 1)");
+    bool use_cmdline_argv;
+    ret = toml_bool_in(g_pal_state.manifest_root, "loader.insecure__use_cmdline_argv",
+                       /*defaultval=*/false, &use_cmdline_argv);
+    if (ret < 0) {
+        INIT_FAIL_MANIFEST(PAL_ERROR_DENIED, "Cannot parse 'loader.insecure__use_cmdline_argv' "
+                                             "(the value must be `true` or `false`)");
     }
 
     if (use_cmdline_argv) {
         /* Warn only in the first process. */
         if (!parent_process) {
             log_error("Using insecure argv source. Graphene will continue application execution, "
-                      "but this configuration must not be used in production!\n");
+                      "but this configuration must not be used in production!");
         }
     } else {
         char* argv_src_file = NULL;
@@ -349,7 +347,7 @@ noreturn void pal_main(PAL_NUM instance_id,        /* current instance id */
              * be achieved using protected or trusted files). */
             if (arguments[0] && arguments[1])
                 log_error("Discarding cmdline arguments (%s %s [...]) because loader.argv_src_file "
-                          "was specified in the manifest.\n", arguments[0], arguments[1]);
+                          "was specified in the manifest.", arguments[0], arguments[1]);
 
             ret = load_cstring_array(argv_src_file, &arguments);
             if (ret < 0)
@@ -362,12 +360,12 @@ noreturn void pal_main(PAL_NUM instance_id,        /* current instance id */
         }
     }
 
-    int64_t use_host_env = 0;
-    ret = toml_int_in(g_pal_state.manifest_root, "loader.insecure__use_host_env",
-                      /*defaultval=*/0, &use_host_env);
-    if (ret < 0 || (use_host_env != 0 && use_host_env != 1)) {
-        INIT_FAIL_MANIFEST(PAL_ERROR_DENIED, "Cannot parse "
-                           "'loader.insecure__use_host_env' (the value must be 0 or 1)");
+    bool use_host_env;
+    ret = toml_bool_in(g_pal_state.manifest_root, "loader.insecure__use_host_env",
+                       /*defaultval=*/false, &use_host_env);
+    if (ret < 0) {
+        INIT_FAIL_MANIFEST(PAL_ERROR_DENIED, "Cannot parse 'loader.insecure__use_host_env' "
+                                             "(the value must be `true` or `false`)");
     }
 
     if (use_host_env) {
@@ -375,7 +373,7 @@ noreturn void pal_main(PAL_NUM instance_id,        /* current instance id */
         if (!parent_process) {
             log_error("Forwarding host environment variables to the app is enabled. Graphene will "
                       "continue application execution, but this configuration must not be used in "
-                      "production!\n");
+                      "production!");
         }
     } else {
         environments = malloc(sizeof(*environments));
@@ -419,18 +417,12 @@ noreturn void pal_main(PAL_NUM instance_id,        /* current instance id */
         INIT_FAIL_MANIFEST(PAL_ERROR_INVAL, "Cannot parse 'pal.entrypoint'");
     if (entrypoint) {
         if (!strstartswith(entrypoint, URI_PREFIX_FILE))
-            INIT_FAIL(PAL_ERROR_INVAL, "'pal.entrypoint' is missing 'file:' prefix\n");
-        // Temporary hack: Assume we're in PAL regression test suite and load the test binary
-        // directly, without LibOS.
-        exec_uri = entrypoint;
+            INIT_FAIL(PAL_ERROR_INVAL, "'pal.entrypoint' is missing 'file:' prefix");
     }
-
-    configure_logging();
 
     g_pal_control.host_type       = XSTRINGIFY(HOST_TYPE);
     g_pal_control.process_id      = _DkGetProcessId();
     g_pal_control.manifest_root   = g_pal_state.manifest_root;
-    g_pal_control.executable      = exec_uri;
     g_pal_control.parent_process  = parent_process;
     g_pal_control.first_thread    = first_thread;
     g_pal_control.disable_aslr    = disable_aslr;

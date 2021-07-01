@@ -20,13 +20,14 @@ include host/$(PAL_HOST)/Makefile.am
 
 CFLAGS += \
 	-I. \
+	-I../../common/include \
+	-I../../common/include/arch/$(ARCH) \
 	-I$(HOST_DIR) \
 	-I../include \
 	-I../include/pal \
 	-I../include/$(HOST_DIR) \
 	-I../include/arch/$(ARCH) \
-	-I../include/arch/$(ARCH)/$(PAL_HOST) \
-	-I../include/lib
+	-I../include/arch/$(ARCH)/$(PAL_HOST)
 
 # use TLS-based stack protector of GCC (all PALs must have a canary in its PAL_TCB at offset 0x8);
 # not all compilers support mstack-protector-guard, so use stack protector only if supported
@@ -43,8 +44,10 @@ PAL_HOST_MACRO = $(shell echo $(PAL_HOST) | tr '[:lower:]' '[:upper:]' | tr '-' 
 #     (2) Generic targets are in "host/{Host Name}/.obj".
 #     (3) API library targets are in "host/{Host Name}/.lib".
 
+ifeq ($(PAL_HOST),Linux-SGX)
 files_to_build = $(pal_lib) $(pal_lib_post) $(pal_static) \
 		 $(pal_loader)
+endif
 
 defs	= -DIN_PAL -DHOST_TYPE="$(PAL_HOST)" -D$(PAL_HOST_MACRO)
 CFLAGS += $(defs)
@@ -54,7 +57,6 @@ objs = \
 	db_main.o \
 	db_memory.o \
 	db_misc.o \
-	db_mutex.o \
 	db_object.o \
 	db_process.o \
 	db_rtld.o \
@@ -79,7 +81,9 @@ ifneq ($(pal_lib),)
 	runtime_lib += $(RUNTIME_DIR)/libpal-$(PAL_HOST)$(suffix $(pal_lib))
 endif
 
+ifeq ($(PAL_HOST),Linux-SGX)
 files_to_install = $(runtime_loader) $(runtime_lib) $(runtime_sec)
+endif
 
 
 ###########################
@@ -87,12 +91,12 @@ files_to_install = $(runtime_loader) $(runtime_lib) $(runtime_sec)
 ###########################
 
 .PHONY: all
-all: $(files_to_build) $(files_to_install)
+all: $(graphene_lib) $(files_to_build) $(files_to_install)
 
 .PHONY: host_lib_recurse graphene_lib_recurse
 
 graphene_lib_recurse:
-	$(MAKE) -C ../lib target=$(abspath $(LIB_DIR))/
+	CFLAGS="$(defs)" $(MAKE) -C ../../common/src target=$(abspath $(LIB_DIR))/
 
 $(graphene_lib): graphene_lib_recurse
 	@true
@@ -157,7 +161,9 @@ clean_targets = clean distclean
 .PHONY: $(clean_targets) clean_
 
 $(clean_targets): clean_
+ifeq ($(PAL_HOST),Linux-SGX)
 	@[ ! -d $(HOST_DIR) ] || $(MAKE) -C $(HOST_DIR) $@
+endif
 
 clean_:
 	$(RM) -r $(LIB_DIR) $(OBJ_DIR) $(files_to_build) *.d

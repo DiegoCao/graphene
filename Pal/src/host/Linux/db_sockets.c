@@ -19,7 +19,6 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -177,10 +176,11 @@ static int inet_create_uri(char* buf, size_t buf_size, struct sockaddr* addr, si
     return 0;
 }
 
-/* parse the uri for a socket stream. The uri might have both binding
-   address and connecting address, or connecting address only. The form
-   of uri will be either "bind-addr:bind-port:connect-addr:connect-port"
-   or "addr:port". */
+/*
+ * Parse a URI for a socket stream. The URI might have both binding address and connecting
+ * address, or connecting address only. The form of URI will be either
+ * "bind-addr:bind-port:connect-addr:connect-port" or "addr:port".
+ */
 static int socket_parse_uri(char* uri, struct sockaddr** bind_addr, size_t* bind_addrlen,
                             struct sockaddr** dest_addr, size_t* dest_addrlen) {
     int ret;
@@ -285,7 +285,7 @@ static int tcp_listen(PAL_HANDLE* handle, char* uri, int create, int options) {
         return ret;
 
     if (!bind_addr)
-        return -PAL_ERROR_DENIED;
+        return -PAL_ERROR_INVAL;
 
     assert(bind_addrlen == addr_size(bind_addr));
 
@@ -489,13 +489,13 @@ static int tcp_open(PAL_HANDLE* handle, const char* type, const char* uri, int a
     assert(WITHIN_MASK(create,  PAL_CREATE_MASK));
     assert(WITHIN_MASK(options, PAL_OPTION_MASK));
 
-    size_t uri_len = strlen(uri) + 1;
+    size_t uri_size = strlen(uri) + 1;
 
-    if (uri_len > PAL_SOCKADDR_SIZE)
+    if (uri_size > PAL_SOCKADDR_SIZE)
         return -PAL_ERROR_TOOLONG;
 
     char uri_buf[PAL_SOCKADDR_SIZE];
-    memcpy(uri_buf, uri, uri_len);
+    memcpy(uri_buf, uri, uri_size);
 
     if (!strcmp(type, URI_TYPE_TCP_SRV))
         return tcp_listen(handle, uri_buf, create, options);
@@ -578,7 +578,7 @@ static int udp_bind(PAL_HANDLE* handle, char* uri, int create, int options) {
         return ret;
 
     if (!bind_addr)
-        return -PAL_ERROR_DENIED;
+        return -PAL_ERROR_INVAL;
 
     assert(bind_addrlen == addr_size(bind_addr));
 

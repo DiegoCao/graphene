@@ -12,9 +12,9 @@
 #include "api.h"
 #include "cpu.h"
 #include "gsgx.h"
+#include "hex.h"
 #include "linux_utils.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -24,6 +24,7 @@
 #include "seqlock.h"
 #include "sgx_api.h"
 #include "sgx_attest.h"
+#include "spinlock.h"
 #include "toml.h"
 
 #define TSC_REFINE_INIT_TIMEOUT_USECS 10000000
@@ -116,12 +117,12 @@ static struct pal_cpuid {
 } g_pal_cpuid_cache[CPUID_CACHE_SIZE];
 
 static int g_pal_cpuid_cache_top   = 0;
-static PAL_LOCK g_cpuid_cache_lock = LOCK_INIT;
+static spinlock_t g_cpuid_cache_lock = INIT_SPINLOCK_UNLOCKED;
 
 static int get_cpuid_from_cache(unsigned int leaf, unsigned int subleaf, unsigned int values[4]) {
     int ret = -PAL_ERROR_DENIED;
 
-    _DkInternalLock(&g_cpuid_cache_lock);
+    spinlock_lock(&g_cpuid_cache_lock);
     for (int i = 0; i < g_pal_cpuid_cache_top; i++) {
         if (g_pal_cpuid_cache[i].leaf == leaf && g_pal_cpuid_cache[i].subleaf == subleaf) {
             values[0] = g_pal_cpuid_cache[i].values[0];
@@ -132,12 +133,12 @@ static int get_cpuid_from_cache(unsigned int leaf, unsigned int subleaf, unsigne
             break;
         }
     }
-    _DkInternalUnlock(&g_cpuid_cache_lock);
+    spinlock_unlock(&g_cpuid_cache_lock);
     return ret;
 }
 
 static void add_cpuid_to_cache(unsigned int leaf, unsigned int subleaf, unsigned int values[4]) {
-    _DkInternalLock(&g_cpuid_cache_lock);
+    spinlock_lock(&g_cpuid_cache_lock);
 
     struct pal_cpuid* chosen = NULL;
     if (g_pal_cpuid_cache_top < CPUID_CACHE_SIZE) {
@@ -159,7 +160,7 @@ static void add_cpuid_to_cache(unsigned int leaf, unsigned int subleaf, unsigned
         chosen->values[3] = values[3];
     }
 
-    _DkInternalUnlock(&g_cpuid_cache_lock);
+    spinlock_unlock(&g_cpuid_cache_lock);
 }
 
 static inline uint32_t extension_enabled(uint32_t xfrm, uint32_t bit_idx) {
@@ -270,15 +271,18 @@ static void sanity_check_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t values[
             case AVX512_3:
             case PKRU:
                 if (extension_enabled(xfrm, subleaf)) {
-                    if (values[EAX] != extension_sizes_bytes[subleaf]) {
-                        log_error("Unexpected value in host CPUID. Exiting...\n");
+                    if (values[EAX] != extension_sizes_bytes[subleaf] ||
+                            values[EBX] != extension_offset_bytes[subleaf]) {
+                        log_error("Unexpected value in host CPUID. Exiting...");
                         _DkProcessExit(1);
                     }
                 } else {
-                    if (values[EAX] != 0) {
-                        log_error("Unexpected value in host CPUID. Exiting...\n");
-                        _DkProcessExit(1);
-                    }
+                    /* SGX enclave doesn't use this CPU extension, pretend it doesn't exist by
+                     * forcing EAX ("size in bytes of the save area for an extended state feature")
+                     * and EBX ("offset in bytes of this extended state component's save area from
+                     * the beginning of the XSAVE/XRSTOR area") to zero */
+                    values[EAX] = 0;
+                    values[EBX] = 0;
                 }
                 break;
         }
@@ -381,7 +385,7 @@ int _DkCpuIdRetrieve(unsigned int leaf, unsigned int subleaf, unsigned int value
 
     return 0;
 fail:
-    log_error("Unrecognized leaf/subleaf in CPUID (EAX=%u, ECX=%u). Exiting...\n", leaf,
+    log_error("Unrecognized leaf/subleaf in CPUID (EAX=%u, ECX=%u). Exiting...", leaf,
               subleaf);
     _DkProcessExit(1);
 }
@@ -450,15 +454,14 @@ int _DkAttestationQuote(const PAL_PTR user_report_data, PAL_NUM user_report_data
 
     int ret;
     bool is_epid;
-    sgx_spid_t spid;
+    sgx_spid_t spid = {0};
     bool linkable;
 
     /* read sgx.ra_client_spid from manifest (must be hex string) */
     char* ra_client_spid_str = NULL;
     ret = toml_string_in(g_pal_state.manifest_root, "sgx.ra_client_spid", &ra_client_spid_str);
     if (ret < 0) {
-        log_error("Cannot parse \'sgx.ra_client_spid\' "
-                  "(the value must be put in double quotes!)\n");
+        log_error("Cannot parse \'sgx.ra_client_spid\' (the value must be put in double quotes!)");
         return -PAL_ERROR_INVAL;
     }
 
@@ -466,14 +469,13 @@ int _DkAttestationQuote(const PAL_PTR user_report_data, PAL_NUM user_report_data
         /* No Software Provider ID (SPID) specified in the manifest, it is DCAP attestation --
          * for DCAP, spid and linkable arguments are ignored (we unset them for sanity) */
         is_epid = false;
-        memset(&spid, 0, sizeof(spid));
         linkable = false;
     } else {
         /* SPID specified in the manifest, it is EPID attestation -- read spid and linkable */
         is_epid = true;
 
         if (strlen(ra_client_spid_str) != sizeof(sgx_spid_t) * 2) {
-            log_error("Malformed \'sgx.ra_client_spid\' value in the manifest: %s\n",
+            log_error("Malformed \'sgx.ra_client_spid\' value in the manifest: %s",
                       ra_client_spid_str);
             free(ra_client_spid_str);
             return -PAL_ERROR_INVAL;
@@ -482,7 +484,7 @@ int _DkAttestationQuote(const PAL_PTR user_report_data, PAL_NUM user_report_data
         for (size_t i = 0; i < strlen(ra_client_spid_str); i++) {
             int8_t val = hex2dec(ra_client_spid_str[i]);
             if (val < 0) {
-                log_error("Malformed \'sgx.ra_client_spid\' value in the manifest: %s\n",
+                log_error("Malformed \'sgx.ra_client_spid\' value in the manifest: %s",
                           ra_client_spid_str);
                 free(ra_client_spid_str);
                 return -PAL_ERROR_INVAL;
@@ -491,15 +493,14 @@ int _DkAttestationQuote(const PAL_PTR user_report_data, PAL_NUM user_report_data
         }
 
         /* read sgx.ra_client_linkable from manifest */
-        int64_t linkable_int64;
-        ret = toml_int_in(g_pal_state.manifest_root, "sgx.ra_client_linkable",
-                          /*defaultval=*/0, &linkable_int64);
-        if (ret < 0 || (linkable_int64 != 0 && linkable_int64 != 1)) {
-            log_error("Cannot parse \'sgx.ra_client_linkable\' (the value must be 0 or 1)\n");
+        ret = toml_bool_in(g_pal_state.manifest_root, "sgx.ra_client_linkable",
+                           /*defaultval=*/false, &linkable);
+        if (ret < 0) {
+            log_error("Cannot parse \'sgx.ra_client_linkable\' (the value must be `true` or "
+                      "`false`)");
             free(ra_client_spid_str);
             return -PAL_ERROR_INVAL;
         }
-        linkable = !!linkable_int64;
     }
 
     free(ra_client_spid_str);
@@ -621,45 +622,45 @@ static double get_bogomips(void) {
 }
 
 bool is_tsc_usable(void) {
-    uint32_t words[PAL_CPUID_WORD_NUM];
+    uint32_t words[CPUID_WORD_NUM];
     _DkCpuIdRetrieve(CPUID_LEAF_INVARIANT_TSC, 0, words);
-    return words[PAL_CPUID_WORD_EDX] & 1 << 8;
+    return words[CPUID_WORD_EDX] & 1 << 8;
 }
 
 /* return TSC frequency or 0 if invariant TSC is not supported */
 uint64_t get_tsc_hz(void) {
-    uint32_t words[PAL_CPUID_WORD_NUM];
+    uint32_t words[CPUID_WORD_NUM];
 
     _DkCpuIdRetrieve(CPUID_LEAF_TSC_FREQ, 0, words);
-    if (!words[PAL_CPUID_WORD_EAX] || !words[PAL_CPUID_WORD_EBX]) {
+    if (!words[CPUID_WORD_EAX] || !words[CPUID_WORD_EBX]) {
         /* TSC/core crystal clock ratio is not enumerated, can't use RDTSC for accurate time */
         return 0;
     }
 
-    if (words[PAL_CPUID_WORD_ECX] > 0) {
+    if (words[CPUID_WORD_ECX] > 0) {
         /* calculate TSC frequency as core crystal clock frequency (EAX) * EBX / EAX; cast to 64-bit
          * first to prevent integer overflow */
-        uint64_t ecx_hz = words[PAL_CPUID_WORD_ECX];
-        return ecx_hz * words[PAL_CPUID_WORD_EBX] / words[PAL_CPUID_WORD_EAX];
+        uint64_t ecx_hz = words[CPUID_WORD_ECX];
+        return ecx_hz * words[CPUID_WORD_EBX] / words[CPUID_WORD_EAX];
     }
 
     /* some Intel CPUs do not report nominal frequency of crystal clock, let's calculate it
      * based on Processor Frequency Information Leaf (CPUID 16H); this leaf always exists if
      * TSC Frequency Leaf exists; logic is taken from Linux 5.11's arch/x86/kernel/tsc.c */
     _DkCpuIdRetrieve(CPUID_LEAF_PROC_FREQ, 0, words);
-    if (!words[PAL_CPUID_WORD_EAX]) {
+    if (!words[CPUID_WORD_EAX]) {
         /* processor base frequency (in MHz) is not enumerated, can't calculate frequency */
         return 0;
     }
 
     /* processor base frequency is in MHz but we need to return TSC frequency in Hz; cast to 64-bit
      * first to prevent integer overflow */
-    uint64_t base_frequency_mhz = words[PAL_CPUID_WORD_EAX];
+    uint64_t base_frequency_mhz = words[CPUID_WORD_EAX];
     return base_frequency_mhz * 1000000;
 }
 
 int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
-    unsigned int words[PAL_CPUID_WORD_NUM];
+    unsigned int words[CPUID_WORD_NUM];
     int rv = 0;
 
     const size_t VENDOR_ID_SIZE = 13;
@@ -668,9 +669,9 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
         return -PAL_ERROR_NOMEM;
 
     _DkCpuIdRetrieve(0, 0, words);
-    FOUR_CHARS_VALUE(&vendor_id[0], words[PAL_CPUID_WORD_EBX]);
-    FOUR_CHARS_VALUE(&vendor_id[4], words[PAL_CPUID_WORD_EDX]);
-    FOUR_CHARS_VALUE(&vendor_id[8], words[PAL_CPUID_WORD_ECX]);
+    FOUR_CHARS_VALUE(&vendor_id[0], words[CPUID_WORD_EBX]);
+    FOUR_CHARS_VALUE(&vendor_id[4], words[CPUID_WORD_EDX]);
+    FOUR_CHARS_VALUE(&vendor_id[8], words[CPUID_WORD_ECX]);
     vendor_id[VENDOR_ID_SIZE - 1] = '\0';
     ci->cpu_vendor = vendor_id;
     // Must be an Intel CPU
@@ -686,11 +687,11 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
         goto out_vendor_id;
     }
     _DkCpuIdRetrieve(0x80000002, 0, words);
-    memcpy(&brand[ 0], words, sizeof(unsigned int) * PAL_CPUID_WORD_NUM);
+    memcpy(&brand[ 0], words, sizeof(unsigned int) * CPUID_WORD_NUM);
     _DkCpuIdRetrieve(0x80000003, 0, words);
-    memcpy(&brand[16], words, sizeof(unsigned int) * PAL_CPUID_WORD_NUM);
+    memcpy(&brand[16], words, sizeof(unsigned int) * CPUID_WORD_NUM);
     _DkCpuIdRetrieve(0x80000004, 0, words);
-    memcpy(&brand[32], words, sizeof(unsigned int) * PAL_CPUID_WORD_NUM);
+    memcpy(&brand[32], words, sizeof(unsigned int) * CPUID_WORD_NUM);
     brand[BRAND_SIZE - 1] = '\0';
     ci->cpu_brand = brand;
 
@@ -699,13 +700,14 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
     ci->cpu_socket = g_pal_sec.cpu_socket;
 
     _DkCpuIdRetrieve(1, 0, words);
-    ci->cpu_family   = BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EAX],  8, 12) +
-                       BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EAX], 20, 28);
-    ci->cpu_model    = BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EAX],  4,  8) +
-                      (BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EAX], 16, 20) << 4);
-    ci->cpu_stepping = BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EAX],  0,  4);
+    ci->cpu_family   = BIT_EXTRACT_LE(words[CPUID_WORD_EAX],  8, 12) +
+                       BIT_EXTRACT_LE(words[CPUID_WORD_EAX], 20, 28);
+    ci->cpu_model    = BIT_EXTRACT_LE(words[CPUID_WORD_EAX],  4,  8) +
+                      (BIT_EXTRACT_LE(words[CPUID_WORD_EAX], 16, 20) << 4);
+    ci->cpu_stepping = BIT_EXTRACT_LE(words[CPUID_WORD_EAX],  0,  4);
 
-    int flen = 0, fmax = 80;
+    size_t flen = 0;
+    size_t fmax = 80;
     char* flags = malloc(fmax);
     if (!flags) {
         rv = -PAL_ERROR_NOMEM;
@@ -716,8 +718,8 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
         if (!g_cpu_flags[i])
             continue;
 
-        if (BIT_EXTRACT_LE(words[PAL_CPUID_WORD_EDX], i, i + 1)) {
-            int len = strlen(g_cpu_flags[i]);
+        if (BIT_EXTRACT_LE(words[CPUID_WORD_EDX], i, i + 1)) {
+            size_t len = strlen(g_cpu_flags[i]);
             if (flen + len + 1 > fmax) {
                 char* new_flags = malloc(fmax * 2);
                 if (!new_flags) {
@@ -740,7 +742,7 @@ int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
 
     ci->cpu_bogomips = get_bogomips();
     if (ci->cpu_bogomips == 0.0) {
-        log_warning("bogomips could not be retrieved, passing 0.0 to the application\n");
+        log_warning("bogomips could not be retrieved, passing 0.0 to the application");
     }
 
     return rv;

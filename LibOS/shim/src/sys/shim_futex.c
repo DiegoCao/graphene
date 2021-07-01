@@ -16,7 +16,6 @@
  */
 
 #include <linux/futex.h>
-#include <linux/time.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -30,6 +29,7 @@
 #include "shim_table.h"
 #include "shim_thread.h"
 #include "shim_types.h"
+#include "shim_utils.h"
 #include "spinlock.h"
 
 struct shim_futex;
@@ -218,15 +218,15 @@ static void maybe_dequeue_two_futexes(struct shim_futex* futex1, struct shim_fut
  * You need to make sure that this futex is still on `g_futex_tree`, but in most cases it follows
  * from the program control flow.
  *
- * Increases refcount of current thread by 1 (in thread_setwait)
- * and of `futex` by 1.
  * `futex->lock` needs to be held.
  */
 static void add_futex_waiter(struct futex_waiter* waiter, struct shim_futex* futex,
                              uint32_t bitset) {
     assert(spinlock_is_locked(&futex->lock));
 
-    thread_setwait(&waiter->thread, NULL);
+    waiter->thread = get_cur_thread();
+    get_thread(waiter->thread);
+
     INIT_LIST_HEAD(waiter, list);
     waiter->bitset = bitset;
     get_futex(futex);
@@ -309,10 +309,6 @@ static struct shim_futex* find_futex(uint32_t* uaddr) {
     return futex;
 }
 
-static uint64_t timespec_to_us(const struct timespec* ts) {
-    return (uint64_t)ts->tv_sec * 1000000u + (uint64_t)ts->tv_nsec / 1000u;
-}
-
 static int futex_wait(uint32_t* uaddr, uint32_t val, uint64_t timeout, uint32_t bitset) {
     int ret = 0;
     struct shim_futex* futex = NULL;
@@ -343,6 +339,8 @@ static int futex_wait(uint32_t* uaddr, uint32_t val, uint64_t timeout, uint32_t 
         goto out_with_futex_lock;
     }
 
+    thread_prepare_wait();
+
     struct futex_waiter waiter = {0};
     add_futex_waiter(&waiter, futex, bitset);
 
@@ -353,11 +351,7 @@ static int futex_wait(uint32_t* uaddr, uint32_t val, uint64_t timeout, uint32_t 
     put_futex(futex);
     futex = NULL;
 
-    ret = thread_sleep(timeout, /*ignore_pending_signals=*/false);
-    /* On timeout thread_sleep returns -EAGAIN. */
-    if (ret == -EAGAIN) {
-        ret = -ETIMEDOUT;
-    }
+    ret = thread_wait(timeout != NO_TIMEOUT ? &timeout : NULL, /*ignore_pending_signals=*/false);
 
     spinlock_lock(&g_futex_tree_lock);
     /* We might have been requeued. Grab the (possibly new) futex reference. */
@@ -703,8 +697,14 @@ static int is_valid_futex_ptr(uint32_t* ptr, bool check_write) {
     if (!IS_ALIGNED_PTR(ptr, alignof(*ptr))) {
         return -EINVAL;
     }
-    if (test_user_memory(ptr, sizeof(*ptr), check_write)) {
-        return -EFAULT;
+    if (check_write) {
+        if (!is_user_memory_writable(ptr, sizeof(*ptr))) {
+            return -EFAULT;
+        }
+    } else {
+        if (!is_user_memory_readable(ptr, sizeof(*ptr))) {
+            return -EFAULT;
+        }
     }
     return 0;
 }
@@ -717,10 +717,11 @@ static int _shim_do_futex(uint32_t* uaddr, int op, uint32_t val, void* utime, ui
 
     if (utime && (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET || cmd == FUTEX_LOCK_PI ||
                   cmd == FUTEX_WAIT_REQUEUE_PI)) {
-        if (test_user_memory(utime, sizeof(struct timespec), /*write=*/false)) {
+        struct __kernel_timespec* user_timeout = utime;
+        if (!is_user_memory_readable(user_timeout, sizeof(*user_timeout))) {
             return -EFAULT;
         }
-        timeout = timespec_to_us((struct timespec*)utime);
+        timeout = timespec_to_us(user_timeout);
         if (cmd != FUTEX_WAIT) {
             /* For FUTEX_WAIT, timeout is interpreted as a relative value, which differs from other
              * futex operations, where timeout is interpreted as an absolute value. */
@@ -747,12 +748,11 @@ static int _shim_do_futex(uint32_t* uaddr, int op, uint32_t val, void* utime, ui
             return -ENOSYS;
         }
         /* Graphene has only one clock for now. */
-        log_warning("Ignoring FUTEX_CLOCK_REALTIME flag\n");
+        log_warning("Ignoring FUTEX_CLOCK_REALTIME flag");
     }
 
     if (!(op & FUTEX_PRIVATE_FLAG)) {
-        log_warning("Non-private futexes are not supported, assuming implicit "
-                    "FUTEX_PRIVATE_FLAG\n");
+        log_warning("Non-private futexes are not supported, assuming implicit FUTEX_PRIVATE_FLAG");
     }
 
     int ret = 0;
@@ -797,10 +797,10 @@ static int _shim_do_futex(uint32_t* uaddr, int op, uint32_t val, void* utime, ui
         case FUTEX_UNLOCK_PI:
         case FUTEX_CMP_REQUEUE_PI:
         case FUTEX_WAIT_REQUEUE_PI:
-            log_warning("PI futexes are not yet supported!\n");
+            log_warning("PI futexes are not yet supported!");
             return -ENOSYS;
         default:
-            log_warning("Invalid futex op: %d\n", cmd);
+            log_warning("Invalid futex op: %d", cmd);
             return -ENOSYS;
     }
 }
@@ -835,8 +835,8 @@ long shim_do_get_robust_list(pid_t pid, struct robust_list_head** head, size_t* 
         get_thread(thread);
     }
 
-    if (test_user_memory(head, sizeof(*head), /*write=*/true) ||
-            test_user_memory(len, sizeof(*len), /*write=*/true)) {
+    if (!is_user_memory_writable(head, sizeof(*head)) ||
+            !is_user_memory_writable(len, sizeof(*len))) {
         ret = -EFAULT;
         goto out;
     }
@@ -895,7 +895,7 @@ static bool handle_futex_death(uint32_t* uaddr) {
  * Returns 0 on success, negative value on error.
  */
 static bool fetch_robust_entry(struct robust_list** entry, struct robust_list** head) {
-    if (test_user_memory(head, sizeof(*head), /*write=*/false)) {
+    if (!is_user_memory_readable(head, sizeof(*head))) {
         return -EFAULT;
     }
 
@@ -923,7 +923,7 @@ void release_robust_list(struct robust_list_head* head) {
         return;
     }
 
-    if (test_user_memory(&head->futex_offset, sizeof(head->futex_offset), /*write=*/false)) {
+    if (!is_user_memory_readable(&head->futex_offset, sizeof(head->futex_offset))) {
         return;
     }
     futex_offset = head->futex_offset;
@@ -966,7 +966,7 @@ void release_robust_list(struct robust_list_head* head) {
 
 void release_clear_child_tid(int* clear_child_tid) {
     if (!clear_child_tid || !IS_ALIGNED_PTR(clear_child_tid, alignof(*clear_child_tid)) ||
-        test_user_memory(clear_child_tid, sizeof(*clear_child_tid), /*write=*/true))
+        !is_user_memory_writable(clear_child_tid, sizeof(*clear_child_tid)))
         return;
 
     /* child thread exited, now parent can wake up */

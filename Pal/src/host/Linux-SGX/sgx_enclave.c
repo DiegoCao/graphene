@@ -37,8 +37,8 @@ static long sgx_ocall_exit(void* pms) {
     ODEBUG(OCALL_EXIT, NULL);
 
     if (ms->ms_exitcode != (int)((uint8_t)ms->ms_exitcode)) {
-        urts_log_debug("Saturation error in exit code %d, getting rounded down to %u\n",
-                       ms->ms_exitcode, (uint8_t)ms->ms_exitcode);
+        log_debug("Saturation error in exit code %d, getting rounded down to %u",
+                  ms->ms_exitcode, (uint8_t)ms->ms_exitcode);
         ms->ms_exitcode = 255;
     }
 
@@ -278,7 +278,7 @@ static long sgx_ocall_create_process(void* pms) {
     ms_ocall_create_process_t* ms = (ms_ocall_create_process_t*)pms;
     ODEBUG(OCALL_CREATE_PROCESS, ms);
 
-    ret = sgx_create_process(ms->ms_uri, ms->ms_nargs, ms->ms_args, &ms->ms_stream_fd,
+    ret = sgx_create_process(ms->ms_nargs, ms->ms_args, &ms->ms_stream_fd,
                              g_pal_enclave.raw_manifest_data);
     if (ret < 0) {
         return ret;
@@ -291,13 +291,41 @@ static long sgx_ocall_futex(void* pms) {
     ms_ocall_futex_t* ms = (ms_ocall_futex_t*)pms;
     long ret;
     ODEBUG(OCALL_FUTEX, ms);
-    struct timespec* ts = NULL;
-    if (ms->ms_timeout_us >= 0) {
-        ts = __alloca(sizeof(struct timespec));
-        ts->tv_sec  = ms->ms_timeout_us / 1000000;
-        ts->tv_nsec = (ms->ms_timeout_us - ts->tv_sec * 1000000) * 1000;
+
+    struct timespec timeout = { 0 };
+    bool have_timeout = ms->ms_timeout_us != (uint64_t)-1;
+    if (have_timeout) {
+        time_get_now_plus_ns(&timeout, ms->ms_timeout_us * TIME_NS_IN_US);
     }
-    ret = INLINE_SYSCALL(futex, 6, ms->ms_futex, ms->ms_op, ms->ms_val, ts, NULL, 0);
+
+    /* `FUTEX_WAIT` treats timeout parameter as a relative value. We want to have an absolute one
+     * (since we need to get start time anyway, to calculate remaining time later on), hence we use
+     * `FUTEX_WAIT_BITSET` with `FUTEX_BITSET_MATCH_ANY`. */
+    uint32_t val3 = 0;
+    int priv_flag = ms->ms_op & FUTEX_PRIVATE_FLAG;
+    int op = ms->ms_op & ~FUTEX_PRIVATE_FLAG;
+    if (op == FUTEX_WAKE) {
+        op = FUTEX_WAKE_BITSET;
+        val3 = FUTEX_BITSET_MATCH_ANY;
+    } else if (op == FUTEX_WAIT) {
+        op = FUTEX_WAIT_BITSET;
+        val3 = FUTEX_BITSET_MATCH_ANY;
+    } else {
+        /* Other operations are not supported atm. */
+        return -EINVAL;
+    }
+
+    ret = INLINE_SYSCALL(futex, 6, ms->ms_futex, op | priv_flag, ms->ms_val,
+                         have_timeout ? &timeout : NULL, NULL, val3);
+
+    if (have_timeout) {
+        int64_t diff = time_ns_diff_from_now(&timeout);
+        if (diff < 0) {
+            /* We might have slept a bit too long. */
+            diff = 0;
+        }
+        ms->ms_timeout_us = (uint64_t)diff / TIME_NS_IN_US;
+    }
     return ret;
 }
 
@@ -311,8 +339,8 @@ static long sgx_ocall_socketpair(void* pms) {
 }
 
 static long sock_getopt(int fd, struct sockopt* opt) {
-    urts_log_debug("sock_getopt (fd = %d, sockopt addr = %p) is not implemented "
-                   "and always returns 0\n", fd, opt);
+    log_debug("sock_getopt (fd = %d, sockopt addr = %p) is not implemented and always returns 0",
+              fd, opt);
     /* initialize *opt with constant */
     *opt = (struct sockopt){0};
     opt->reuseaddr = 1;
@@ -575,30 +603,11 @@ static long sgx_ocall_gettime(void* pms) {
     return 0;
 }
 
-static long sgx_ocall_sleep(void* pms) {
-    ms_ocall_sleep_t* ms = (ms_ocall_sleep_t*)pms;
-    long ret;
-    ODEBUG(OCALL_SLEEP, ms);
-    if (!ms->ms_microsec) {
-        INLINE_SYSCALL(sched_yield, 0);
-        return 0;
-    }
-    struct timespec req, rem;
-    uint64_t microsec = ms->ms_microsec;
-    const uint64_t VERY_LONG_TIME_IN_US = (uint64_t)1000000 * 60 * 60 * 24 * 365 * 128;
-    if (ms->ms_microsec > VERY_LONG_TIME_IN_US) {
-        /* avoid overflow with time_t */
-        req.tv_sec  = VERY_LONG_TIME_IN_US / 1000000;
-        req.tv_nsec = 0;
-    } else {
-        req.tv_sec  = ms->ms_microsec / 1000000;
-        req.tv_nsec = (microsec - req.tv_sec * (uint64_t)1000000) * 1000;
-    }
-
-    ret = INLINE_SYSCALL(nanosleep, 2, &req, &rem);
-    if (ret == -EINTR)
-        ms->ms_microsec = rem.tv_sec * 1000000UL + rem.tv_nsec / 1000UL;
-    return ret;
+static long sgx_ocall_sched_yield(void* pms) {
+    __UNUSED(pms);
+    ODEBUG(OCALL_SCHED_YIELD, pms);
+    INLINE_SYSCALL(sched_yield, 0);
+    return 0;
 }
 
 static long sgx_ocall_poll(void* pms) {
@@ -652,7 +661,7 @@ static long sgx_ocall_debug_map_add(void* pms) {
 #ifdef DEBUG
     int ret = debug_map_add(ms->ms_name, ms->ms_addr);
     if (ret < 0)
-        urts_log_error("debug_map_add(%s, %p): %d\n", ms->ms_name, ms->ms_addr, ret);
+        log_error("debug_map_add(%s, %p): %d", ms->ms_name, ms->ms_addr, ret);
 
     sgx_profile_report_elf(ms->ms_name, ms->ms_addr);
 #else
@@ -667,7 +676,7 @@ static long sgx_ocall_debug_map_remove(void* pms) {
 #ifdef DEBUG
     int ret = debug_map_remove(ms->ms_addr);
     if (ret < 0)
-        urts_log_error("debug_map_remove(%p): %d\n", ms->ms_addr, ret);
+        log_error("debug_map_remove(%p): %d", ms->ms_addr, ret);
 #else
     __UNUSED(ms);
 #endif
@@ -715,7 +724,7 @@ sgx_ocall_fn_t ocall_table[OCALL_NR] = {
     [OCALL_SETSOCKOPT]       = sgx_ocall_setsockopt,
     [OCALL_SHUTDOWN]         = sgx_ocall_shutdown,
     [OCALL_GETTIME]          = sgx_ocall_gettime,
-    [OCALL_SLEEP]            = sgx_ocall_sleep,
+    [OCALL_SCHED_YIELD]      = sgx_ocall_sched_yield,
     [OCALL_POLL]             = sgx_ocall_poll,
     [OCALL_RENAME]           = sgx_ocall_rename,
     [OCALL_DELETE]           = sgx_ocall_delete,
@@ -786,7 +795,7 @@ static int rpc_thread_loop(void* arg) {
             int ret = INLINE_SYSCALL(futex, 6, &req->lock.lock, FUTEX_WAKE_PRIVATE,
                                      1, NULL, NULL, 0);
             if (ret == -1)
-                urts_log_error("RPC thread failed to wake up enclave thread\n");
+                log_error("RPC thread failed to wake up enclave thread");
         }
     }
 
@@ -873,9 +882,4 @@ int ecall_thread_start(void) {
 int ecall_thread_reset(void) {
     EDEBUG(ECALL_THREAD_RESET, NULL);
     return sgx_ecall(ECALL_THREAD_RESET, NULL);
-}
-
-noreturn void __abort(void) {
-    INLINE_SYSCALL(exit_group, 1, 1);
-    die_or_inf_loop();
 }

@@ -10,18 +10,11 @@ stage('test') {
     timeout(time: 15, unit: 'MINUTES') {
         try {
             sh '''
-                if test -n "$SGX"
-                then
-                    graphene=sgx
-                else
-                    graphene=direct
-                fi
-
                 cd Pal/regression
-                make ${MAKEOPTS} all pal_lib="$GRAPHENE_PKGLIBDIR"/"$graphene"/libpal.so
+                make ${MAKEOPTS} all
                 if test -n "$SGX"
                 then
-                    make ${MAKEOPTS} sgx-tokens pal_lib="$GRAPHENE_PKGLIBDIR"/"$graphene"/libpal.so
+                    make ${MAKEOPTS} sgx-tokens
                 fi
                 python3 -m pytest -v --junit-xml pal-regression.xml test_pal.py
             '''
@@ -55,9 +48,7 @@ stage('test') {
                 then
                     make ${MAKEOPTS} sgx-tokens
                 fi
-                make test
-                # TODO: after resolving deps problem (or rewriting makefiles):
-#               python3 -m pytest -v --junit-xml fs.xml test_fs.py test_tmpfs.py test_pf.py
+                python3 -m pytest -v --junit-xml fs.xml test_fs.py test_tmpfs.py test_pf.py
             '''
         } finally {
             junit 'LibOS/shim/test/fs/*.xml'

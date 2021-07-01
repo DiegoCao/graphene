@@ -31,21 +31,21 @@ static int create_pipes(struct shim_handle* srv, struct shim_handle* cli, int fl
 
     if ((ret = create_pipe(name, uri, PIPE_URI_SIZE, &hdl0, qstr,
                            /*use_vmid_for_name=*/false)) < 0) {
-        log_error("pipe creation failure\n");
+        log_error("pipe creation failure");
         return ret;
     }
 
     ret = DkStreamOpen(uri, 0, 0, 0, LINUX_OPEN_FLAGS_TO_PAL_OPTIONS(flags), &hdl2);
     if (ret < 0) {
         ret = pal_to_unix_errno(ret);
-        log_error("pipe connection failure\n");
+        log_error("pipe connection failure");
         goto out;
     }
 
     ret = DkStreamWaitForClient(hdl0, &hdl1);
     if (ret < 0) {
         ret = pal_to_unix_errno(ret);
-        log_error("pipe acceptance failure\n");
+        log_error("pipe acceptance failure");
         goto out;
     }
 
@@ -89,7 +89,7 @@ long shim_do_pipe2(int* filedes, int flags) {
     int ret = 0;
 
     if (flags & O_DIRECT) {
-        log_warning("shim_do_pipe2(): ignoring not supported O_DIRECT flag\n");
+        log_warning("shim_do_pipe2(): ignoring not supported O_DIRECT flag");
         flags &= ~O_DIRECT;
     }
 
@@ -97,7 +97,7 @@ long shim_do_pipe2(int* filedes, int flags) {
         return -EINVAL;
     }
 
-    if (test_user_memory(filedes, 2 * sizeof(int), true))
+    if (!is_user_memory_writable(filedes, 2 * sizeof(int)))
         return -EFAULT;
 
     int vfd1 = -1;
@@ -112,13 +112,13 @@ long shim_do_pipe2(int* filedes, int flags) {
     }
 
     hdl1->type = TYPE_PIPE;
-    set_handle_fs(hdl1, &pipe_builtin_fs);
-    hdl1->flags    = O_RDONLY;
+    hdl1->fs = &pipe_builtin_fs;
+    hdl1->flags = O_RDONLY;
     hdl1->acc_mode = MAY_READ;
 
     hdl2->type = TYPE_PIPE;
-    set_handle_fs(hdl2, &pipe_builtin_fs);
-    hdl2->flags    = O_WRONLY;
+    hdl2->fs = &pipe_builtin_fs;
+    hdl2->flags = O_WRONLY;
     hdl2->acc_mode = MAY_WRITE;
 
     hdl1->info.pipe.ready_for_ops = true;
@@ -172,7 +172,7 @@ long shim_do_socketpair(int domain, int type, int protocol, int* sv) {
     if ((type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) != SOCK_STREAM)
         return -EPROTONOSUPPORT;
 
-    if (test_user_memory(sv, 2 * sizeof(int), true))
+    if (!is_user_memory_writable(sv, 2 * sizeof(int)))
         return -EFAULT;
 
     int vfd1 = -1;
@@ -188,9 +188,9 @@ long shim_do_socketpair(int domain, int type, int protocol, int* sv) {
 
 
     hdl1->type = TYPE_SOCK;
-    set_handle_fs(hdl1, &socket_builtin_fs);
-    hdl1->flags       = O_RDONLY;
-    hdl1->acc_mode    = MAY_READ | MAY_WRITE;
+    hdl1->fs = &socket_builtin_fs;
+    hdl1->flags = O_RDONLY;
+    hdl1->acc_mode = MAY_READ | MAY_WRITE;
 
     struct shim_sock_handle* sock1 = &hdl1->info.sock;
     sock1->domain     = domain;
@@ -199,9 +199,9 @@ long shim_do_socketpair(int domain, int type, int protocol, int* sv) {
     sock1->sock_state = SOCK_ACCEPTED;
 
     hdl2->type = TYPE_SOCK;
-    set_handle_fs(hdl2, &socket_builtin_fs);
-    hdl2->flags       = O_WRONLY;
-    hdl2->acc_mode    = MAY_READ | MAY_WRITE;
+    hdl2->fs = &socket_builtin_fs;
+    hdl2->flags = O_WRONLY;
+    hdl2->acc_mode = MAY_READ | MAY_WRITE;
 
     struct shim_sock_handle* sock2 = &hdl2->info.sock;
     sock2->domain     = domain;
@@ -270,7 +270,7 @@ long shim_do_mknodat(int dirfd, const char* pathname, mode_t mode, dev_t dev) {
     if (!S_ISFIFO(mode))
         return -EINVAL;
 
-    if (!pathname || test_user_string(pathname))
+    if (!is_user_string_readable(pathname))
         return -EFAULT;
 
     if (pathname[0] == '\0')
@@ -294,6 +294,8 @@ long shim_do_mknodat(int dirfd, const char* pathname, mode_t mode, dev_t dev) {
     }
 
     dent->fs = &fifo_builtin_fs;
+    dent->type = mode & S_IFMT;
+    dent->perm = mode & ~S_IFMT;
 
     /* create two pipe ends */
     hdl1 = get_new_handle();
@@ -305,15 +307,15 @@ long shim_do_mknodat(int dirfd, const char* pathname, mode_t mode, dev_t dev) {
     }
 
     hdl1->type = TYPE_PIPE;
-    set_handle_fs(hdl1, &fifo_builtin_fs);
-    hdl1->flags    = O_RDONLY;
+    hdl1->fs =  &fifo_builtin_fs;
+    hdl1->flags = O_RDONLY;
     hdl1->acc_mode = MAY_READ;
     get_dentry(dent);
     hdl1->dentry = dent;
 
     hdl2->type = TYPE_PIPE;
-    set_handle_fs(hdl2, &fifo_builtin_fs);
-    hdl2->flags    = O_WRONLY;
+    hdl2->fs = &fifo_builtin_fs;
+    hdl2->flags = O_WRONLY;
     hdl2->acc_mode = MAY_WRITE;
     get_dentry(dent);
     hdl2->dentry = dent;
@@ -348,7 +350,7 @@ long shim_do_mknodat(int dirfd, const char* pathname, mode_t mode, dev_t dev) {
 
     /* mark pseudo entry in file system as valid and stash FDs in data */
     dent->state &= ~DENTRY_NEGATIVE;
-    dent->state |= DENTRY_VALID | DENTRY_RECENTLY;
+    dent->state |= DENTRY_VALID;
 
     static_assert(sizeof(vfd1) == sizeof(uint32_t) && sizeof(vfd2) == sizeof(uint32_t),
                   "FDs must be 4B in size");

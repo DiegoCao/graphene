@@ -7,7 +7,6 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -16,12 +15,6 @@
 int DkThreadCreate(PAL_PTR addr, PAL_PTR param, PAL_HANDLE* handle) {
     *handle = NULL;
     return _DkThreadCreate(handle, (int (*)(void*))addr, (const void*)param);
-}
-
-/* PAL call DkThreadDelayExecution. Delay the current thread (sleep) for the given duration */
-PAL_NUM DkThreadDelayExecution(PAL_NUM duration) {
-    (void)_DkThreadDelayExecution(&duration);
-    return duration;
 }
 
 /* PAL call DkThreadYieldExecution. Yield the execution of the current thread. */

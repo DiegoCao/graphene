@@ -37,19 +37,16 @@ int main(int argc, char** argv, char** envp) {
     PRINT_SYMBOL(DkStreamsWaitEvents);
 
     PRINT_SYMBOL(DkThreadCreate);
-    PRINT_SYMBOL(DkThreadDelayExecution);
     PRINT_SYMBOL(DkThreadYieldExecution);
     PRINT_SYMBOL(DkThreadExit);
     PRINT_SYMBOL(DkThreadResume);
 
     PRINT_SYMBOL(DkSetExceptionHandler);
 
-    PRINT_SYMBOL(DkMutexCreate);
-    PRINT_SYMBOL(DkMutexRelease);
     PRINT_SYMBOL(DkEventCreate);
     PRINT_SYMBOL(DkEventSet);
     PRINT_SYMBOL(DkEventClear);
-    PRINT_SYMBOL(DkSynchronizationObjectWait);
+    PRINT_SYMBOL(DkEventWait);
 
     PRINT_SYMBOL(DkObjectClose);
 

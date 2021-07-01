@@ -11,6 +11,9 @@
 #include "api.h"
 #include "assert.h"
 #include "atomic.h"
+#include "log.h"
+#include "pal.h"
+#include "pal_error.h"
 #include "shim_defs.h"
 #include "shim_internal-arch.h"
 #include "shim_tcb.h"
@@ -20,33 +23,13 @@ void* shim_init(int argc, void* args);
 
 /* important macros and static inline functions */
 
-#define INTERNAL_TID_BASE ((IDTYPE)1 << (sizeof(IDTYPE) * 8 - 1))
-
-static inline bool is_internal_tid(unsigned int tid) {
-    return tid >= INTERNAL_TID_BASE;
-}
-
-#include "pal.h"
-#include "pal_debug.h"
-#include "pal_error.h"
-
 extern int g_log_level;
 
 extern const PAL_CONTROL* g_pal_control;
 
 // TODO(mkow): We should make it cross-object-inlinable, ideally by enabling LTO, less ideally by
 // pasting it here and making `inline`, but our current linker scripts prevent both.
-void _log(int level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
-/* This function emits logs regardless of log_level setting and doesn't prefix the output. */
-void log_always(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-
-#define log_error(fmt...)    _log(PAL_LOG_ERROR, fmt)
-#define log_warning(fmt...)  _log(PAL_LOG_WARNING, fmt)
-#define log_debug(fmt...)    _log(PAL_LOG_DEBUG, fmt)
-#define log_trace(fmt...)    _log(PAL_LOG_TRACE, fmt)
-
-/* TODO: Replace debug() calls with log_*() at the appropriate levels, and remove this macro. */
-#define debug(fmt...)        _log(PAL_LOG_WARNING, fmt)
+void shim_log(int level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
 
 #if 0
 #define DEBUG_BREAK_ON_FAILURE() DEBUG_BREAK()
@@ -56,14 +39,14 @@ void log_always(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 #define BUG()                                           \
     do {                                                \
-        log_error("BUG() " __FILE__ ":%d\n", __LINE__); \
+        log_error("BUG() " __FILE__ ":%d", __LINE__);   \
         DEBUG_BREAK_ON_FAILURE();                       \
         die_or_inf_loop();                              \
     } while (0)
 
 #define DEBUG_HERE()                                             \
     do {                                                         \
-        log_debug("%s (" __FILE__ ":%d)\n", __func__, __LINE__); \
+        log_debug("%s (" __FILE__ ":%d)", __func__, __LINE__);   \
     } while (0)
 
 /*!
@@ -318,7 +301,7 @@ static inline int64_t __ref_dec(REFTYPE* ref) {
     do {
         _c = __atomic_load_n(&ref->counter, __ATOMIC_SEQ_CST);
         if (!_c) {
-            log_error("Fail: Trying to drop reference count below 0\n");
+            log_error("Fail: Trying to drop reference count below 0");
             BUG();
             return 0;
         }
@@ -366,8 +349,9 @@ void reset_brk(void);
 int init_loader(void);
 int init_rlimit(void);
 
-bool test_user_memory(void* addr, size_t size, bool write);
-bool test_user_string(const char* addr);
+bool is_user_memory_readable(const void* addr, size_t size);
+bool is_user_memory_writable(const void* addr, size_t size);
+bool is_user_string_readable(const char* addr);
 
 uint64_t get_rlimit_cur(int resource);
 void set_rlimit_cur(int resource, uint64_t rlim);

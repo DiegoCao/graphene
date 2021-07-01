@@ -273,9 +273,6 @@ seven calls to create, signal, and block on synchronization objects.
 .. doxygenfunction:: DkThreadCreate
    :project: pal
 
-.. doxygenfunction:: DkThreadDelayExecution
-   :project: pal
-
 .. doxygenfunction:: DkThreadYieldExecution
    :project: pal
 
@@ -308,10 +305,7 @@ Exception handling
 Synchronization
 ^^^^^^^^^^^^^^^
 
-.. doxygenfunction:: DkMutexCreate
-   :project: pal
-
-.. doxygenfunction:: DkMutexRelease
+.. doxygendefine:: NO_TIMEOUT
    :project: pal
 
 .. doxygenfunction:: DkEventCreate
@@ -323,14 +317,11 @@ Synchronization
 .. doxygenfunction:: DkEventClear
    :project: pal
 
+.. doxygenfunction:: DkEventWait
+   :project: pal
+
 Objects
 ^^^^^^^
-
-.. doxygendefine:: NO_TIMEOUT
-   :project: pal
-
-.. doxygenfunction:: DkSynchronizationObjectWait
-   :project: pal
 
 .. doxygenfunction:: DkStreamsWaitEvents
    :project: pal
@@ -371,9 +362,6 @@ and to obtain an attestation report and quote.
    :project: pal
 
 .. doxygenfunction:: DkCpuIdRetrieve
-   :project: pal
-
-.. doxygenenum:: PAL_CPUID_WORD
    :project: pal
 
 .. doxygenfunction:: DkAttestationReport

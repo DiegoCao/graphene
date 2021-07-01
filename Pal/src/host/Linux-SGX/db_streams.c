@@ -17,10 +17,9 @@
 #include <linux/wait.h>
 
 #include "api.h"
+#include "crypto.h"
 #include "enclave_pages.h"
 #include "pal.h"
-#include "pal_crypto.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -29,7 +28,6 @@
 #include "pal_linux_error.h"
 #include "perm.h"
 #include "stat.h"
-
 
 #define DUMMYPAYLOAD     "dummypayload"
 #define DUMMYPAYLOADSIZE (sizeof(DUMMYPAYLOAD))
@@ -299,7 +297,8 @@ int _DkSendHandle(PAL_HANDLE hdl, PAL_HANDLE cargo) {
 
     /* finally send the serialized cargo as payload (possibly encrypted) */
     if (hdl->process.ssl_ctx) {
-        ret = _DkStreamSecureWrite(hdl->process.ssl_ctx, (uint8_t*)hdl_data, hdl_hdr.data_size);
+        ret = _DkStreamSecureWrite(hdl->process.ssl_ctx, (uint8_t*)hdl_data, hdl_hdr.data_size,
+                                   /*is_blocking=*/!hdl->process.nonblocking);
     } else {
         ret = ocall_write(fd, hdl_data, hdl_hdr.data_size);
         ret = ret < 0 ? unix_to_pal_error(ret) : ret;
@@ -360,7 +359,8 @@ int _DkReceiveHandle(PAL_HANDLE hdl, PAL_HANDLE* cargo) {
     char hdl_data[hdl_hdr.data_size];
 
     if (hdl->process.ssl_ctx) {
-        ret = _DkStreamSecureRead(hdl->process.ssl_ctx, (uint8_t*)hdl_data, hdl_hdr.data_size);
+        ret = _DkStreamSecureRead(hdl->process.ssl_ctx, (uint8_t*)hdl_data, hdl_hdr.data_size,
+                                  /*is_blocking=*/!hdl->process.nonblocking);
     } else {
         ret = ocall_read(fd, hdl_data, hdl_hdr.data_size);
         ret = ret < 0 ? unix_to_pal_error(ret) : ret;
