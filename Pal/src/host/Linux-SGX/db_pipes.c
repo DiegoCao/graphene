@@ -372,7 +372,7 @@ static int64_t pipe_read(PAL_HANDLE handle, uint64_t offset, uint64_t len, void*
 //        bytes = _DkStreamSecureRead(handle->pipe.ssl_ctx, buffer, len);
 //	if (bytes < 0) SGX_DBG(DBG_E, "@@@@@@_DkStreamSecureRead returns %ld\n", bytes);
         bytes = _DkStreamSecureRead(handle->pipe.ssl_ctx, buffer, len,
-                                    /*is_blocking=*/!handle->pipe.nonblocking);"
+                                    /*is_blocking=*/!handle->pipe.nonblocking);
     }
 
     return bytes;
