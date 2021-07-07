@@ -392,7 +392,7 @@ static int tcp_open(PAL_HANDLE* handle, const char* type, const char* uri, int a
     assert(WITHIN_MASK(share,   PAL_SHARE_MASK));
     assert(WITHIN_MASK(create,  PAL_CREATE_MASK));
     assert(WITHIN_MASK(options, PAL_OPTION_MASK));
-    pal_printf("@@@@@Enter tcp_open type = %s\n", type);
+    //pal_printf("@@@@@Enter tcp_open type = %s\n", type);
 
     size_t uri_size = strlen(uri) + 1;
 
