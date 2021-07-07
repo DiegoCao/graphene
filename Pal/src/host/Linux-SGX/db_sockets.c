@@ -454,7 +454,7 @@ static int udp_bind(PAL_HANDLE* handle, char* uri, int create, int options) {
     struct sockaddr* bind_addr = (struct sockaddr*)&buffer;
     size_t bind_addrlen = sizeof(buffer);
     int ret = 0;
-    pal_printf("@@@@@Enter udp_bind uri = %s\n", uri);
+    //pal_printf("@@@@@Enter udp_bind uri = %s\n", uri);
 
     if ((ret = socket_parse_uri(uri, &bind_addr, &bind_addrlen, NULL, NULL)) < 0)
         return ret;
@@ -534,7 +534,7 @@ static int udp_open(PAL_HANDLE* hdl, const char* type, const char* uri, int acce
     char buf[PAL_SOCKADDR_SIZE];
     size_t len = strlen(uri);
 
-    pal_printf("@@@@@Enter udp_open type = %s\n", type);
+    //pal_printf("@@@@@Enter udp_open type = %s\n", type);
     if (len >= PAL_SOCKADDR_SIZE)
         return -PAL_ERROR_TOOLONG;
 
