@@ -272,7 +272,7 @@ static int tcp_listen(PAL_HANDLE* handle, char* uri, int create, int options) {
     struct sockaddr* bind_addr = (struct sockaddr*)&buffer;
     size_t bind_addrlen = sizeof(buffer);
     int ret;
-    pal_printf("@@@@@Enter tcp_listen uri = %s\n", uri);
+    //pal_printf("@@@@@Enter tcp_listen uri = %s\n", uri);
 
     if ((ret = socket_parse_uri(uri, &bind_addr, &bind_addrlen, NULL, NULL)) < 0)
         return ret;
