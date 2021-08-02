@@ -409,6 +409,8 @@ int lib_SSLRead(LIB_SSL_CONTEXT* ssl_ctx, uint8_t* buf, size_t buf_size) {
 
 int lib_SSLWrite(LIB_SSL_CONTEXT* ssl_ctx, const uint8_t* buf, size_t buf_size) {
     int ret = mbedtls_ssl_write(&ssl_ctx->ssl, buf, buf_size);
+	if (ret<0)
+		//pal_printf("@@@@mbedtls_ssl_write = -%#x\n", -ret);
     if (ret <= 0)
         return mbedtls_to_pal_error(ret);
     return ret;

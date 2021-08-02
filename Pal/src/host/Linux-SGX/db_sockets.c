@@ -272,6 +272,7 @@ static int tcp_listen(PAL_HANDLE* handle, char* uri, int create, int options) {
     struct sockaddr* bind_addr = (struct sockaddr*)&buffer;
     size_t bind_addrlen = sizeof(buffer);
     int ret;
+    //pal_printf("@@@@@Enter tcp_listen uri = %s\n", uri);
 
     if ((ret = socket_parse_uri(uri, &bind_addr, &bind_addrlen, NULL, NULL)) < 0)
         return ret;
@@ -353,6 +354,13 @@ static int tcp_connect(PAL_HANDLE* handle, char* uri, int options) {
     if (bind_addr && bind_addr->sa_family != dest_addr->sa_family)
         return -PAL_ERROR_INVAL;
 
+    if (!bind_addr) {
+       /*bind_addr pointer and dest_addr pointer are swapped in socket_parse_uri()*/
+       bind_addr = (struct sockaddr*)&buffer[1];
+       bind_addr->sa_family = 0;
+       bind_addrlen = sizeof(buffer[1]);
+    }
+
     struct sockopt sock_options;
 
     memset(&sock_options, 0, sizeof(sock_options));
@@ -384,6 +392,7 @@ static int tcp_open(PAL_HANDLE* handle, const char* type, const char* uri, int a
     assert(WITHIN_MASK(share,   PAL_SHARE_MASK));
     assert(WITHIN_MASK(create,  PAL_CREATE_MASK));
     assert(WITHIN_MASK(options, PAL_OPTION_MASK));
+    //pal_printf("@@@@@Enter tcp_open type = %s\n", type);
 
     size_t uri_size = strlen(uri) + 1;
 
@@ -445,6 +454,7 @@ static int udp_bind(PAL_HANDLE* handle, char* uri, int create, int options) {
     struct sockaddr* bind_addr = (struct sockaddr*)&buffer;
     size_t bind_addrlen = sizeof(buffer);
     int ret = 0;
+    //pal_printf("@@@@@Enter udp_bind uri = %s\n", uri);
 
     if ((ret = socket_parse_uri(uri, &bind_addr, &bind_addrlen, NULL, NULL)) < 0)
         return ret;
@@ -524,6 +534,7 @@ static int udp_open(PAL_HANDLE* hdl, const char* type, const char* uri, int acce
     char buf[PAL_SOCKADDR_SIZE];
     size_t len = strlen(uri);
 
+    //pal_printf("@@@@@Enter udp_open type = %s\n", type);
     if (len >= PAL_SOCKADDR_SIZE)
         return -PAL_ERROR_TOOLONG;
 
