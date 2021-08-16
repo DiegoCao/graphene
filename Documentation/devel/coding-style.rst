@@ -16,11 +16,11 @@ setup it this way:
 
    sudo apt-get install clang-format
 
-Usage: (assuming you're in the project's top directory)
+Usage: (assuming you've configured your build into ``build`` directory)
 
 .. code-block:: sh
 
-   make format
+   ninja -C build clang-format
 
 This :command:`make` target **reformats all source files in-place**, so we
 recommend you first commit them (or add to `git index
@@ -118,7 +118,8 @@ Code formatting
 Conventions and high-level style
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 #. Variable and function names should be sane and easy to understand (example:
-   ``nofpts`` is bad, ``points_cnt`` is ok).
+   ``nofpts`` is bad, ``points_cnt`` is ok). The names ``i``, ``j``, ``k`` etc.
+   should be limited to integers used as array indexes.
 
 #. All non-static function interfaces should be documented in comments
    (especially pointer ownerships). Same for public macros.
@@ -135,6 +136,9 @@ Conventions and high-level style
    #. Macros and global constants should be ``NAMED_THIS_WAY``.
    #. Functions, structures and variables should be ``named_this_way``.
    #. Global variables should be prefixed with ``g_`` (e.g. ``g_thread_list``).
+   #. "size" always means size in bytes, "length" (or "count") means the number
+      of elements (e.g. in an array, or characters in a C-string, excluding the
+      terminating null byte).
 
 #. Types:
 
@@ -154,3 +158,26 @@ Python
 ------
 
 .. todo:: TBD
+
+Meson
+-----
+
+#. 4-space indent, no tabs. Wrap lines at ~80-100 columns except for unbreakable
+   things like URLs.
+
+#. First argument to target functions (``shared_library``, ``executable``,
+   ``custom_target``, ...) should be on the same line as opening paren. All
+   other arguments should be on next lines, aligned to 4-space indent.
+
+   Arguments to other functions should either be all on the same line, or there
+   should be no argument on the same line as opening paren, and arguments should
+   be in following lines, indented by 4 spaces.
+
+#. Otherwise, whitespace should generally follow PEP8 instead of meson suggested
+   style (i.e., no space inside parens, no space before ``:``).
+
+#. Variables named ``_prog`` refer to things obtained from ``find_program()``.
+   Auxiliary commands should reside in ``Scripts/``, and the variable name is
+   tied to the script name (see :file:`meson.build` there). The scripts should
+   be written in Python except for things that clearly benefit from being
+   written in ``sh``.

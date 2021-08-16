@@ -19,7 +19,7 @@
 
 #define __attribute_migratable __attribute__((section(".migratable")))
 
-extern char __migratable;
+extern char __migratable[];
 extern char __migratable_end;
 
 /* FIXME: Checkpointing must be de-macroed and simplified */
@@ -296,7 +296,7 @@ struct shim_cp_map_entry* get_cp_map_entry(void* map, void* addr, bool create);
 
 #if DEBUG_RESUME == 1
 #define DEBUG_RS(fmt, ...) \
-    debug("GET %s(0x%08lx): " fmt "\n", CP_FUNC_NAME, entry->cp_val, ##__VA_ARGS__)
+    log_debug("GET %s(0x%08lx): " fmt, CP_FUNC_NAME, entry->cp_val, ##__VA_ARGS__)
 #else
 #define DEBUG_RS(...) do {} while (0)
 #endif
@@ -313,7 +313,7 @@ struct shim_cp_map_entry* get_cp_map_entry(void* map, void* addr, bool create);
             if (ret < 0)                                                   \
                 goto out;                                                  \
                                                                            \
-            debug("complete checkpointing data\n");                        \
+            log_debug("complete checkpointing data");                      \
         out:                                                               \
             destroy_cp_map((store)->cp_map);                               \
         } while (0);                                                       \
@@ -333,7 +333,7 @@ struct checkpoint_hdr {
 };
 
 typedef int (*migrate_func_t)(struct shim_cp_store*, struct shim_process*, struct shim_thread*,
-                              struct shim_process_ipc_info*, va_list);
+                              struct shim_ipc_ids*, va_list);
 
 /*!
  * \brief Create child process and migrate state to it.

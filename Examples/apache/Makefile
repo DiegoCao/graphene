@@ -13,15 +13,16 @@
 THIS_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 
 INSTALL_DIR ?= $(THIS_DIR)install
-HTTPD_SRC ?= $(THIS_DIR)httpd-2.4.41
-HTTPD_CHECKSUM ?= 3c0f9663240beb0f008acf3b4501c4f339d7467ee345a36c86c46b4d6f3a5461
+HTTPD_SRC ?= $(THIS_DIR)httpd-2.4.46
+HTTPD_CHECKSUM ?= 44b759ce932dc090c0e75c0210b4485ebf6983466fb8ca1b446c8168e1a1aec2
 
 # Mirros for downloading the Apache source code
 HTTPD_MIRRORS ?= \
-	https://www-eu.apache.org/dist/ \
-	https://www-us.apache.org/dist/ \
-	https://ftp.fau.de/apache/ \
-	https://archive.apache.org/dist/
+    https://www-eu.apache.org/dist/httpd \
+    https://www-us.apache.org/dist/httpd \
+    https://ftp.fau.de/apache/httpd \
+    https://archive.apache.org/dist/httpd \
+    https://packages.grapheneproject.io/distfiles
 
 # Address and port for the Apache server to listen
 LISTEN_HOST ?= 127.0.0.1
@@ -38,7 +39,7 @@ GRAPHENE_LOG_LEVEL = error
 endif
 
 .PHONY: all
-all: $(INSTALL_DIR)/bin/httpd httpd.manifest config testdata ssldata | pal_loader
+all: $(INSTALL_DIR)/bin/httpd httpd.manifest config testdata ssldata
 ifeq ($(SGX),1)
 all: httpd.manifest.sgx httpd.sig httpd.token
 endif
@@ -55,23 +56,15 @@ $(INSTALL_DIR)/bin/httpd: $(HTTPD_SRC)/configure
 	cd $(HTTPD_SRC) && $(MAKE)
 	cd $(HTTPD_SRC) && $(MAKE) install
 
+# We need to patch the Apache makefile: it has broken group-target, which does not work on
+# parallel builds.
 $(HTTPD_SRC)/configure: $(HTTPD_SRC).tar.gz
 	tar --touch -xzf $<
+	cd $(HTTPD_SRC) && patch -p1 -l < ../apache_makefile.patch
 
 $(HTTPD_SRC).tar.gz:
-	$(GRAPHENEDIR)/Scripts/download --output $@ --sha256 $(HTTPD_CHECKSUM) $(foreach mirror,$(HTTPD_MIRRORS),--url $(mirror)httpd/$(HTTPD_SRC).tar.gz)
-
-# Apache dependencies (generate from ldd):
-#
-# For SGX, the manifest needs to list all the libraries loaded during the
-# execution, so that the signer can include the file checksums.
-#
-# The dependencies are generated from the ldd results.
-
-# We need to replace Glibc dependencies with Graphene-specific Glibc. The Glibc
-# binaries are already listed in the manifest template, so we can skip them
-# from the ldd results
-GLIBC_DEPS = linux-vdso /lib64/ld-linux-x86-64 libc libm librt libdl libpthread
+	$(GRAPHENEDIR)/Scripts/download --output $@ --sha256 $(HTTPD_CHECKSUM) \
+		$(foreach mirror,$(HTTPD_MIRRORS),--url $(mirror)/$(HTTPD_SRC).tar.gz)
 
 $(INSTALL_DIR)/conf/httpd.conf: $(INSTALL_DIR)/bin/httpd
 $(INSTALL_DIR)/conf/extra/httpd-ssl.conf: $(INSTALL_DIR)/bin/httpd
@@ -85,44 +78,13 @@ httpd-modules: $(INSTALL_DIR)/conf/httpd.conf
 	@echo $(INSTALL_DIR)/modules/mod_mpm_event.so  >> $@
 	@echo $(INSTALL_DIR)/modules/mod_ssl.so        >> $@
 
-# Listing all the Apache dependencies, besides Glibc libraries
-.INTERMEDIATE: httpd-ldd
-httpd-ldd: httpd-modules $(INSTALL_DIR)/bin/httpd
-	@for F in $(INSTALL_DIR)/bin/httpd `cat httpd-modules`; do \
-		ldd $$F >> $@ || exit 1; done
-
-.INTERMEDIATE: httpd-deps
-httpd-deps: httpd-ldd
-	@cat $< | awk '{if ($$2 =="=>") {split($$1,s,/\./); print s[1]}}' \
-		| sort | uniq | grep -v -x $(patsubst %,-e %,$(GLIBC_DEPS)) > $@
-
-# Generating manifest rules for Apache modules
-.INTERMEDIATE: httpd-trusted-mods
-httpd-trusted-mods: httpd-modules
-	@for F in `cat httpd-modules`; do \
-		N=`echo $$F | awk '{n=split($$1,s,/\/|\./); print s[n-1]}'`; \
-		echo -n "sgx.trusted_files.$$N = \\\"file:$$F\\\"\\\\n"; \
-	done > $@
-
-# Generating manifest rules for Apache dependencies
-.INTERMEDIATE: httpd-trusted-libs
-httpd-trusted-libs: httpd-deps httpd-modules $(INSTALL_DIR)/bin/httpd
-	@HTTPD_LIBS="$(INSTALL_DIR)/bin/httpd `cat httpd-modules`" && \
-	for F in `cat httpd-deps`; do \
-		P=`ldd $$HTTPD_LIBS | grep $$F | awk '{print $$3; exit}'`; \
-		N=`echo $$F | tr --delete '-'`; \
-		echo -n "sgx.trusted_files.$$N = \\\"file:$$P\\\"\\\\n"; \
-	done > $@
-
-httpd.manifest: httpd.manifest.template httpd-trusted-mods httpd-trusted-libs
-	sed -e 's|$$(GRAPHENEDIR)|'"$(GRAPHENEDIR)"'|g' \
-	    -e 's|$$(GRAPHENE_LOG_LEVEL)|'"$(GRAPHENE_LOG_LEVEL)"'|g' \
-	    -e 's|$$(INSTALL_DIR)|'"$(INSTALL_DIR)"'|g' \
-	    -e 's|$$(INSTALL_DIR_ABSPATH)|'"$(abspath $(INSTALL_DIR))"'|g' \
-	    -e 's|$$(HTTPD_TRUSTED_MODS)|'"`cat httpd-trusted-mods`"'|g' \
-	    -e 's|$$(HTTPD_TRUSTED_LIBS)|'"`cat httpd-trusted-libs`"'|g' \
-	    -e 's|$$(ARCH_LIBDIR)|'"$(ARCH_LIBDIR)"'|g' \
-	    $< > $@
+httpd.manifest: httpd.manifest.template
+	graphene-manifest \
+		-Dlog_level=$(GRAPHENE_LOG_LEVEL) \
+		-Dinstall_dir=$(INSTALL_DIR) \
+		-Dinstall_dir_abspath=$(abspath $(INSTALL_DIR)) \
+		-Darch_libdir=$(ARCH_LIBDIR) \
+		$< > $@
 
 # Generating the SGX-specific manifest (httpd.manifest.sgx), the enclave signature,
 # and the token for enclave initialization.
@@ -131,18 +93,15 @@ httpd.manifest.sgx: httpd.manifest $(INSTALL_DIR)/bin/httpd \
 		$(INSTALL_DIR)/conf/extra/httpd-ssl-graphene.conf \
 		$(TEST_DATA) \
 		$(INSTALL_DIR)/conf/server.crt
-	$(GRAPHENEDIR)/Pal/src/host/Linux-SGX/signer/pal-sgx-sign \
-		-libpal $(GRAPHENEDIR)/Runtime/libpal-Linux-SGX.so \
-		-key $(SGX_SIGNER_KEY) \
-		-manifest httpd.manifest -output $@
+	graphene-sgx-sign \
+		--key $(SGX_SIGNER_KEY) \
+		--manifest httpd.manifest \
+		--output $@
 
 httpd.sig: httpd.manifest.sgx
 
 httpd.token: httpd.sig
-	$(GRAPHENEDIR)/Pal/src/host/Linux-SGX/signer/pal-sgx-get-token -output $@ -sig $<
-
-pal_loader:
-	ln -s $(GRAPHENEDIR)/Runtime/pal_loader $@
+	graphene-sgx-get-token --output $@ --sig $<
 
 # Apache configuration and test data
 
@@ -150,14 +109,15 @@ pal_loader:
 config: $(INSTALL_DIR)/conf/httpd-graphene.conf $(INSTALL_DIR)/conf/extra/httpd-ssl-graphene.conf
 
 $(INSTALL_DIR)/conf/httpd-graphene.conf: $(INSTALL_DIR)/conf/httpd.conf
-	sed -e "s|^Listen |#Listen |g" \
-	    -e "s|^User |#User |g" \
-	    -e "s|^Group |#Group |g" \
-	    -e "s|^LoadModule mpm_prefork|#LoadModule mpm_prefork|g" \
-	    -e "s|^#LoadModule ssl_module|LoadModule ssl_module|g" \
-	    -e "s|^#Include conf/extra/httpd-ssl.conf|Include conf/extra/httpd-ssl-graphene.conf|g" \
-	    -e "s|#EnableMMAP off|EnableMMAP off|g" \
-	    -e "s|#EnableSendfile on|EnableSendfile on|g" \
+	sed \
+		-e "s|^Listen |#Listen |g" \
+		-e "s|^User |#User |g" \
+		-e "s|^Group |#Group |g" \
+		-e "s|^LoadModule mpm_prefork|#LoadModule mpm_prefork|g" \
+		-e "s|^#LoadModule ssl_module|LoadModule ssl_module|g" \
+		-e "s|^#Include conf/extra/httpd-ssl.conf|Include conf/extra/httpd-ssl-graphene.conf|g" \
+		-e "s|#EnableMMAP off|EnableMMAP off|g" \
+		-e "s|#EnableSendfile on|EnableSendfile on|g" \
 	$< > $@
 	echo "\n\
 <IfModule mpm_prefork_module>\n\
@@ -175,10 +135,11 @@ $(INSTALL_DIR)/conf/httpd-graphene.conf: $(INSTALL_DIR)/conf/httpd.conf
 </IfModule>\n" >> $@
 
 $(INSTALL_DIR)/conf/extra/httpd-ssl-graphene.conf: $(INSTALL_DIR)/conf/extra/httpd-ssl.conf
-	sed -e "s|^Listen 443|Listen 127.0.0.1:8443|g" \
-	    -e "s|^<VirtualHost _default_:443>|<VirtualHost 127.0.0.1:8443>|g" \
-	    -e "s|^ServerName www.example.com:443|ServerName www.example.com:8443|g" \
-	    -e "s|^SSLSessionCache|#SSLSessionCache|g" \
+	sed \
+		-e "s|^Listen 443|Listen 127.0.0.1:8443|g" \
+		-e "s|^<VirtualHost _default_:443>|<VirtualHost 127.0.0.1:8443>|g" \
+		-e "s|^ServerName www.example.com:443|ServerName www.example.com:8443|g" \
+		-e "s|^SSLSessionCache|#SSLSessionCache|g" \
 	$< > $@
 
 # HTTP docs:
@@ -234,6 +195,12 @@ ssldata: $(INSTALL_DIR)/conf/server.crt
 # - make clean-server:
 #      Clean up the PID files generated by Apache
 
+ifeq ($(SGX),)
+GRAPHENE = graphene-direct
+else
+GRAPHENE = graphene-sgx
+endif
+
 .PHONY: clean-server
 clean-server:
 	$(RM) $(INSTALL_DIR)/logs/httpd-$(LISTEN_HOST)-$(LISTEN_PORT).pid
@@ -241,7 +208,7 @@ clean-server:
 .PHONY: start-native-server
 start-native-server: all clean-server
 	@echo "Listen on $(LISTEN_HOST):$(LISTEN_PORT)"
-	$(PREFIX) $(INSTALL_DIR)/bin/httpd -D FOREGROUND \
+	$(INSTALL_DIR)/bin/httpd -D FOREGROUND \
 		-f conf/httpd-graphene.conf \
 		-C "LoadModule mpm_prefork_module modules/mod_mpm_prefork.so" \
 		-C "Listen $(LISTEN_HOST):$(LISTEN_PORT)" \
@@ -251,7 +218,7 @@ start-native-server: all clean-server
 .PHONY: start-graphene-server
 start-graphene-server: all clean-server
 	@echo "Listen on $(LISTEN_HOST):$(LISTEN_PORT)"
-	$(PREFIX) ./pal_loader ./httpd -D FOREGROUND \
+	$(GRAPHENE) ./httpd -D FOREGROUND \
 		-f conf/httpd-graphene.conf \
 		-C "LoadModule mpm_prefork_module modules/mod_mpm_prefork.so" \
 		-C "Listen $(LISTEN_HOST):$(LISTEN_PORT)" \
@@ -261,7 +228,7 @@ start-graphene-server: all clean-server
 .PHONY: start-native-multithreaded-server
 start-native-multithreaded-server: all clean-server
 	@echo "Listen on $(LISTEN_HOST):$(LISTEN_PORT)"
-	$(PREFIX) $(INSTALL_DIR)/bin/httpd -D FOREGROUND \
+	$(INSTALL_DIR)/bin/httpd -D FOREGROUND \
 		-f conf/httpd-graphene.conf \
 		-C "LoadModule mpm_worker_module modules/mod_mpm_worker.so" \
 		-C "Listen $(LISTEN_HOST):$(LISTEN_PORT)" \
@@ -271,7 +238,7 @@ start-native-multithreaded-server: all clean-server
 .PHONY: start-graphene-multithreaded-server
 start-graphene-multithreaded-server: all clean-server
 	@echo "Listen on $(LISTEN_HOST):$(LISTEN_PORT)"
-	$(PREFIX) ./pal_loader ./httpd -D FOREGROUND \
+	$(GRAPHENE) ./httpd -D FOREGROUND \
 		-f conf/httpd-graphene.conf \
 		-C "LoadModule mpm_worker_module modules/mod_mpm_worker.so" \
 		-C "Listen $(LISTEN_HOST):$(LISTEN_PORT)" \
@@ -280,8 +247,7 @@ start-graphene-multithreaded-server: all clean-server
 
 .PHONY: clean
 clean:
-	$(RM) *.manifest *.manifest.sgx *.token *.sig pal_loader OUTPUT result-* httpd-ldd \
-	      httpd-modules tmp
+	$(RM) *.manifest *.manifest.sgx *.token *.sig OUTPUT result-* httpd-ldd httpd-modules tmp
 
 .PHONY: distclean
 distclean: clean

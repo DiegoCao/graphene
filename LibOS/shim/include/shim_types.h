@@ -1,6 +1,7 @@
 #ifndef _SHIM_TYPES_H_
 #define _SHIM_TYPES_H_
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -221,12 +222,12 @@ enum {
     MSG_OOB      = 0x01,   /* Process out-of-band data. */
     MSG_PEEK     = 0x02,   /* Peek at incoming messages. */
     MSG_DONTWAIT = 0x40,   /* Nonblocking IO. */
-    MSG_WAITALL  = 0x100,
+    MSG_WAITALL  = 0x100,  /* Wait for full request or error */
     MSG_NOSIGNAL = 0x4000, /* Do not generate SIGPIPE. */
 #define MSG_OOB      MSG_OOB
 #define MSG_PEEK     MSG_PEEK
 #define MSG_DONTWAIT MSG_DONTWAIT
-#define MSG_WAITALL MSG_WAITALL
+#define MSG_WAITALL  MSG_WAITALL
 #define MSG_NOSIGNAL MSG_NOSIGNAL
 };
 
@@ -332,15 +333,13 @@ struct linux_file_handle {
     unsigned char f_handle[0];
 };
 
-#ifdef __x86_64__
 typedef Elf64_auxv_t elf_auxv_t;
-#else
-typedef Elf64_auxv_t elf_auxv_t;
-#endif
 
 /* typedef for shim internal types */
-typedef unsigned int IDTYPE;
+typedef uint32_t IDTYPE;
+#define IDTYPE_MAX UINT32_MAX
 typedef uint16_t FDTYPE;
+#define FDTYPE_MAX UINT16_MAX
 typedef uint64_t HASHTYPE;
 
 typedef struct atomic_int REFTYPE;
@@ -365,7 +364,6 @@ struct shim_str {
 /* Use qstr for names. This has fixed size string + string object
  * if len > SHIM_QSTR_SIZE then use overflow string */
 struct shim_qstr {
-    HASHTYPE hash;
     size_t len;
     char name[QSTR_SIZE];
     struct shim_str* oflow;

@@ -10,25 +10,29 @@
 #include <stdint.h>
 
 #include "api.h"
+#include "cpu.h"
+#include "gsgx.h"
+#include "hex.h"
+#include "linux_utils.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
 #include "pal_linux.h"
 #include "pal_linux_defs.h"
 #include "pal_security.h"
-#include "gsgx.h"
+#include "seqlock.h"
 #include "sgx_api.h"
 #include "sgx_attest.h"
+#include "spinlock.h"
 #include "toml.h"
 
 #define TSC_REFINE_INIT_TIMEOUT_USECS 10000000
 
-static uint64_t g_tsc_hz = 0;
+uint64_t g_tsc_hz = 0; /* TSC frequency for fast and accurate time ("invariant TSC" HW feature) */
 static uint64_t g_start_tsc = 0;
 static uint64_t g_start_usec = 0;
-static PAL_LOCK g_tsc_lock = LOCK_INIT;
+static seqlock_t g_tsc_lock = INIT_SEQLOCK_UNLOCKED;
 
 /**
  * Initialize the data structures used for date/time emulation using TSC
@@ -41,63 +45,69 @@ void init_tsc(void) {
 
 /* TODO: result comes from the untrusted host, introduce some schielding */
 int _DkSystemTimeQuery(uint64_t* out_usec) {
-    uint64_t usec = 0;
-    uint64_t tsc_usec = 0, tsc_cyc1, tsc_cyc2, tsc_cyc, tsc_diff;
     int ret;
 
-    if (g_tsc_hz > 0) {
-        _DkInternalLock(&g_tsc_lock);
-        if (g_start_tsc > 0 && g_start_usec > 0) {
-            /* calculate the TSC-based time */
-            tsc_diff = get_tsc() - g_start_tsc;
-            if (tsc_diff < INT64_MAX / 1000000) {
-                tsc_usec = g_start_usec + (tsc_diff * 1000000 / g_tsc_hz);
-                if (tsc_usec < g_start_usec + TSC_REFINE_INIT_TIMEOUT_USECS) {
-                    /* no need to refine yet */
-                    usec = tsc_usec;
-                }
-            }
-        }
-        _DkInternalUnlock(&g_tsc_lock);
-
-        if (!usec) {
-            /* refresh the baseline usec and TSC to contain the drift */
-            tsc_cyc1 = get_tsc();
-            ret = ocall_gettime(&usec);
-            tsc_cyc2 = get_tsc();
-            if (!ret) {
-                /* the ocall_gettime() is a time consuming operation.   *
-                 * it includes EENTER and EEXIT instructions, our best  *
-                 * estimation is the timestamp obtained in the middle   *
-                 * time point, therefore, the tsc_cyc as baseline will  *
-                 * be calibrated precisely in this way.                 */
-                tsc_cyc = ((tsc_cyc2 - tsc_cyc1) / 2) + tsc_cyc1;
-                _DkInternalLock(&g_tsc_lock);
-                /* refresh the baseline data if no other thread updated g_start_tsc */
-                if (g_start_tsc < tsc_cyc) {
-                    g_start_usec = usec;
-                    g_start_tsc = tsc_cyc;
-                }
-                _DkInternalUnlock(&g_tsc_lock);
-            } else {
-                return -PAL_ERROR_DENIED;
-            }
-        }
-    } else {
-        /* fallback to the slow ocall */
-        ret = ocall_gettime(&usec);
-        if (ret < 0)
-            return -PAL_ERROR_DENIED;
+    if (!g_tsc_hz) {
+        /* RDTSC is not allowed or no Invariant TSC feature -- fallback to the slow ocall */
+        return ocall_gettime(out_usec);
     }
+
+    uint32_t seq;
+    uint64_t start_tsc;
+    uint64_t start_usec;
+    do {
+        seq = read_seqbegin(&g_tsc_lock);
+        start_tsc  = g_start_tsc;
+        start_usec = g_start_usec;
+    } while (read_seqretry(&g_tsc_lock, seq));
+
+    uint64_t usec = 0;
+    if (start_tsc > 0 && start_usec > 0) {
+        /* baseline TSC/usec pair was initialized, can calculate time via RDTSC (but should be
+         * careful with integer overflow during calculations) */
+        uint64_t diff_tsc = get_tsc() - start_tsc;
+        if (diff_tsc < UINT64_MAX / 1000000) {
+            uint64_t diff_usec = diff_tsc * 1000000 / g_tsc_hz;
+            if (diff_usec < TSC_REFINE_INIT_TIMEOUT_USECS) {
+                /* less than TSC_REFINE_INIT_TIMEOUT_USECS passed from the previous update of
+                 * TSC/usec pair (time drift is contained), use the RDTSC-calculated time */
+                usec = start_usec + diff_usec;
+                if (usec < start_usec)
+                    return -PAL_ERROR_OVERFLOW;
+            }
+        }
+    }
+
+    if (usec) {
+        *out_usec = usec;
+        return 0;
+    }
+
+    /* if we are here, either the baseline TSC/usec pair was not yet initialized or too much time
+     * passed since the previous TSC/usec update, so let's refresh them to contain the time drift */
+    uint64_t tsc_cyc1 = get_tsc();
+    ret = ocall_gettime(&usec);
+    if (ret < 0)
+        return -PAL_ERROR_DENIED;
+    uint64_t tsc_cyc2 = get_tsc();
+
+    /* we need to match the OCALL-obtained timestamp (`usec`) with the RDTSC-obtained number of
+     * cycles (`tsc_cyc`); since OCALL is a time-consuming operation, we estimate `tsc_cyc` as a
+     * mid-point between the RDTSC values obtained right-before and right-after the OCALL. */
+    uint64_t tsc_cyc = tsc_cyc1 + (tsc_cyc2 - tsc_cyc1) / 2;
+    if (tsc_cyc < tsc_cyc1)
+        return -PAL_ERROR_OVERFLOW;
+
+    /* refresh the baseline data if no other thread updated g_start_tsc */
+    write_seqbegin(&g_tsc_lock);
+    if (g_start_tsc < tsc_cyc) {
+        g_start_tsc  = tsc_cyc;
+        g_start_usec = usec;
+    }
+    write_seqend(&g_tsc_lock);
+
     *out_usec = usec;
     return 0;
-}
-
-int _DkInstructionCacheFlush(const void* addr, int size) {
-    __UNUSED(addr);
-    __UNUSED(size);
-
-    return -PAL_ERROR_NOTIMPLEMENTED;
 }
 
 #define CPUID_CACHE_SIZE 64 /* cache only 64 distinct CPUID entries; sufficient for most apps */
@@ -107,12 +117,12 @@ static struct pal_cpuid {
 } g_pal_cpuid_cache[CPUID_CACHE_SIZE];
 
 static int g_pal_cpuid_cache_top   = 0;
-static PAL_LOCK g_cpuid_cache_lock = LOCK_INIT;
+static spinlock_t g_cpuid_cache_lock = INIT_SPINLOCK_UNLOCKED;
 
 static int get_cpuid_from_cache(unsigned int leaf, unsigned int subleaf, unsigned int values[4]) {
     int ret = -PAL_ERROR_DENIED;
 
-    _DkInternalLock(&g_cpuid_cache_lock);
+    spinlock_lock(&g_cpuid_cache_lock);
     for (int i = 0; i < g_pal_cpuid_cache_top; i++) {
         if (g_pal_cpuid_cache[i].leaf == leaf && g_pal_cpuid_cache[i].subleaf == subleaf) {
             values[0] = g_pal_cpuid_cache[i].values[0];
@@ -123,12 +133,12 @@ static int get_cpuid_from_cache(unsigned int leaf, unsigned int subleaf, unsigne
             break;
         }
     }
-    _DkInternalUnlock(&g_cpuid_cache_lock);
+    spinlock_unlock(&g_cpuid_cache_lock);
     return ret;
 }
 
 static void add_cpuid_to_cache(unsigned int leaf, unsigned int subleaf, unsigned int values[4]) {
-    _DkInternalLock(&g_cpuid_cache_lock);
+    spinlock_lock(&g_cpuid_cache_lock);
 
     struct pal_cpuid* chosen = NULL;
     if (g_pal_cpuid_cache_top < CPUID_CACHE_SIZE) {
@@ -150,7 +160,7 @@ static void add_cpuid_to_cache(unsigned int leaf, unsigned int subleaf, unsigned
         chosen->values[3] = values[3];
     }
 
-    _DkInternalUnlock(&g_cpuid_cache_lock);
+    spinlock_unlock(&g_cpuid_cache_lock);
 }
 
 static inline uint32_t extension_enabled(uint32_t xfrm, uint32_t bit_idx) {
@@ -261,15 +271,18 @@ static void sanity_check_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t values[
             case AVX512_3:
             case PKRU:
                 if (extension_enabled(xfrm, subleaf)) {
-                    if (values[EAX] != extension_sizes_bytes[subleaf]) {
-                        SGX_DBG(DBG_E, "Unexpected value in host CPUID. Exiting...\n");
+                    if (values[EAX] != extension_sizes_bytes[subleaf] ||
+                            values[EBX] != extension_offset_bytes[subleaf]) {
+                        log_error("Unexpected value in host CPUID. Exiting...");
                         _DkProcessExit(1);
                     }
                 } else {
-                    if (values[EAX] != 0) {
-                        SGX_DBG(DBG_E, "Unexpected value in host CPUID. Exiting...\n");
-                        _DkProcessExit(1);
-                    }
+                    /* SGX enclave doesn't use this CPU extension, pretend it doesn't exist by
+                     * forcing EAX ("size in bytes of the save area for an extended state feature")
+                     * and EBX ("offset in bytes of this extended state component's save area from
+                     * the beginning of the XSAVE/XRSTOR area") to zero */
+                    values[EAX] = 0;
+                    values[EBX] = 0;
                 }
                 break;
         }
@@ -289,6 +302,7 @@ struct cpuid_leaf {
  *       different sockets in a multisocket system and thus should not be declared with
  *       `.cache = true` below, but we don't know of any such systems and currently ignore this */
 static const struct cpuid_leaf cpuid_known_leaves[] = {
+    /* basic CPUID leaf functions start here */
     {.leaf = 0x00, .zero_subleaf = true,  .cache = true},  /* Highest Func Param and Manufacturer */
     {.leaf = 0x01, .zero_subleaf = true,  .cache = false}, /* Processor Info and Feature Bits */
     {.leaf = 0x02, .zero_subleaf = true,  .cache = true},  /* Cache and TLB Descriptor */
@@ -297,13 +311,18 @@ static const struct cpuid_leaf cpuid_known_leaves[] = {
     {.leaf = 0x05, .zero_subleaf = true,  .cache = true},  /* MONITOR/MWAIT */
     {.leaf = 0x06, .zero_subleaf = true,  .cache = true},  /* Thermal and Power Management */
     {.leaf = 0x07, .zero_subleaf = false, .cache = true},  /* Structured Extended Feature Flags */
+    /* NOTE: 0x08 leaf is reserved, see code below */
     {.leaf = 0x09, .zero_subleaf = true,  .cache = true},  /* Direct Cache Access Information */
     {.leaf = 0x0A, .zero_subleaf = true,  .cache = true},  /* Architectural Performance Monitoring */
     {.leaf = 0x0B, .zero_subleaf = false, .cache = false}, /* Extended Topology Enumeration */
+    /* NOTE: 0x0C leaf is reserved, see code below */
     {.leaf = 0x0D, .zero_subleaf = false, .cache = true},  /* Processor Extended State Enumeration */
+    /* NOTE: 0x0E leaf is reserved, see code below */
     {.leaf = 0x0F, .zero_subleaf = false, .cache = true},  /* Intel RDT Monitoring */
     {.leaf = 0x10, .zero_subleaf = false, .cache = true},  /* RDT/L2/L3 Cache Allocation Tech */
+    /* NOTE: 0x11 leaf is reserved, see code below */
     {.leaf = 0x12, .zero_subleaf = false, .cache = true},  /* Intel SGX Capability */
+    /* NOTE: 0x13 leaf is reserved, see code below */
     {.leaf = 0x14, .zero_subleaf = false, .cache = true},  /* Intel Processor Trace Enumeration */
     {.leaf = 0x15, .zero_subleaf = true,  .cache = true},  /* Time Stamp Counter/Core Clock */
     {.leaf = 0x16, .zero_subleaf = true,  .cache = true},  /* Processor Frequency Information */
@@ -311,8 +330,18 @@ static const struct cpuid_leaf cpuid_known_leaves[] = {
     {.leaf = 0x18, .zero_subleaf = false, .cache = true},  /* Deterministic Address Translation */
     {.leaf = 0x19, .zero_subleaf = true,  .cache = true},  /* Key Locker */
     {.leaf = 0x1A, .zero_subleaf = true,  .cache = false}, /* Hybrid Information Enumeration */
+    /* NOTE: 0x1B leaf is not recognized, see code below */
+    /* NOTE: 0x1C leaf is not recognized, see code below */
+    /* NOTE: 0x1D leaf is not recognized, see code below */
+    /* NOTE: 0x1E leaf is not recognized, see code below */
     {.leaf = 0x1F, .zero_subleaf = false, .cache = false}, /* Intel V2 Ext Topology Enumeration */
+    /* basic CPUID leaf functions end here */
 
+    /* invalid CPUID leaf functions (no existing or future CPU will return any meaningful
+     * information in these leaves) occupy 40000000 - 4FFFFFFFH -- they are treated the same as
+     * unrecognized leaves, see code below */
+
+    /* extended CPUID leaf functions start here */
     {.leaf = 0x80000000, .zero_subleaf = true, .cache = true}, /* Get Highest Extended Function */
     {.leaf = 0x80000001, .zero_subleaf = true, .cache = true}, /* Extended Processor Info */
     {.leaf = 0x80000002, .zero_subleaf = true, .cache = true}, /* Processor Brand String 1 */
@@ -322,19 +351,45 @@ static const struct cpuid_leaf cpuid_known_leaves[] = {
     {.leaf = 0x80000006, .zero_subleaf = true, .cache = true}, /* Extended L2 Cache Features */
     {.leaf = 0x80000007, .zero_subleaf = true, .cache = true}, /* Advanced Power Management */
     {.leaf = 0x80000008, .zero_subleaf = true, .cache = true}, /* Virtual/Physical Address Sizes */
+    /* extended CPUID leaf functions end here */
 };
 
 int _DkCpuIdRetrieve(unsigned int leaf, unsigned int subleaf, unsigned int values[4]) {
+    /* A few basic leaves are considered reserved and always return zeros; see corresponding EAX
+     * cases in the "Operation" section of CPUID description in Intel SDM, Vol. 2A, Chapter 3.2.
+     *
+     * NOTE: Leaves 0x11 and 0x13 are not marked as reserved in Intel SDM but the actual CPUs return
+     *       all-zeros on them (as if these leaves are reserved). It is unclear why this discrepancy
+     *       exists, but we decided to emulate how actual CPUs behave. */
+    if (leaf == 0x08 || leaf == 0x0C || leaf == 0x0E || leaf == 0x11 || leaf == 0x13) {
+        values[0] = 0;
+        values[1] = 0;
+        values[2] = 0;
+        values[3] = 0;
+        return 0;
+    }
+
     const struct cpuid_leaf* known_leaf = NULL;
-    for (unsigned int i = 0; i < ARRAY_SIZE(cpuid_known_leaves); i++) {
+    for (size_t i = 0; i < ARRAY_SIZE(cpuid_known_leaves); i++) {
         if (leaf == cpuid_known_leaves[i].leaf) {
             known_leaf = &cpuid_known_leaves[i];
             break;
         }
     }
 
-    if (!known_leaf)
-        goto fail;
+    if (!known_leaf) {
+        /* leaf is not recognized (EAX value is outside of recongized range for CPUID), return info
+         * for highest basic information leaf (see cpuid_known_leaves table; currently 0x1F); see
+         * the DEFAULT case in the "Operation" section of CPUID description in Intel SDM, Vol. 2A,
+         * Chapter 3.2 */
+        leaf = 0x1F;
+        for (size_t i = 0; i < ARRAY_SIZE(cpuid_known_leaves); i++) {
+            if (leaf == cpuid_known_leaves[i].leaf) {
+                known_leaf = &cpuid_known_leaves[i];
+                break;
+            }
+        }
+    }
 
     if ((leaf == 0x07 && subleaf != 0 && subleaf != 1) ||
         (leaf == 0x0F && subleaf != 0 && subleaf != 1) ||
@@ -350,7 +405,7 @@ int _DkCpuIdRetrieve(unsigned int leaf, unsigned int subleaf, unsigned int value
     if (known_leaf->cache && !get_cpuid_from_cache(leaf, subleaf, values))
         return 0;
 
-    if (IS_ERR(ocall_cpuid(leaf, subleaf, values)))
+    if (ocall_cpuid(leaf, subleaf, values) < 0)
         return -PAL_ERROR_DENIED;
 
     sanity_check_cpuid(leaf, subleaf, values);
@@ -360,8 +415,7 @@ int _DkCpuIdRetrieve(unsigned int leaf, unsigned int subleaf, unsigned int value
 
     return 0;
 fail:
-    SGX_DBG(DBG_E, "Unrecognized leaf/subleaf in CPUID (EAX=%u, ECX=%u). Exiting...\n", leaf,
-            subleaf);
+    log_error("Unrecognized leaf/subleaf in CPUID (EAX=0x%x, ECX=0x%x). Exiting...", leaf, subleaf);
     _DkProcessExit(1);
 }
 
@@ -429,15 +483,14 @@ int _DkAttestationQuote(const PAL_PTR user_report_data, PAL_NUM user_report_data
 
     int ret;
     bool is_epid;
-    sgx_spid_t spid;
+    sgx_spid_t spid = {0};
     bool linkable;
 
     /* read sgx.ra_client_spid from manifest (must be hex string) */
     char* ra_client_spid_str = NULL;
     ret = toml_string_in(g_pal_state.manifest_root, "sgx.ra_client_spid", &ra_client_spid_str);
     if (ret < 0) {
-        SGX_DBG(DBG_E, "Cannot parse \'sgx.ra_client_spid\' "
-                       "(the value must be put in double quotes!)\n");
+        log_error("Cannot parse \'sgx.ra_client_spid\' (the value must be put in double quotes!)");
         return -PAL_ERROR_INVAL;
     }
 
@@ -445,15 +498,14 @@ int _DkAttestationQuote(const PAL_PTR user_report_data, PAL_NUM user_report_data
         /* No Software Provider ID (SPID) specified in the manifest, it is DCAP attestation --
          * for DCAP, spid and linkable arguments are ignored (we unset them for sanity) */
         is_epid = false;
-        memset(&spid, 0, sizeof(spid));
         linkable = false;
     } else {
         /* SPID specified in the manifest, it is EPID attestation -- read spid and linkable */
         is_epid = true;
 
         if (strlen(ra_client_spid_str) != sizeof(sgx_spid_t) * 2) {
-            SGX_DBG(DBG_E, "Malformed \'sgx.ra_client_spid\' value in the manifest: %s\n",
-                    ra_client_spid_str);
+            log_error("Malformed \'sgx.ra_client_spid\' value in the manifest: %s",
+                      ra_client_spid_str);
             free(ra_client_spid_str);
             return -PAL_ERROR_INVAL;
         }
@@ -461,8 +513,8 @@ int _DkAttestationQuote(const PAL_PTR user_report_data, PAL_NUM user_report_data
         for (size_t i = 0; i < strlen(ra_client_spid_str); i++) {
             int8_t val = hex2dec(ra_client_spid_str[i]);
             if (val < 0) {
-                SGX_DBG(DBG_E, "Malformed \'sgx.ra_client_spid\' value in the manifest: %s\n",
-                        ra_client_spid_str);
+                log_error("Malformed \'sgx.ra_client_spid\' value in the manifest: %s",
+                          ra_client_spid_str);
                 free(ra_client_spid_str);
                 return -PAL_ERROR_INVAL;
             }
@@ -470,15 +522,14 @@ int _DkAttestationQuote(const PAL_PTR user_report_data, PAL_NUM user_report_data
         }
 
         /* read sgx.ra_client_linkable from manifest */
-        int64_t linkable_int64;
-        ret = toml_int_in(g_pal_state.manifest_root, "sgx.ra_client_linkable",
-                          /*defaultval=*/0, &linkable_int64);
-        if (ret < 0 || (linkable_int64 != 0 && linkable_int64 != 1)) {
-            SGX_DBG(DBG_E, "Cannot parse \'sgx.ra_client_linkable\' (the value must be 0 or 1)\n");
+        ret = toml_bool_in(g_pal_state.manifest_root, "sgx.ra_client_linkable",
+                           /*defaultval=*/false, &linkable);
+        if (ret < 0) {
+            log_error("Cannot parse \'sgx.ra_client_linkable\' (the value must be `true` or "
+                      "`false`)");
             free(ra_client_spid_str);
             return -PAL_ERROR_INVAL;
         }
-        linkable = !!linkable_int64;
     }
 
     free(ra_client_spid_str);
@@ -515,4 +566,268 @@ int _DkAttestationQuote(const PAL_PTR user_report_data, PAL_NUM user_report_data
 
 int _DkSetProtectedFilesKey(const PAL_PTR pf_key_hex) {
     return set_protected_files_key(pf_key_hex);
+}
+
+/* Rest is moved from old `db_main-x86_64.c`. */
+
+#define FOUR_CHARS_VALUE(s, w)      \
+    (s)[0] = (w) & 0xff;            \
+    (s)[1] = ((w) >>  8) & 0xff;    \
+    (s)[2] = ((w) >> 16) & 0xff;    \
+    (s)[3] = ((w) >> 24) & 0xff;
+
+#define BPI  32
+#define POWER2(power) \
+    (1ULL << (power))
+#define RIGHTMASK(width) \
+    (((unsigned long)(width) >= BPI) ? ~0ULL : POWER2(width) - 1ULL)
+
+#define BIT_EXTRACT_LE(value, start, after) \
+    (((unsigned long)(value) & RIGHTMASK(after)) >> start)
+
+#define CPUID_LEAF_INVARIANT_TSC 0x80000007
+#define CPUID_LEAF_TSC_FREQ 0x15
+#define CPUID_LEAF_PROC_FREQ 0x16
+
+static const char* const g_cpu_flags[] = {
+    "fpu",    // "x87 FPU on chip"
+    "vme",    // "virtual-8086 mode enhancement"
+    "de",     // "debugging extensions"
+    "pse",    // "page size extensions"
+    "tsc",    // "time stamp counter"
+    "msr",    // "RDMSR and WRMSR support"
+    "pae",    // "physical address extensions"
+    "mce",    // "machine check exception"
+    "cx8",    // "CMPXCHG8B inst."
+    "apic",   // "APIC on chip"
+    NULL,
+    "sep",    // "SYSENTER and SYSEXIT"
+    "mtrr",   // "memory type range registers"
+    "pge",    // "PTE global bit"
+    "mca",    // "machine check architecture"
+    "cmov",   // "conditional move/compare instruction"
+    "pat",    // "page attribute table"
+    "pse36",  // "page size extension"
+    "pn",     // "processor serial number"
+    "clflush",    // "CLFLUSH instruction"
+    NULL,
+    "dts",    // "debug store"
+    "acpi",   // "Onboard thermal control"
+    "mmx",    // "MMX Technology"
+    "fxsr",   // "FXSAVE/FXRSTOR"
+    "sse",    // "SSE extensions"
+    "sse2",   // "SSE2 extensions"
+    "ss",     // "self snoop"
+    "ht",     // "hyper-threading / multi-core supported"
+    "tm",     // "therm. monitor"
+    "ia64",   // "IA64"
+    "pbe",    // "pending break event"
+};
+
+static ssize_t read_file_buffer(const char* filename, char* buf, size_t buf_size) {
+    int fd;
+
+    fd = ocall_open(filename, O_RDONLY, 0);
+    if (fd < 0)
+        return fd;
+
+    /* Although the whole file might not fit in this size, the first cpu description should. */
+    ssize_t n = ocall_read(fd, buf, buf_size);
+    ocall_close(fd);
+
+    return n;
+}
+
+static double get_bogomips(void) {
+    char buf[2048];
+    ssize_t len;
+
+    len = read_file_buffer("/proc/cpuinfo", buf, sizeof(buf) - 1);
+    if (len < 0)
+        return 0.0;
+    buf[len] = 0;
+
+    return sanitize_bogomips_value(get_bogomips_from_cpuinfo_buf(buf));
+}
+
+bool is_tsc_usable(void) {
+    uint32_t words[CPUID_WORD_NUM];
+    _DkCpuIdRetrieve(CPUID_LEAF_INVARIANT_TSC, 0, words);
+    return words[CPUID_WORD_EDX] & 1 << 8;
+}
+
+/* return TSC frequency or 0 if invariant TSC is not supported */
+uint64_t get_tsc_hz(void) {
+    uint32_t words[CPUID_WORD_NUM];
+
+    _DkCpuIdRetrieve(CPUID_LEAF_TSC_FREQ, 0, words);
+    if (!words[CPUID_WORD_EAX] || !words[CPUID_WORD_EBX]) {
+        /* TSC/core crystal clock ratio is not enumerated, can't use RDTSC for accurate time */
+        return 0;
+    }
+
+    if (words[CPUID_WORD_ECX] > 0) {
+        /* calculate TSC frequency as core crystal clock frequency (EAX) * EBX / EAX; cast to 64-bit
+         * first to prevent integer overflow */
+        uint64_t ecx_hz = words[CPUID_WORD_ECX];
+        return ecx_hz * words[CPUID_WORD_EBX] / words[CPUID_WORD_EAX];
+    }
+
+    /* some Intel CPUs do not report nominal frequency of crystal clock, let's calculate it
+     * based on Processor Frequency Information Leaf (CPUID 16H); this leaf always exists if
+     * TSC Frequency Leaf exists; logic is taken from Linux 5.11's arch/x86/kernel/tsc.c */
+    _DkCpuIdRetrieve(CPUID_LEAF_PROC_FREQ, 0, words);
+    if (!words[CPUID_WORD_EAX]) {
+        /* processor base frequency (in MHz) is not enumerated, can't calculate frequency */
+        return 0;
+    }
+
+    /* processor base frequency is in MHz but we need to return TSC frequency in Hz; cast to 64-bit
+     * first to prevent integer overflow */
+    uint64_t base_frequency_mhz = words[CPUID_WORD_EAX];
+    return base_frequency_mhz * 1000000;
+}
+
+int _DkGetCPUInfo(PAL_CPU_INFO* ci) {
+    unsigned int words[CPUID_WORD_NUM];
+    int rv = 0;
+
+    const size_t VENDOR_ID_SIZE = 13;
+    char* vendor_id = malloc(VENDOR_ID_SIZE);
+    if (!vendor_id)
+        return -PAL_ERROR_NOMEM;
+
+    _DkCpuIdRetrieve(0, 0, words);
+    FOUR_CHARS_VALUE(&vendor_id[0], words[CPUID_WORD_EBX]);
+    FOUR_CHARS_VALUE(&vendor_id[4], words[CPUID_WORD_EDX]);
+    FOUR_CHARS_VALUE(&vendor_id[8], words[CPUID_WORD_ECX]);
+    vendor_id[VENDOR_ID_SIZE - 1] = '\0';
+    ci->cpu_vendor = vendor_id;
+    // Must be an Intel CPU
+    if (memcmp(vendor_id, "GenuineIntel", 12)) {
+        rv = -PAL_ERROR_INVAL;
+        goto out_vendor_id;
+    }
+
+    const size_t BRAND_SIZE = 49;
+    char* brand = malloc(BRAND_SIZE);
+    if (!brand) {
+        rv = -PAL_ERROR_NOMEM;
+        goto out_vendor_id;
+    }
+    _DkCpuIdRetrieve(0x80000002, 0, words);
+    memcpy(&brand[ 0], words, sizeof(unsigned int) * CPUID_WORD_NUM);
+    _DkCpuIdRetrieve(0x80000003, 0, words);
+    memcpy(&brand[16], words, sizeof(unsigned int) * CPUID_WORD_NUM);
+    _DkCpuIdRetrieve(0x80000004, 0, words);
+    memcpy(&brand[32], words, sizeof(unsigned int) * CPUID_WORD_NUM);
+    brand[BRAND_SIZE - 1] = '\0';
+    ci->cpu_brand = brand;
+
+    ci->online_logical_cores = g_pal_sec.online_logical_cores;
+    ci->physical_cores_per_socket = g_pal_sec.physical_cores_per_socket;
+    ci->cpu_socket = g_pal_sec.cpu_socket;
+
+    _DkCpuIdRetrieve(1, 0, words);
+    ci->cpu_family   = BIT_EXTRACT_LE(words[CPUID_WORD_EAX],  8, 12) +
+                       BIT_EXTRACT_LE(words[CPUID_WORD_EAX], 20, 28);
+    ci->cpu_model    = BIT_EXTRACT_LE(words[CPUID_WORD_EAX],  4,  8) +
+                      (BIT_EXTRACT_LE(words[CPUID_WORD_EAX], 16, 20) << 4);
+    ci->cpu_stepping = BIT_EXTRACT_LE(words[CPUID_WORD_EAX],  0,  4);
+
+    size_t flen = 0;
+    size_t fmax = 80;
+    char* flags = malloc(fmax);
+    if (!flags) {
+        rv = -PAL_ERROR_NOMEM;
+        goto out_brand;
+    }
+
+    for (int i = 0; i < 32; i++) {
+        if (!g_cpu_flags[i])
+            continue;
+
+        if (BIT_EXTRACT_LE(words[CPUID_WORD_EDX], i, i + 1)) {
+            size_t len = strlen(g_cpu_flags[i]);
+            if (flen + len + 1 > fmax) {
+                char* new_flags = malloc(fmax * 2);
+                if (!new_flags) {
+                    rv = -PAL_ERROR_NOMEM;
+                    goto out_flags;
+                }
+                memcpy(new_flags, flags, flen);
+                free(flags);
+                fmax *= 2;
+                flags = new_flags;
+            }
+            memcpy(flags + flen, g_cpu_flags[i], len);
+            flen += len;
+            flags[flen++] = ' ';
+        }
+    }
+
+    flags[flen ? flen - 1 : 0] = 0;
+    ci->cpu_flags = flags;
+
+    ci->cpu_bogomips = get_bogomips();
+    if (ci->cpu_bogomips == 0.0) {
+        log_warning("bogomips could not be retrieved, passing 0.0 to the application");
+    }
+
+    return rv;
+out_flags:
+    free(flags);
+out_brand:
+    free(brand);
+out_vendor_id:
+    free(vendor_id);
+    return rv;
+}
+
+int _DkGetTopologyInfo(PAL_TOPO_INFO* topo_info) {
+    topo_info->num_online_nodes = g_pal_sec.topo_info.num_online_nodes;
+    topo_info->num_cache_index  = g_pal_sec.topo_info.num_cache_index;
+    topo_info->core_topology    = g_pal_sec.topo_info.core_topology;
+    topo_info->numa_topology    = g_pal_sec.topo_info.numa_topology;
+    COPY_ARRAY(topo_info->online_logical_cores, g_pal_sec.topo_info.online_logical_cores);
+    COPY_ARRAY(topo_info->possible_logical_cores, g_pal_sec.topo_info.possible_logical_cores);
+    COPY_ARRAY(topo_info->online_nodes, g_pal_sec.topo_info.online_nodes);
+
+    return 0;
+}
+
+int _DkRandomBitsRead(void* buffer, size_t size) {
+    uint32_t rand;
+    for (size_t i = 0; i < size; i += sizeof(rand)) {
+        rand = rdrand();
+        memcpy(buffer + i, &rand, MIN(sizeof(rand), size - i));
+    }
+    return 0;
+}
+
+int _DkSegmentRegisterGet(int reg, void** addr) {
+    switch (reg) {
+        case PAL_SEGMENT_FS:
+            *addr = (void*)GET_ENCLAVE_TLS(fsbase);
+            return 0;
+        case PAL_SEGMENT_GS:
+            /* GS is internally used, deny any access to it */
+            return -PAL_ERROR_DENIED;
+        default:
+            return -PAL_ERROR_INVAL;
+    }
+}
+
+int _DkSegmentRegisterSet(int reg, void* addr) {
+    switch (reg) {
+        case PAL_SEGMENT_FS:
+            SET_ENCLAVE_TLS(fsbase, addr);
+            wrfsbase((uint64_t)addr);
+            return 0;
+        case PAL_SEGMENT_GS:
+            /* GS is internally used, deny any access to it */
+            return -PAL_ERROR_DENIED;
+        default:
+            return -PAL_ERROR_INVAL;
+    }
 }

@@ -1,11 +1,12 @@
 include ../../Scripts/Makefile.configs
 include ../../Scripts/Makefile.rules
 
-CFLAGS	+= -Wp,-U_FORTIFY_SOURCE -fno-stack-protector -fno-builtin -nostdlib \
-	  -I../src \
+CFLAGS	+= -fno-stack-protector -fno-builtin -nostdlib \
+	  -I. \
+	  -I../../common/include \
+	  -I../../common/include/arch/$(ARCH) \
 	  -I../include \
 	  -I../include/pal \
-	  -I../include/lib \
 	  -I../include/arch/$(ARCH) \
 	  -I../include/arch/$(ARCH)/$(PAL_HOST)
 
@@ -28,9 +29,7 @@ executables = \
 	Bootstrap7 \
 	Directory \
 	Event \
-	Event2 \
 	Exit \
-	Failure \
 	File \
 	File2 \
 	HelloWorld \
@@ -40,20 +39,15 @@ executables = \
 	Pie \
 	Pipe \
 	Process \
-	Process2 \
 	Process3 \
 	Process4 \
 	Select \
-	Semaphore \
 	SendHandle \
-	Sleep \
 	Socket \
 	Symbols \
 	Tcp \
 	Thread2 \
 	Udp \
-	Wait \
-	Yield \
 	normalize_path \
 	$(executables-$(ARCH))
 
@@ -78,12 +72,15 @@ target = \
 
 include ../../Scripts/manifest.mk
 graphene_lib = .lib/graphene-lib.a
-pal_lib = ../../Runtime/libpal-$(PAL_HOST).so
-
-RUNTIME_DIR = $(CURDIR)/../../Runtime
+ifneq ($(SGX),)
+graphene = sgx
+else
+graphene = direct
+endif
+pal_lib ?= $(shell graphene-manifest -c '{{ graphene.pkglibdir }}')/$(graphene)/libpal.so
 
 .PHONY: all
-all: pal_loader $(target) $(call expand_target_to_sig,$(target)) \
+all: $(target) $(call expand_target_to_sig,$(target)) \
      $(call expand_target_to_sgx,$(target)) $(preloads)
 
 .PHONY: sgx-tokens
@@ -91,36 +88,35 @@ sgx-tokens: $(call expand_target_to_token,$(target))
 
 .PHONY: crt_init-recurse
 crt_init-recurse:
-	$(MAKE) -C ../crt_init all
+	$(MAKE) -C crt_init all
 
-../crt_init/user_shared_start.o ../crt_init/user_start.o: crt_init-recurse
+crt_init/user_shared_start.o crt_init/user_start.o: crt_init-recurse
 	@true
 
 CFLAGS-Pie = -fPIC -pie
 CFLAGS-AttestationReport = -I../src/host/Linux-SGX
+
+utils.o: CFLAGS += -fPIC
 
 # workaround: File.manifest.template has strange reference
 # to ../regression/File
 ../regression/File: | File
 	@true
 
-LDLIBS-preloads = ../crt_init/user_shared_start.o $(graphene_lib) $(pal_lib)
+LDLIBS-preloads = crt_init/user_shared_start.o utils.o $(graphene_lib) $(pal_lib)
 $(preloads): %.so: %.c $(LDLIBS-preloads)
 	$(call cmd,csingle) -shared -fPIC $(LDLIBS-preloads)
 
-LDLIBS-executables = ../crt_init/user_start.o $(graphene_lib) $(pal_lib) $(preloads)
+LDLIBS-executables = crt_init/user_start.o utils.o $(graphene_lib) $(pal_lib) $(preloads)
 $(executables): %: %.c $(LDLIBS-executables)
 	$(call cmd,csingle) -no-pie $(LDLIBS-executables)
-
-pal_loader:
-	ln -s ../../Runtime/pal_loader $@
 
 ifeq ($(filter %clean,$(MAKECMDGOALS)),)
 include $(wildcard *.d)
 endif
 
 $(graphene_lib):
-	$(MAKE) -C ../lib target=$(abspath .lib)/
+	$(MAKE) -C ../../common/src target=$(abspath .lib)/
 
 .PHONY: regression
 regression:
@@ -132,9 +128,28 @@ pal-regression.xml: test_pal.py $(target) $(call expand_target_to_sig,$(target))
 
 .PHONY: clean
 clean:
-	$(RM) -r $(executables) $(preloads) $(gen_manifests) *.tmp .lib *.cached *.sig .*.sig *.d .*.d \
-	         .output.* *.token .*.token *.manifest.sgx .*.manifest.sgx __pycache__ .cache \
-	         pal-regression.xml pal_loader
+	$(MAKE) -C crt_init $@
+	$(RM) -r \
+		$(executables) \
+		$(gen_manifests) \
+		$(preloads) \
+		*.cached \
+		*.d \
+		.*.d \
+		*.manifest.sgx \
+		.*.manifest.sgx \
+		*.o \
+		*.sig \
+		.*.sig \
+		*.tmp \
+		*.token \
+		.*.token \
+		.cache \
+		.lib \
+		.output.* \
+		.pytest_cache \
+		__pycache__ \
+		pal-regression.xml
 
 .PHONY: distclean
 distclean: clean

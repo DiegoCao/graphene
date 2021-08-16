@@ -12,6 +12,7 @@
 
 #include <linux/mman.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "api.h"
 #include "pal.h"
@@ -29,7 +30,7 @@ struct shim_vma_info {
     int prot;  // memory protection flags: PROT_*
     int flags; // MAP_* and VMA_*
     struct shim_handle* file;
-    off_t file_offset;
+    uint64_t file_offset;
     char comment[VMA_COMMENT_LEN];
 };
 
@@ -60,7 +61,9 @@ int init_vma(void);
  * if (bkeep_munmap(ptr, len, is_internal, &tmp_vma) < 0) {
  *     handle_errors();
  * }
- * DkVirtualMemoryFree(ptr, len);
+ * if (DkVirtualMemoryFree(ptr, len) < 0) {
+ *     handle_errors();
+ * }
  * bkeep_remove_tmp_vma(tmp_vma);
  *
  * Such a way of freeing is needed, so that no other thread will map the same memory in the window
@@ -78,7 +81,7 @@ int bkeep_mprotect(void* addr, size_t length, int prot, bool is_internal);
  * atomically checks for overlaps and fails if one is found.
  */
 int bkeep_mmap_fixed(void* addr, size_t length, int prot, int flags, struct shim_handle* file,
-                     off_t offset, const char* comment);
+                     uint64_t offset, const char* comment);
 
 /*
  * Bookkeeping an allocation of memory at any address in the range [`bottom_addr`, `top_addr`).
@@ -87,25 +90,27 @@ int bkeep_mmap_fixed(void* addr, size_t length, int prot, int flags, struct shim
  * Start of bookkept range is returned in `*ret_val_ptr`.
  */
 int bkeep_mmap_any_in_range(void* bottom_addr, void* top_addr, size_t length, int prot, int flags,
-                            struct shim_handle* file, off_t offset, const char* comment,
+                            struct shim_handle* file, uint64_t offset, const char* comment,
                             void** ret_val_ptr);
 
 /* Shorthand for `bkeep_mmap_any_in_range` with the range
- * [`PAL_CB(user_address.start)`, `PAL_CB(user_address.end)`). */
-int bkeep_mmap_any(size_t length, int prot, int flags, struct shim_handle* file, off_t offset,
+ * [`g_pal_control->user_address.start`, `g_pal_control->user_address.end`). */
+int bkeep_mmap_any(size_t length, int prot, int flags, struct shim_handle* file, uint64_t offset,
                    const char* comment, void** ret_val_ptr);
 
-/* First tries to bookkeep in the range [`PAL_CB(user_address.start)`, `aslr_addr_top`) and if it
- * fails calls `bkeep_mmap_any`. `aslr_addr_top` is a value randomized on each program run. */
-int bkeep_mmap_any_aslr(size_t length, int prot, int flags, struct shim_handle* file, off_t offset,
-                        const char* comment, void** ret_val_ptr);
+/* First tries to bookkeep in the range [`g_pal_control->user_address.start`, `aslr_addr_top`)
+ * and if it fails calls `bkeep_mmap_any`. `aslr_addr_top` is a value randomized on each program
+ * run. */
+int bkeep_mmap_any_aslr(size_t length, int prot, int flags, struct shim_handle* file,
+                        uint64_t offset, const char* comment, void** ret_val_ptr);
 
 /* Looking up VMA that contains `addr`. If one is found, returns its description in `vma_info`.
  * This function increases ref-count of `vma_info->file` by one (if it is not NULL). */
 int lookup_vma(void* addr, struct shim_vma_info* vma_info);
 
-/* Returns true if the whole range [`addr`, `addr` + `length`) is mapped as user memory. */
-bool is_in_adjacent_user_vmas(void* addr, size_t length);
+/* Returns true if the whole range [`addr`, `addr` + `length`) is mapped as user memory and allows
+ * for `prot` type of access. */
+bool is_in_adjacent_user_vmas(const void* addr, size_t length, int prot);
 
 /*
  * Dumps all non-internal and mapped VMAs.

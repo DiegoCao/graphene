@@ -1,0 +1,15 @@
+loader.preload = "file:{{ graphene.libos }}"
+loader.argv0_override = "bootstrap"
+libos.entrypoint = "bootstrap"
+
+loader.env.LD_LIBRARY_PATH = "/lib"
+loader.insecure__use_host_env = true
+
+fs.mount.lib.type = "chroot"
+fs.mount.lib.path = "/lib"
+fs.mount.lib.uri = "file:{{ graphene.runtimedir() }}"
+
+sgx.trusted_files.runtime = "file:{{ graphene.runtimedir() }}/"
+sgx.trusted_files.bootstrap = "file:bootstrap"
+
+sgx.nonpie_binary = true

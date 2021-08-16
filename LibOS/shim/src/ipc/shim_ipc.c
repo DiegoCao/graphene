@@ -1,17 +1,21 @@
 /* SPDX-License-Identifier: LGPL-3.0-or-later */
-/* Copyright (C) 2014 Stony Brook University */
-
-/*
- * This file contains code to maintain generic bookkeeping of IPC: operations on shim_ipc_msg
- * (one-way IPC messages), shim_ipc_msg_with_ack (IPC messages with acknowledgement), shim_ipc_info
- * (IPC ports of process).
+/* Copyright (C) 2021 Intel Corporation
+ *                    Borys Popławski <borysp@invisiblethingslab.com>
  */
 
-#include "list.h"
+/*
+ * This file provides functions for dealing with outgoing IPC connections, mainly sending IPC
+ * messages.
+ */
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "api.h"
+#include "assert.h"
+#include "avl_tree.h"
 #include "pal.h"
-#include "pal_error.h"
 #include "shim_checkpoint.h"
-#include "shim_handle.h"
 #include "shim_internal.h"
 #include "shim_ipc.h"
 #include "shim_lock.h"
@@ -19,479 +23,356 @@
 #include "shim_types.h"
 #include "shim_utils.h"
 
-static struct shim_lock ipc_info_mgr_lock;
+struct shim_ipc_connection {
+    struct avl_tree_node node;
+    IDTYPE vmid;
+    int seen_error;
+    REFTYPE ref_count;
+    PAL_HANDLE handle;
+    /* This lock guards concurrent accesses to `handle` and `seen_error`. If you need both this lock
+     * and `g_ipc_connections_lock`, take the latter first. */
+    struct shim_lock lock;
+};
 
-#define SYSTEM_LOCK()   lock(&ipc_info_mgr_lock)
-#define SYSTEM_UNLOCK() unlock(&ipc_info_mgr_lock)
-#define SYSTEM_LOCKED() locked(&ipc_info_mgr_lock)
+static bool ipc_connection_cmp(struct avl_tree_node* _a, struct avl_tree_node* _b) {
+    struct shim_ipc_connection* a = container_of(_a, struct shim_ipc_connection, node);
+    struct shim_ipc_connection* b = container_of(_b, struct shim_ipc_connection, node);
+    return a->vmid <= b->vmid;
+}
 
-#define IPC_INFO_MGR_ALLOC 32
-#define OBJ_TYPE           struct shim_ipc_info
-#include "memmgr.h"
-static MEM_MGR ipc_info_mgr;
+/* Tree of outgoing IPC connections, to be accessed only with `g_ipc_connections_lock` taken. */
+static struct avl_tree g_ipc_connections = { .cmp = ipc_connection_cmp };
+static struct shim_lock g_ipc_connections_lock;
 
-struct shim_lock ipc_info_lock;
+struct ipc_msg_waiter {
+    struct avl_tree_node node;
+    PAL_HANDLE event;
+    uint64_t seq;
+    IDTYPE dest;
+    void* response_data;
+};
 
-struct shim_process_ipc_info g_process_ipc_info;
+static bool ipc_msg_waiter_cmp(struct avl_tree_node* _a, struct avl_tree_node* _b) {
+    struct ipc_msg_waiter* a = container_of(_a, struct ipc_msg_waiter, node);
+    struct ipc_msg_waiter* b = container_of(_b, struct ipc_msg_waiter, node);
+    return a->seq <= b->seq;
+}
 
-#define CLIENT_HASH_BITLEN 6
-#define CLIENT_HASH_NUM    (1 << CLIENT_HASH_BITLEN)
-#define CLIENT_HASH_MASK   (CLIENT_HASH_NUM - 1)
-#define CLIENT_HASH(vmid)  ((vmid)&CLIENT_HASH_MASK)
-DEFINE_LISTP(shim_ipc_info);
-static LISTP_TYPE(shim_ipc_info) info_hlist[CLIENT_HASH_NUM];
+static struct avl_tree g_msg_waiters_tree = { .cmp = ipc_msg_waiter_cmp };
+static struct shim_lock g_msg_waiters_tree_lock;
+
+IDTYPE g_self_vmid;
+struct shim_ipc_ids g_process_ipc_ids;
 
 int init_ipc(void) {
-    int ret = 0;
-
-    if (!create_lock(&ipc_info_lock)
-        || !create_lock(&g_process_ipc_info.lock)
-        || !create_lock(&ipc_info_mgr_lock)) {
+    if (!create_lock(&g_ipc_connections_lock)) {
+        return -ENOMEM;
+    }
+    if (!create_lock(&g_msg_waiters_tree_lock)) {
         return -ENOMEM;
     }
 
-    if (!(ipc_info_mgr = create_mem_mgr(init_align_up(IPC_INFO_MGR_ALLOC))))
-        return -ENOMEM;
-
-    if ((ret = init_ipc_ports()) < 0)
-        return ret;
-    if ((ret = init_ns_ranges()) < 0)
-        return ret;
-    if ((ret = init_ns_sysv()) < 0)
-        return ret;
-
-    return 0;
+    return init_ipc_ids();
 }
 
-static struct shim_ipc_info* __create_ipc_info(IDTYPE vmid, const char* uri, size_t len) {
-    assert(locked(&ipc_info_lock));
-
-    struct shim_ipc_info* info =
-        get_mem_obj_from_mgr_enlarge(ipc_info_mgr, size_align_up(IPC_INFO_MGR_ALLOC));
-    if (!info)
-        return NULL;
-
-    memset(info, 0, sizeof(struct shim_ipc_info));
-    info->vmid = vmid;
-    if (uri)
-        qstrsetstr(&info->uri, uri, len);
-    REF_SET(info->ref_count, 1);
-    INIT_LIST_HEAD(info, hlist);
-    return info;
+static void get_ipc_connection(struct shim_ipc_connection* conn) {
+    REF_INC(conn->ref_count);
 }
 
-static void __free_ipc_info(struct shim_ipc_info* info) {
-    assert(locked(&ipc_info_lock));
-
-    if (info->pal_handle) {
-        DkObjectClose(info->pal_handle);
-        info->pal_handle = NULL;
-    }
-    if (info->port)
-        put_ipc_port(info->port);
-    qstrfree(&info->uri);
-    free_mem_obj_to_mgr(ipc_info_mgr, info);
-}
-
-static void __get_ipc_info(struct shim_ipc_info* info) {
-    REF_INC(info->ref_count);
-}
-
-static void __put_ipc_info(struct shim_ipc_info* info) {
-    assert(locked(&ipc_info_lock));
-
-    int ref_count = REF_DEC(info->ref_count);
-    if (!ref_count)
-        __free_ipc_info(info);
-}
-
-void get_ipc_info(struct shim_ipc_info* info) {
-    /* no need to grab ipc_info_lock because __get_ipc_info() does not touch global state */
-    __get_ipc_info(info);
-}
-
-void put_ipc_info(struct shim_ipc_info* info) {
-    /* this is atomic so we don't grab lock in common case of ref_count > 0 */
-    int ref_count = REF_DEC(info->ref_count);
+static void put_ipc_connection(struct shim_ipc_connection* conn) {
+    int64_t ref_count = REF_DEC(conn->ref_count);
 
     if (!ref_count) {
-        lock(&ipc_info_lock);
-        __free_ipc_info(info);
-        unlock(&ipc_info_lock);
+        DkObjectClose(conn->handle);
+        destroy_lock(&conn->lock);
+        free(conn);
     }
 }
 
-struct shim_ipc_info* create_ipc_info(IDTYPE vmid, const char* uri, size_t len) {
-    lock(&ipc_info_lock);
-    struct shim_ipc_info* info = __create_ipc_info(vmid, uri, len);
-    unlock(&ipc_info_lock);
-    return info;
-}
-
-struct shim_ipc_info* create_ipc_info_in_list(IDTYPE vmid, const char* uri, size_t len) {
-    assert(vmid);
-
-    struct shim_ipc_info* info;
-    lock(&ipc_info_lock);
-
-    /* check if info with this vmid & uri already exists and return it */
-    LISTP_TYPE(shim_ipc_info)* info_bucket = &info_hlist[CLIENT_HASH(vmid)];
-    LISTP_FOR_EACH_ENTRY(info, info_bucket, hlist) {
-        if (info->vmid == vmid && !qstrcmpstr(&info->uri, uri, len)) {
-            get_ipc_info(info);
-            unlock(&ipc_info_lock);
-            return info;
-        }
-    }
-
-    /* otherwise create new info and return it */
-    info = __create_ipc_info(vmid, uri, len);
-    if (info) {
-        LISTP_ADD(info, info_bucket, hlist);
-        get_ipc_info(info);
-    }
-
-    unlock(&ipc_info_lock);
-    return info;
-}
-
-void put_ipc_info_in_list(struct shim_ipc_info* info) {
-    LISTP_TYPE(shim_ipc_info)* info_bucket = &info_hlist[CLIENT_HASH(info->vmid)];
-
-    lock(&ipc_info_lock);
-    __put_ipc_info(info);
-    if (REF_GET(info->ref_count) == 1) {
-        LISTP_DEL_INIT(info, info_bucket, hlist);
-        __put_ipc_info(info);
-    }
-    unlock(&ipc_info_lock);
-}
-
-struct shim_ipc_info* lookup_ipc_info(IDTYPE vmid) {
-    assert(vmid);
-    lock(&ipc_info_lock);
-
-    struct shim_ipc_info* info;
-    LISTP_TYPE(shim_ipc_info)* info_bucket = &info_hlist[CLIENT_HASH(vmid)];
-    LISTP_FOR_EACH_ENTRY(info, info_bucket, hlist) {
-        if (info->vmid == vmid && !qstrempty(&info->uri)) {
-            __get_ipc_info(info);
-            unlock(&ipc_info_lock);
-            return info;
-        }
-    }
-
-    unlock(&ipc_info_lock);
-    return NULL;
-}
-
-struct shim_process_ipc_info* create_process_ipc_info(void) {
-    struct shim_process_ipc_info* new_process_ipc_info = calloc(1, sizeof(*new_process_ipc_info));
-    if (!new_process_ipc_info)
+static struct shim_ipc_connection* node2conn(struct avl_tree_node* node) {
+    if (!node) {
         return NULL;
-
-    lock(&g_process_ipc_info.lock);
-
-    /* current process must have been initialized with info on its own IPC info */
-    assert(g_process_ipc_info.self);
-
-    /* new process after clone/fork has new identity but inherits parent  */
-    new_process_ipc_info->vmid   = 0;
-    new_process_ipc_info->self   = NULL;
-    new_process_ipc_info->parent = create_ipc_info(g_process_ipc_info.self->vmid,
-                                                   qstrgetstr(&g_process_ipc_info.self->uri),
-                                                   g_process_ipc_info.self->uri.len);
-    if (!new_process_ipc_info->parent)
-        goto fail;
-
-    /* new process inherits the same namespace leader */
-    if (g_process_ipc_info.ns) {
-        new_process_ipc_info->ns = create_ipc_info(g_process_ipc_info.ns->vmid,
-                                                   qstrgetstr(&g_process_ipc_info.ns->uri),
-                                                   g_process_ipc_info.ns->uri.len);
-        if (!new_process_ipc_info->ns)
-            goto fail;
     }
-
-    unlock(&g_process_ipc_info.lock);
-    return new_process_ipc_info;
-
-fail:
-    unlock(&g_process_ipc_info.lock);
-    free_process_ipc_info(new_process_ipc_info);
-    return NULL;
+    return container_of(node, struct shim_ipc_connection, node);
 }
 
-void free_process_ipc_info(struct shim_process_ipc_info* process_ipc_info) {
-    if (process_ipc_info->self)
-        put_ipc_info(process_ipc_info->self);
-    if (process_ipc_info->parent)
-        put_ipc_info(process_ipc_info->parent);
-    if (process_ipc_info->ns)
-        put_ipc_info(process_ipc_info->ns);
-    free(process_ipc_info);
-}
-
-void init_ipc_msg(struct shim_ipc_msg* msg, int code, size_t size, IDTYPE dest) {
-    msg->code = code;
-    msg->size = get_ipc_msg_size(size);
-    msg->src  = g_process_ipc_info.vmid;
-    msg->dst  = dest;
-    msg->seq  = 0;
-}
-
-void init_ipc_msg_with_ack(struct shim_ipc_msg_with_ack* msg, int code, size_t size, IDTYPE dest) {
-    init_ipc_msg(&msg->msg, code, size, dest);
-    msg->thread = NULL;
-    INIT_LIST_HEAD(msg, list);
-    msg->retval  = 0;
-    msg->private = NULL;
-}
-
-int send_ipc_message(struct shim_ipc_msg* msg, struct shim_ipc_port* port) {
-    assert(msg->size >= IPC_MSG_MINIMAL_SIZE);
-
-    msg->src = g_process_ipc_info.vmid;
-    debug("Sending ipc message to port %p (handle %p)\n", port, port->pal_handle);
-
-    size_t total_bytes = msg->size;
-    size_t bytes       = 0;
-
-    do {
-        PAL_NUM ret =
-            DkStreamWrite(port->pal_handle, 0, total_bytes - bytes, (void*)msg + bytes, NULL);
-
-        if (ret == PAL_STREAM_ERROR) {
-            if (PAL_ERRNO() == EINTR || PAL_ERRNO() == EAGAIN || PAL_ERRNO() == EWOULDBLOCK)
-                continue;
-
-            debug("Port %p (handle %p) was removed during sending\n", port, port->pal_handle);
-            del_ipc_port_fini(port);
-            return -PAL_ERRNO();
-        }
-
-        bytes += ret;
-    } while (bytes < total_bytes);
-
-    return 0;
-}
-
-struct shim_ipc_msg_with_ack* pop_ipc_msg_with_ack(struct shim_ipc_port* port, unsigned long seq) {
-    struct shim_ipc_msg_with_ack* found = NULL;
-
-    lock(&port->msgs_lock);
-    struct shim_ipc_msg_with_ack* tmp;
-    LISTP_FOR_EACH_ENTRY(tmp, &port->msgs, list) {
-        if (tmp->msg.seq == seq) {
-            found = tmp;
-            LISTP_DEL_INIT(tmp, &port->msgs, list);
-            break;
-        }
-    }
-    unlock(&port->msgs_lock);
-
-    return found;
-}
-
-int send_ipc_message_with_ack(struct shim_ipc_msg_with_ack* msg, struct shim_ipc_port* port,
-                              unsigned long* seq, void* private_data) {
+static int ipc_connect(IDTYPE dest, struct shim_ipc_connection** conn_ptr) {
+    struct shim_ipc_connection dummy = { .vmid = dest };
     int ret = 0;
 
-    struct shim_thread* thread = get_cur_thread();
-    assert(thread);
-
-    /* prepare thread which will send the message for waiting for response
-     * (this also acquires reference to the thread) */
-    if (!msg->thread)
-        thread_setwait(&msg->thread, thread);
-
-    static struct atomic_int ipc_seq_counter;
-    msg->msg.seq = __atomic_add_fetch(&ipc_seq_counter.counter, 1, __ATOMIC_SEQ_CST);
-
-    /* save the message to list of port msgs together with its private data */
-    lock(&port->msgs_lock);
-    msg->private = private_data;
-    LISTP_ADD_TAIL(msg, &port->msgs, list);
-    unlock(&port->msgs_lock);
-
-    ret = send_ipc_message(&msg->msg, port);
-    if (ret < 0)
-        goto out;
-
-    if (seq)
-        *seq = msg->msg.seq;
-
-    debug("Waiting for response (seq = %lu)\n", msg->msg.seq);
-
-    /* force thread which will send the message to wait for response;
-     * ignore unrelated interrupts but fail on actual errors */
-    do {
-        ret = thread_sleep(NO_TIMEOUT);
-        if (ret < 0 && ret != -EINTR && ret != -EAGAIN)
+    lock(&g_ipc_connections_lock);
+    struct shim_ipc_connection* conn = node2conn(avl_tree_find(&g_ipc_connections, &dummy.node));
+    if (!conn) {
+        conn = calloc(1, sizeof(*conn));
+        if (!conn) {
+            ret = -ENOMEM;
             goto out;
-    } while (ret != 0);
+        }
+        if (!create_lock(&conn->lock)) {
+            ret = -ENOMEM;
+            goto out;
+        }
 
-    debug("Finished waiting for response (seq = %lu, ret = %d)\n", msg->msg.seq, msg->retval);
-    ret = msg->retval;
-out:
-    lock(&port->msgs_lock);
-    if (!LIST_EMPTY(msg, list))
-        LISTP_DEL_INIT(msg, &port->msgs, list);
-    unlock(&port->msgs_lock);
+        char uri[PIPE_URI_SIZE];
+        if (vmid_to_uri(dest, uri, sizeof(uri)) < 0) {
+            log_error("buffer for IPC pipe URI too small");
+            BUG();
+        }
+        ret = DkStreamOpen(uri, 0, 0, 0, 0, &conn->handle);
+        if (ret < 0) {
+            ret = pal_to_unix_errno(ret);
+            goto out;
+        }
+        ret = write_exact(conn->handle, &g_self_vmid, sizeof(g_self_vmid));
+        if (ret < 0) {
+            goto out;
+        }
 
-    if (msg->thread) {
-        /* put reference to the thread acquired earlier */
-        put_thread(msg->thread);
-        msg->thread = NULL;
+        conn->vmid = dest;
+        REF_SET(conn->ref_count, 1);
+        avl_tree_insert(&g_ipc_connections, &conn->node);
     }
 
+    get_ipc_connection(conn);
+    *conn_ptr = conn;
+    conn = NULL;
+    ret = 0;
+
+out:
+    if (conn) {
+        if (lock_created(&conn->lock)) {
+            destroy_lock(&conn->lock);
+        }
+        if (conn->handle) {
+            DkObjectClose(conn->handle);
+        }
+        free(conn);
+    }
+    unlock(&g_ipc_connections_lock);
     return ret;
 }
 
-struct shim_ipc_info* create_ipc_info_and_port(bool use_vmid_as_port_name) {
-    assert(locked(&g_process_ipc_info.lock));
-
-    struct shim_ipc_info* info = create_ipc_info(g_process_ipc_info.vmid, NULL, 0);
-    if (!info)
-        return NULL;
-
-    /* pipe for g_process_ipc_info.self is of format "pipe:<g_process_ipc_info.vmid>", others with
-     * random name */
-    char uri[PIPE_URI_SIZE];
-    if (create_pipe(NULL, uri, PIPE_URI_SIZE, &info->pal_handle, &info->uri,
-                    use_vmid_as_port_name) < 0) {
-        put_ipc_info(info);
-        return NULL;
-    }
-
-    add_ipc_port_by_id(g_process_ipc_info.vmid, info->pal_handle, IPC_PORT_LISTENING, NULL,
-                       &info->port);
-
-    return info;
+static void _remove_ipc_connection(struct shim_ipc_connection* conn) {
+    assert(locked(&g_ipc_connections_lock));
+    avl_tree_delete(&g_ipc_connections, &conn->node);
+    put_ipc_connection(conn);
 }
 
-int get_ipc_info_cur_process(struct shim_ipc_info** info) {
-    lock(&g_process_ipc_info.lock);
-
-    if (!g_process_ipc_info.self) {
-        g_process_ipc_info.self = create_ipc_info_and_port(/*use_vmid_as_port_name=*/true);
-        if (!g_process_ipc_info.self) {
-            unlock(&g_process_ipc_info.lock);
-            return -EACCES;
-        }
+int connect_to_process(IDTYPE dest) {
+    struct shim_ipc_connection* conn = NULL;
+    int ret = ipc_connect(dest, &conn);
+    if (ret < 0) {
+        return ret;
     }
-
-    get_ipc_info(g_process_ipc_info.self);
-    *info = g_process_ipc_info.self;
-
-    unlock(&g_process_ipc_info.lock);
+    put_ipc_connection(conn);
     return 0;
 }
 
-BEGIN_CP_FUNC(ipc_info) {
-    __UNUSED(size);
-    assert(size == sizeof(struct shim_ipc_info));
+void remove_outgoing_ipc_connection(IDTYPE dest) {
+    struct shim_ipc_connection dummy = { .vmid = dest };
+    lock(&g_ipc_connections_lock);
+    struct shim_ipc_connection* conn = node2conn(avl_tree_find(&g_ipc_connections, &dummy.node));
+    if (conn) {
+        _remove_ipc_connection(conn);
+    }
+    unlock(&g_ipc_connections_lock);
 
-    struct shim_ipc_info* info     = (struct shim_ipc_info*)obj;
-    struct shim_ipc_info* new_info = NULL;
-
-    size_t off = GET_FROM_CP_MAP(obj);
-
-    if (!off) {
-        off = ADD_CP_OFFSET(sizeof(struct shim_ipc_info));
-        ADD_TO_CP_MAP(obj, off);
-
-        new_info = (struct shim_ipc_info*)(base + off);
-        *new_info = *info;
-        REF_SET(new_info->ref_count, 0);
-
-        /* call qstr-specific checkpointing function for new_info->uri */
-        DO_CP_IN_MEMBER(qstr, new_info, uri);
-
-        if (info->pal_handle) {
-            struct shim_palhdl_entry* entry;
-            /* call palhdl-specific checkpointing function to checkpoint
-             * info->pal_handle and return created object in entry */
-            DO_CP(palhdl, info->pal_handle, &entry);
-            /* info's PAL handle will be re-opened with new URI during
-             * palhdl restore (see checkpoint.c) */
-            entry->uri     = &new_info->uri;
-            entry->phandle = &new_info->pal_handle;
+    lock(&g_msg_waiters_tree_lock);
+    struct avl_tree_node* node = avl_tree_first(&g_msg_waiters_tree);
+    /* Usually there are no or very few waiters, so linear loop should be fine. If this becomes
+     * a problem for some reason, we can make `g_msg_waiters_tree` use `dest` as a part of the key
+     * and search for matching entries here. */
+    while (node) {
+        struct ipc_msg_waiter* waiter = container_of(node, struct ipc_msg_waiter, node);
+        if (waiter->dest == dest) {
+            waiter->response_data = NULL;
+            DkEventSet(waiter->event);
+            log_debug("Woke up a thread waiting for a message from a disconnected process");
         }
-    } else {
-        /* already checkpointed */
-        new_info = (struct shim_ipc_info*)(base + off);
+        node = avl_tree_next(node);
+    }
+    unlock(&g_msg_waiters_tree_lock);
+}
+
+void init_ipc_msg(struct shim_ipc_msg* msg, unsigned char code, size_t size) {
+    SET_UNALIGNED(msg->header.size, get_ipc_msg_size(size));
+    SET_UNALIGNED(msg->header.seq, 0ul);
+    SET_UNALIGNED(msg->header.code, code);
+}
+
+void init_ipc_response(struct shim_ipc_msg* msg, uint64_t seq, size_t size) {
+    init_ipc_msg(msg, IPC_MSG_RESP, size);
+    SET_UNALIGNED(msg->header.seq, seq);
+}
+
+static int ipc_send_message_to_conn(struct shim_ipc_connection* conn, struct shim_ipc_msg* msg) {
+    log_debug("Sending ipc message to %u", conn->vmid);
+
+    int ret = 0;
+    lock(&conn->lock);
+    if (conn->seen_error) {
+        ret = conn->seen_error;
+        log_debug("%s: returning previously seen error: %d", __func__, ret);
+        goto out;
     }
 
-    if (new_info && objp)
-        *objp = (void*)new_info;
-}
-END_CP_FUNC_NO_RS(ipc_info)
+    ret = write_exact(conn->handle, msg,  GET_UNALIGNED(msg->header.size));
+    if (ret < 0) {
+        log_error("Failed to send IPC msg to %u: %d", conn->vmid, ret);
+        conn->seen_error = ret;
+        goto out;
+    }
 
-BEGIN_CP_FUNC(process_ipc_info) {
+out:
+    unlock(&conn->lock);
+    return ret;
+}
+
+int ipc_send_message(IDTYPE dest, struct shim_ipc_msg* msg) {
+    struct shim_ipc_connection* conn = NULL;
+    int ret = ipc_connect(dest, &conn);
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = ipc_send_message_to_conn(conn, msg);
+    put_ipc_connection(conn);
+    return ret;
+}
+
+static int wait_for_response(struct ipc_msg_waiter* waiter) {
+    log_debug("Waiting for a response to %lu", waiter->seq);
+
+    int ret = 0;
+    do {
+        ret = pal_to_unix_errno(DkEventWait(waiter->event, /*timeout=*/NULL));
+    } while (ret == -EINTR);
+
+    log_debug("Waiting finished: %d", ret);
+    return ret;
+}
+
+int ipc_send_msg_and_get_response(IDTYPE dest, struct shim_ipc_msg* msg, void** resp) {
+    static uint64_t ipc_seq_counter = 1;
+    uint64_t seq = __atomic_fetch_add(&ipc_seq_counter, 1, __ATOMIC_RELAXED);
+    SET_UNALIGNED(msg->header.seq, seq);
+
+    struct ipc_msg_waiter waiter = {
+        .seq = seq,
+        .dest = dest,
+        .response_data = NULL,
+    };
+    int ret = DkEventCreate(&waiter.event, /*init_signaled=*/false, /*auto_clear=*/false);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
+
+    lock(&g_msg_waiters_tree_lock);
+    avl_tree_insert(&g_msg_waiters_tree, &waiter.node);
+    unlock(&g_msg_waiters_tree_lock);
+
+    ret = ipc_send_message(dest, msg);
+    if (ret < 0) {
+        goto out;
+    }
+
+    ret = wait_for_response(&waiter);
+    if (ret < 0) {
+        goto out;
+    }
+
+    if (!waiter.response_data) {
+        log_warning("IPC recipient %u died while we were waiting for a message response", dest);
+        ret = -ESRCH;
+    } else {
+        if (resp) {
+            /* We take the ownership of `waiter.response_data`. */
+            *resp = waiter.response_data;
+            waiter.response_data = NULL;
+        }
+        ret = 0;
+    }
+
+out:
+    lock(&g_msg_waiters_tree_lock);
+    avl_tree_delete(&g_msg_waiters_tree, &waiter.node);
+    unlock(&g_msg_waiters_tree_lock);
+    free(waiter.response_data);
+    return ret;
+}
+
+int ipc_response_callback(IDTYPE src, void* data, uint64_t seq) {
+    int ret = 0;
+    if (!seq) {
+        log_error("Got an IPC response without a sequence number");
+        ret = -EINVAL;
+        goto out;
+    }
+
+    lock(&g_msg_waiters_tree_lock);
+    struct ipc_msg_waiter dummy = {
+        .seq = seq,
+    };
+    struct avl_tree_node* node = avl_tree_find(&g_msg_waiters_tree, &dummy.node);
+    if (!node) {
+        log_error("No thread is waiting for a response with seq: %lu", seq);
+        ret = -EINVAL;
+        goto out_unlock;
+    }
+
+    struct ipc_msg_waiter* waiter = container_of(node, struct ipc_msg_waiter, node);
+    waiter->response_data = data;
+    DkEventSet(waiter->event);
+    ret = 0;
+    log_debug("Got an IPC response from %u, seq: %lu", src, seq);
+
+out_unlock:
+    unlock(&g_msg_waiters_tree_lock);
+out:
+    if (ret < 0) {
+        free(data);
+    }
+    return ret;
+}
+
+int ipc_broadcast(struct shim_ipc_msg* msg, IDTYPE exclude_id) {
+    lock(&g_ipc_connections_lock);
+    struct shim_ipc_connection* conn = node2conn(avl_tree_first(&g_ipc_connections));
+
+    int main_ret = 0;
+    while (conn) {
+        if (conn->vmid != exclude_id) {
+            int ret = ipc_send_message_to_conn(conn, msg);
+            if (!main_ret) {
+                main_ret = ret;
+            }
+        }
+        conn = node2conn(avl_tree_next(&conn->node));
+    }
+
+    unlock(&g_ipc_connections_lock);
+    return main_ret;
+}
+
+BEGIN_CP_FUNC(process_ipc_ids) {
     __UNUSED(size);
-    assert(size == sizeof(struct shim_process_ipc_info));
+    __UNUSED(objp);
+    assert(size == sizeof(struct shim_ipc_ids));
 
-    struct shim_process_ipc_info* process_ipc_info     = (struct shim_process_ipc_info*)obj;
-    struct shim_process_ipc_info* new_process_ipc_info = NULL;
+    struct shim_ipc_ids* ipc_ids = (struct shim_ipc_ids*)obj;
 
-    size_t off = GET_FROM_CP_MAP(obj);
+    size_t off = ADD_CP_OFFSET(sizeof(*ipc_ids));
+    ADD_CP_FUNC_ENTRY(off);
 
-    if (!off) {
-        off = ADD_CP_OFFSET(sizeof(*new_process_ipc_info));
-        ADD_TO_CP_MAP(obj, off);
-
-        new_process_ipc_info = (struct shim_process_ipc_info*)(base + off);
-        *new_process_ipc_info = *process_ipc_info;
-
-        /* call ipc_info-specific checkpointing functions for new_process_ipc_info's self, parent
-         * and ns infos */
-        if (process_ipc_info->self)
-            DO_CP_MEMBER(ipc_info, process_ipc_info, new_process_ipc_info, self);
-        if (process_ipc_info->parent)
-            DO_CP_MEMBER(ipc_info, process_ipc_info, new_process_ipc_info, parent);
-        if (process_ipc_info->ns)
-            DO_CP_MEMBER(ipc_info, process_ipc_info, new_process_ipc_info, ns);
-
-        ADD_CP_FUNC_ENTRY(off);
-    } else {
-        /* already checkpointed */
-        new_process_ipc_info = (struct shim_process_ipc_info*)(base + off);
-    }
-
-    if (objp)
-        *objp = (void*)new_process_ipc_info;
+    *(struct shim_ipc_ids*)(base + off) = *ipc_ids;
 }
-END_CP_FUNC(process_ipc_info)
+END_CP_FUNC(process_ipc_ids)
 
-BEGIN_RS_FUNC(process_ipc_info) {
+BEGIN_RS_FUNC(process_ipc_ids) {
     __UNUSED(offset);
-    struct shim_process_ipc_info* process_ipc_info = (void*)(base + GET_CP_FUNC_ENTRY());
+    __UNUSED(rebase);
+    struct shim_ipc_ids* ipc_ids = (void*)(base + GET_CP_FUNC_ENTRY());
 
-    assert(process_ipc_info->vmid == 0);
-    /* forces to pick up new host-OS vmid */
-    process_ipc_info->vmid = g_process_ipc_info.vmid;
-
-    CP_REBASE(process_ipc_info->self);
-    CP_REBASE(process_ipc_info->parent);
-    CP_REBASE(process_ipc_info->ns);
-
-    if (process_ipc_info->self) {
-        process_ipc_info->self->vmid = process_ipc_info->vmid;
-        get_ipc_info(process_ipc_info->self);
-    }
-    if (process_ipc_info->parent)
-        get_ipc_info(process_ipc_info->parent);
-    if (process_ipc_info->ns)
-        get_ipc_info(process_ipc_info->ns);
-
-    g_process_ipc_info = *process_ipc_info;
-    // this lock will be created in init_ipc
-    clear_lock(&g_process_ipc_info.lock);
-
-    DEBUG_RS("vmid=%u,uri=%s,parent=%u(%s)", process_ipc_info->vmid,
-             process_ipc_info->self ? qstrgetstr(&process_ipc_info->self->uri) : "",
-             process_ipc_info->parent ? process_ipc_info->parent->vmid : 0,
-             process_ipc_info->parent ? qstrgetstr(&process_ipc_info->parent->uri) : "");
+    g_process_ipc_ids = *ipc_ids;
 }
-END_RS_FUNC(process_ipc_info)
+END_RS_FUNC(process_ipc_ids)

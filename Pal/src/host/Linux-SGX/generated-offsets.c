@@ -103,6 +103,7 @@ __attribute__((__used__)) static void dummy(void) {
 
     /* struct pal_tcb_urts aka PAL_TCB_URTS */
     OFFSET(PAL_TCB_URTS_TCS, pal_tcb_urts, tcs);
+    OFFSET(PAL_TCB_URTS_IN_AEX_PROF, pal_tcb_urts, is_in_aex_profiling);
     OFFSET(PAL_TCB_URTS_EENTER_CNT, pal_tcb_urts, eenter_cnt);
     OFFSET(PAL_TCB_URTS_EEXIT_CNT, pal_tcb_urts, eexit_cnt);
     OFFSET(PAL_TCB_URTS_AEX_CNT, pal_tcb_urts, aex_cnt);
@@ -149,7 +150,8 @@ __attribute__((__used__)) static void dummy(void) {
     OFFSET(PAL_SEC_ENCLAVE_ATTRIBUTES, pal_sec, enclave_attributes);
 
     /* pal_linux_def.h */
-    DEFINE(SSAFRAMENUM, SSAFRAMENUM);
+    DEFINE(SSA_FRAME_NUM, SSA_FRAME_NUM);
+    DEFINE(SSA_FRAME_SIZE, SSA_FRAME_SIZE);
     DEFINE(ENCLAVE_STACK_SIZE, ENCLAVE_STACK_SIZE);
     DEFINE(ENCLAVE_SIG_STACK_SIZE, ENCLAVE_SIG_STACK_SIZE);
     DEFINE(DEFAULT_ENCLAVE_BASE, DEFAULT_ENCLAVE_BASE);

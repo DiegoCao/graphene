@@ -50,6 +50,15 @@ against `libsecret_prov_attest.so` explicitly at build time.
 
 Please make sure that the corresponding RA-TLS libraries (EPID or DCAP versions) are built.
 
+First, start with adding the library directory to `LD_LIBRARY_PATH`:
+
+```sh
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:./libs
+```
+
+Remember to undo this change after finishing the tutorial (or just do everything
+in a subshell).
+
 - Secret Provisioning flows, EPID-based (IAS) attestation:
 
 ```sh
@@ -59,13 +68,13 @@ RA_TLS_EPID_API_KEY=12345678901234567890123456789012 \
 RA_TLS_ALLOW_OUTDATED_TCB_INSECURE=1 ./secret_prov_server_epid &
 
 # test minimal client
-SGX=1 ./pal_loader ./secret_prov_min_client
+graphene-sgx ./secret_prov_min_client
 
 # test feature-rich client
-SGX=1 ./pal_loader ./secret_prov_client
+graphene-sgx ./secret_prov_client
 
 # test protected-files client
-SGX=1 ./pal_loader ./secret_prov_pf_client
+graphene-sgx ./secret_prov_pf_client
 
 kill %%
 ```
@@ -73,18 +82,21 @@ kill %%
 - Secret Provisioning flows, ECDSA-based (DCAP) attestation:
 
 ```sh
+# make sure RA-TLS DCAP libraries are built in Graphene via:
+#   cd graphene/Pal/src/host/Linux-SGX/tools/ra-tls && make dcap
+
 make app dcap files/input.txt
 
 RA_TLS_ALLOW_OUTDATED_TCB_INSECURE=1 ./secret_prov_server_dcap &
 
 # test minimal client
-SGX=1 ./pal_loader ./secret_prov_min_client
+graphene-sgx ./secret_prov_min_client
 
 # test feature-rich client
-SGX=1 ./pal_loader ./secret_prov_client
+graphene-sgx ./secret_prov_client
 
 # test protected-files client
-SGX=1 ./pal_loader ./secret_prov_pf_client
+graphene-sgx ./secret_prov_pf_client
 
 kill %%
 ```

@@ -58,11 +58,17 @@ struct shim_process {
 
     struct shim_lock children_lock;
     struct shim_lock fs_lock;
+
+    /* Complete command line for the process, as reported by /proc/[pid]/cmdline; currently filled
+     * once during initialization, using static buffer and restricted to STR_SIZE. This is enough
+     * for current workloads but see issue https://github.com/oscarlab/graphene/issues/2279. */
+    char cmdline[STR_SIZE];
+    size_t cmdline_size;
 };
 
 extern struct shim_process g_process;
 
-int init_process(void);
+int init_process(int argc, const char** argv);
 
 /* Allocates a new child process structure, initializing all fields. */
 struct shim_child_process* create_child_process(void);
@@ -78,5 +84,14 @@ void add_child_process(struct shim_child_process* child);
  */
 bool mark_child_exited_by_vmid(IDTYPE vmid, IDTYPE child_uid, int exit_code, int signal);
 bool mark_child_exited_by_pid(IDTYPE pid, IDTYPE child_uid, int exit_code, int signal);
+
+/*!
+ * \brief Check whether the process is a zombie process (terminated but not yet waited for).
+ *
+ * \param pid  PID of the process to check.
+ *
+ * Returns `true` if the process \p pid is found in the zombie list of `g_process`.
+ */
+bool is_zombie_process(IDTYPE pid);
 
 #endif // _SHIM_PROCESS_H

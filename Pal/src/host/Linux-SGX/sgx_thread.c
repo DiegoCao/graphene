@@ -1,9 +1,6 @@
 /* SPDX-License-Identifier: LGPL-3.0-or-later */
 
-#include <stddef.h> /* linux/signal.h misses this dependency (for size_t), at least on Ubuntu 16.04.
-                     * We must include it ourselves before including linux/signal.h.
-                     */
-
+#include <stddef.h> /* needed by <linux/signal.h> for size_t */
 #include <asm/errno.h>
 #include <asm/prctl.h>
 #include <asm/signal.h>
@@ -16,6 +13,7 @@
 #include "pal_security.h"
 #include "sgx_enclave.h"
 #include "sgx_internal.h"
+#include "sgx_log.h"
 #include "spinlock.h"
 
 struct thread_map {
@@ -44,12 +42,12 @@ void update_and_print_stats(bool process_wide) {
 
     int tid = INLINE_SYSCALL(gettid, 0);
     assert(tid > 0);
-    pal_printf("----- SGX stats for thread %d -----\n"
+    log_always("----- SGX stats for thread %d -----\n"
                "  # of EENTERs:        %lu\n"
                "  # of EEXITs:         %lu\n"
                "  # of AEXs:           %lu\n"
                "  # of sync signals:   %lu\n"
-               "  # of async signals:  %lu\n",
+               "  # of async signals:  %lu",
                tid, tcb->eenter_cnt, tcb->eexit_cnt, tcb->aex_cnt,
                tcb->sync_signal_cnt, tcb->async_signal_cnt);
 
@@ -62,13 +60,12 @@ void update_and_print_stats(bool process_wide) {
     if (process_wide) {
         int pid = INLINE_SYSCALL(getpid, 0);
         assert(pid > 0);
-
-        pal_printf("----- Total SGX stats for process %d -----\n"
+        log_always("----- Total SGX stats for process %d -----\n"
                    "  # of EENTERs:        %lu\n"
                    "  # of EEXITs:         %lu\n"
                    "  # of AEXs:           %lu\n"
                    "  # of sync signals:   %lu\n"
-                   "  # of async signals:  %lu\n",
+                   "  # of async signals:  %lu",
                    pid, g_eenter_cnt, g_eexit_cnt, g_aex_cnt,
                    g_sync_signal_cnt, g_async_signal_cnt);
     }
@@ -155,7 +152,7 @@ int pal_thread_init(void* tcbptr) {
 
     /* set GS reg of this thread to thread's TCB; after this point, can use get_tcb_urts() */
     ret = INLINE_SYSCALL(arch_prctl, 2, ARCH_SET_GS, tcb);
-    if (IS_ERR(ret)) {
+    if (ret < 0) {
         ret = -EPERM;
         goto out;
     }
@@ -167,7 +164,7 @@ int pal_thread_init(void* tcbptr) {
             .ss_size  = ALT_STACK_SIZE - sizeof(*tcb)
         };
         ret = INLINE_SYSCALL(sigaltstack, 2, &ss, NULL);
-        if (IS_ERR(ret)) {
+        if (ret < 0) {
             ret = -EPERM;
             goto out;
         }
@@ -177,11 +174,11 @@ int pal_thread_init(void* tcbptr) {
     map_tcs(tid); /* updates tcb->tcs */
 
     if (!tcb->tcs) {
-        SGX_DBG(DBG_E,
-                "There are no available TCS pages left for a new thread!\n"
-                "Please try to increase sgx.thread_num in the manifest.\n"
-                "The current value is %d\n",
-                g_enclave_thread_num);
+        log_error(
+            "There are no available TCS pages left for a new thread!\n"
+            "Please try to increase sgx.thread_num in the manifest.\n"
+            "The current value is %d",
+            g_enclave_thread_num);
         ret = -ENOMEM;
         goto out;
     }
@@ -279,9 +276,9 @@ int clone_thread(void) {
                     CLONE_PARENT_SETTID,
                 (void*)tcb, &dummy_parent_tid_field, NULL);
 
-    if (IS_ERR(ret)) {
+    if (ret < 0) {
         INLINE_SYSCALL(munmap, 2, stack, THREAD_STACK_SIZE + ALT_STACK_SIZE);
-        return -ERRNO(ret);
+        return ret;
     }
     return 0;
 }

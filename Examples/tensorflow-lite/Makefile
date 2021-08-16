@@ -10,17 +10,29 @@ BAZEL_BIN ?= $(HOME)/bin/bazel
 GIT_COMMIT ?= v1.9.0
 TAR_SHA256 ?= ffc3151b06823d57b4a408261ba8efe53601563dfe93af0866751d4f6ca5068c
 
+ifeq ($(DEBUG),1)
+GRAPHENE_LOG_LEVEL = debug
+else
+GRAPHENE_LOG_LEVEL = error
+endif
+
 .PHONY: all
 all: label_image.manifest
 ifeq ($(SGX),1)
 all: label_image.manifest.sgx label_image.sig label_image.token
 endif
 
+ifeq ($(SGX),)
+GRAPHENE = graphene-direct
+else
+GRAPHENE = graphene-sgx
+endif
+
 include ../../Scripts/Makefile.configs
 
 $(TF_DIR)/configure:
 	$(GRAPHENEDIR)/Scripts/download --output tensorflow.tar.gz --sha256 $(TAR_SHA256)\
-	       --url https://github.com/tensorflow/tensorflow/archive/$(GIT_COMMIT).tar.gz
+		--url https://github.com/tensorflow/tensorflow/archive/$(GIT_COMMIT).tar.gz
 	mkdir $(TF_DIR)
 	tar -C $(TF_DIR) --strip-components=1 -xf tensorflow.tar.gz
 
@@ -36,7 +48,7 @@ libtensorflow_framework.so: label_image
 INCEPTION_HASH=b1a1f91276e48a9ddf0cb0d854f044ebfbf985dc2c2cedceb52b3d668894299a
 inception_v3.tflite:
 	$(GRAPHENEDIR)/Scripts/download --output inception_v3_2018_04_27.tgz --sha256 $(INCEPTION_HASH)\
-	       --url https://storage.googleapis.com/download.tensorflow.org/models/tflite/model_zoo/upload_20180427/inception_v3_2018_04_27.tgz
+		--url https://storage.googleapis.com/download.tensorflow.org/models/tflite/model_zoo/upload_20180427/inception_v3_2018_04_27.tgz
 	tar xfz inception_v3_2018_04_27.tgz
 
 labels.txt: $(TF_DIR)/tensorflow/contrib/lite/java/ovic/src/testdata/labels.txt
@@ -51,24 +63,23 @@ $(GRAPHENEDIR)/Runtime/libgcc_s.so.1:
 $(GRAPHENEDIR)/Runtime/libstdc++.so.6:
 	cp /usr/$(ARCH_LIBDIR)/libstdc++.so.6 $@
 
-label_image.manifest: libtensorflow_framework.so label_image inception_v3.tflite labels.txt image.bmp
-label_image.manifest: $(GRAPHENEDIR)/Runtime/libgcc_s.so.1 $(GRAPHENEDIR)/Runtime/libstdc++.so.6
-label_image.manifest: label_image.manifest.template
-	sed -e 's|$$(GRAPHENEDIR)|'"$(GRAPHENEDIR)"'|g' \
-		-e 's|$$(GRAPHENE_LOG_LEVEL)|'"$(GRAPHENE_LOG_LEVEL)"'|g' \
+label_image.manifest: label_image.manifest.template libtensorflow_framework.so label_image \
+                      inception_v3.tflite labels.txt image.bmp
+	graphene-manifest \
+		-Dlog_level=$(GRAPHENE_LOG_LEVEL) \
 		$< > $@
 
 label_image.manifest.sgx: label_image.manifest inception_v3.tflite labels.txt
-	$(GRAPHENEDIR)/Pal/src/host/Linux-SGX/signer/pal-sgx-sign \
-		-libpal $(GRAPHENEDIR)/Runtime/libpal-Linux-SGX.so \
-		-key $(SGX_SIGNER_KEY) \
-		-manifest $< -output $@
-	$(GRAPHENEDIR)/Pal/src/host/Linux-SGX/signer/pal-sgx-get-token \
-		-output label_image.token -sig label_image.sig
+	graphene-sgx-sign \
+		--key $(SGX_SIGNER_KEY) \
+		--manifest $< \
+		--output $@
+	graphene-sgx-get-token \
+		--output label_image.token --sig label_image.sig
 
 .PHONY: check
 check: all
-	$(GRAPHENEDIR)/Runtime/pal_loader ./label_image -m inception_v3.tflite -i image.bmp -t 4
+	$(GRAPHENE) ./label_image -m inception_v3.tflite -i image.bmp -t 4
 
 .PHONY: run-native
 run-native: all
@@ -76,7 +87,7 @@ run-native: all
 
 .PHONY: run-graphene
 run-graphene: all
-	$(GRAPHENEDIR)/Runtime/pal_loader ./label_image -m inception_v3.tflite -i image.bmp -t 4
+	$(GRAPHENE) ./label_image -m inception_v3.tflite -i image.bmp -t 4
 
 .PHONY: clean
 clean:

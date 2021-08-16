@@ -3,9 +3,7 @@
  *                    Borys Popławski <borysp@invisiblethingslab.com>
  */
 
-/* We need to include this to get size_t definition, which otherwise is missing in <linux/signal.h>
- * (at least on Ubuntu16.04) */
-#include <stddef.h>
+#include <stddef.h> /* needed by <linux/signal.h> for size_t */
 
 #include <linux/signal.h>
 #include <linux/wait.h>
@@ -80,16 +78,23 @@ static void remove_qnode_from_wait_queue(struct shim_thread_queue* qnode) {
 
     unlock(&g_process.children_lock);
 
-    while (!seen) {
-        DkEventClear(get_cur_thread()->scheduler_event);
-        /* Check `mark_child_exited` for explanation why we might need this compiler barrier. */
-        COMPILER_BARRIER();
-        /* Check if `qnode` is no longer used. */
-        if (!__atomic_load_n(&qnode->in_use, __ATOMIC_ACQUIRE)) {
-            break;
+    if (!seen) {
+        while (1) {
+            thread_prepare_wait();
+            /* Check `mark_child_exited` for explanation why we might need this compiler barrier. */
+            COMPILER_BARRIER();
+            /* Check if `qnode` is no longer used. */
+            if (!__atomic_load_n(&qnode->in_use, __ATOMIC_ACQUIRE)) {
+                break;
+            }
+            int ret = thread_wait(/*timeout_us=*/NULL, /*ignore_pending_signals=*/true);
+            if (ret < 0 && ret != -EINTR) {
+                /* We cannot handle any errors here. */
+                log_error("remove_qnode_from_wait_queue: thread_wait failed with: %d", ret);
+            }
         }
-        /* We cannot handle any errors here. */
-        (void)thread_sleep(NO_TIMEOUT);
+    } else {
+        put_thread(qnode->thread);
     }
 }
 
@@ -99,17 +104,17 @@ static long do_waitid(int which, pid_t id, siginfo_t* infop, int options) {
     }
 
     if (options & WSTOPPED) {
-        debug("Ignoring unsupported WSTOPPED flag to wait4\n");
+        log_warning("Ignoring unsupported WSTOPPED flag to wait4");
         options &= ~WSTOPPED;
     }
     if (options & WCONTINUED) {
-        debug("Ignoring unsupported WCONTINUED flag to wait4\n");
+        log_warning("Ignoring unsupported WCONTINUED flag to wait4");
         options &= ~WCONTINUED;
     }
     assert(options & WEXITED);
 
     if (options & __WNOTHREAD) {
-        debug("Ignoring unsupported __WNOTHREAD flag to wait4\n");
+        log_warning("Ignoring unsupported __WNOTHREAD flag to wait4");
         options &= ~__WNOTHREAD;
     }
 
@@ -118,9 +123,9 @@ static long do_waitid(int which, pid_t id, siginfo_t* infop, int options) {
 
     long ret = 0;
 
-    lock(&g_process.children_lock);
+    do {
+        lock(&g_process.children_lock);
 
-    while (1) {
         struct shim_child_process* child;
         /* First search already exited children. */
         LISTP_FOR_EACH_ENTRY(child, &g_process.zombies, list) {
@@ -173,40 +178,33 @@ static long do_waitid(int which, pid_t id, siginfo_t* infop, int options) {
             .thread = self,
             .next = g_process.wait_queue,
         };
-        g_process.wait_queue = &qnode;
+        get_thread(qnode.thread);
         __atomic_store_n(&qnode.in_use, true, __ATOMIC_RELEASE);
-
-        __atomic_store_n(&self->signal_handled, SIGNAL_NOT_HANDLED, __ATOMIC_RELEASE);
+        g_process.wait_queue = &qnode;
 
         unlock(&g_process.children_lock);
 
-        while (1) {
-            if (__atomic_load_n(&self->signal_handled, __ATOMIC_ACQUIRE) == SIGNAL_HANDLED) {
-                remove_qnode_from_wait_queue(&qnode);
-                return -EINTR;
-            }
-
-            DkEventClear(self->scheduler_event);
-            /* Check `mark_child_exited` for explanation why we might need this compiler barrier. */
-            COMPILER_BARRIER();
-            /* Check that we are still supposed to sleep. */
-            if (!__atomic_load_n(&qnode.in_use, __ATOMIC_ACQUIRE)) {
-                break;
-            }
-            ret = thread_sleep(NO_TIMEOUT);
-            if (ret < 0 && ret != -EINTR && ret != -EAGAIN && ret != -EWOULDBLOCK) {
-                debug("thread_sleep failed in waitid\n");
-
-                remove_qnode_from_wait_queue(&qnode);
-                /* `ret` is already set. */
-                return ret;
-            }
-
-            handle_signals();
+        thread_prepare_wait();
+        /* Check `mark_child_exited` for explanation why we might need this compiler barrier. */
+        COMPILER_BARRIER();
+        /* Check that we are still supposed to sleep. */
+        if (!__atomic_load_n(&qnode.in_use, __ATOMIC_ACQUIRE)) {
+            /* Something woke us up and took of the list in the meantime. */
+            ret = -ERESTARTSYS;
+            break;
+        }
+        ret = thread_wait(/*timeout_us=*/NULL, /*ignore_pending_signals=*/false);
+        if (ret < 0 && ret != -EINTR) {
+            log_warning("thread_wait failed in waitid");
+            remove_qnode_from_wait_queue(&qnode);
+            /* `ret` is already set. */
+            goto out;
         }
 
-        lock(&g_process.children_lock);
-    }
+        ret = -ERESTARTSYS;
+
+        remove_qnode_from_wait_queue(&qnode);
+    } while (!have_pending_signals());
 
 out:
     unlock(&g_process.children_lock);
@@ -223,7 +221,7 @@ long shim_do_waitid(int which, pid_t id, siginfo_t* infop, int options, struct _
     if (!(options & (WEXITED | WSTOPPED | WCONTINUED)))
         return -EINVAL;
 
-    if (infop && test_user_memory(infop, sizeof(*infop), /*write=*/true))
+    if (infop && !is_user_memory_writable(infop, sizeof(*infop)))
         return -EFAULT;
 
     return do_waitid(which, id, infop, options);
@@ -240,7 +238,7 @@ long shim_do_wait4(pid_t pid, int* status, int options, struct __kernel_rusage* 
         return -EINVAL;
     }
 
-    if (status && test_user_memory(status, sizeof(*status), /*write=*/true))
+    if (status && !is_user_memory_writable(status, sizeof(*status)))
         return -EFAULT;
 
     /* Prepare options for do_waitid(). */

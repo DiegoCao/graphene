@@ -10,24 +10,32 @@
  */
 
 #include "api.h"
+#include "cpu.h"
 #include "debug_map.h"
 #include "elf-arch.h"
 #include "elf/elf.h"
 #include "pal.h"
-#include "pal_debug.h"
+#include "pal_internal.h"
 #include "pal_linux.h"
 #include "pal_rtld.h"
+
+uintptr_t g_vdso_start = 0;
+uintptr_t g_vdso_end = 0;
+
+bool is_in_vdso(uintptr_t addr) {
+    return (g_vdso_start || g_vdso_end) && g_vdso_start <= addr && addr < g_vdso_end;
+}
 
 void _DkDebugMapAdd(const char* name, void* addr) {
     int ret = debug_map_add(name, addr);
     if (ret < 0)
-        printf("debug_map_add(%s, %p) failed: %d\n", name, addr, ret);
+        log_error("debug_map_add(%s, %p) failed: %d", name, addr, ret);
 }
 
 void _DkDebugMapRemove(void* addr) {
     int ret = debug_map_remove(addr);
     if (ret < 0)
-        printf("debug_map_remove(%p) failed: %d\n", addr, ret);
+        log_error("debug_map_remove(%p) failed: %d", addr, ret);
 }
 
 void setup_pal_map(struct link_map* pal_map) {
@@ -58,16 +66,27 @@ void setup_vdso_map(ElfW(Addr) addr) {
 
     ElfW(Addr) load_offset = 0;
     const ElfW(Phdr) * ph;
+    unsigned long pt_loads_count = 0;
     for (ph = vdso_map.l_phdr; ph < &vdso_map.l_phdr[vdso_map.l_phnum]; ph++)
         switch (ph->p_type) {
             case PT_LOAD:
                 load_offset = addr + (ElfW(Addr))ph->p_offset - (ElfW(Addr))ph->p_vaddr;
+                g_vdso_start = (uintptr_t)addr;
+                g_vdso_end = ALIGN_UP(g_vdso_start + (size_t)ph->p_memsz, PAGE_SIZE);
+                pt_loads_count++;
                 break;
             case PT_DYNAMIC:
                 vdso_map.l_real_ld = vdso_map.l_ld = (void*)addr + ph->p_offset;
                 vdso_map.l_ldnum = ph->p_memsz / sizeof(ElfW(Dyn));
                 break;
         }
+
+    if (pt_loads_count != 1) {
+        log_warning("The VDSO has %lu PT_LOAD segments, but only 1 was expected.", pt_loads_count);
+        g_vdso_start = 0;
+        g_vdso_end = 0;
+        return;
+    }
 
     ElfW(Dyn) local_dyn[4];
     int ndyn = 0;

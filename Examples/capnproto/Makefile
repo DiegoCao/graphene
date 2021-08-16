@@ -31,7 +31,7 @@ GRAPHENE_LOG_LEVEL = error
 endif
 
 .PHONY: all
-all: addressbook addressbook.manifest pal_loader
+all: addressbook addressbook.manifest
 ifeq ($(SGX),1)
 all: addressbook.manifest.sgx addressbook.sig addressbook.token
 endif
@@ -50,44 +50,33 @@ $(SRCDIR)/addressbook.capnp:
 
 $(SRCDIR)/addressbook: $(SRCDIR)/addressbook.c++ $(SRCDIR)/addressbook.capnp
 	cd $(SRCDIR) && capnp compile -oc++ addressbook.capnp
-	cd $(SRCDIR) && c++ -std=c++14 -Wall addressbook.c++ addressbook.capnp.c++ \
-	                    `pkg-config --cflags --libs capnp` -o addressbook
-
-# Generate manifest rules for Addressbook dependencies.
-# We'll duplicate some Glibc libraries (which Graphene provides in a customized version), but
-# there's no harm in this.
-.INTERMEDIATE: trusted-libs
-trusted-libs: ../common_tools/get_deps.sh $(SRCDIR)/addressbook
-	../common_tools/get_deps.sh $(SRCDIR)/addressbook > $@
+	cd $(SRCDIR) && c++ -std=c++14 -Wall \
+		addressbook.c++ addressbook.capnp.c++ `pkg-config --cflags --libs capnp` -o addressbook
 
 
-addressbook.manifest: addressbook.manifest.template trusted-libs
-	(sed -e 's|$$(GRAPHENEDIR)|'"$(GRAPHENEDIR)"'|g' \
-		-e 's|$$(GRAPHENE_LOG_LEVEL)|'"$(GRAPHENE_LOG_LEVEL)"'|g' \
-		-e 's|$$(ARCH_LIBDIR)|'"$(ARCH_LIBDIR)"'|g' \
-		$<; \
-	cat trusted-libs) > $@
+addressbook.manifest: addressbook.manifest.template
+	graphene-manifest \
+		-Dlog_level=$(GRAPHENE_LOG_LEVEL) \
+		-Darch_libdir=$(ARCH_LIBDIR) \
+		$< >$@
 
 addressbook.manifest.sgx: addressbook.manifest addressbook
-	$(GRAPHENEDIR)/Pal/src/host/Linux-SGX/signer/pal-sgx-sign \
-		-libpal $(GRAPHENEDIR)/Runtime/libpal-Linux-SGX.so \
-		-key $(SGX_SIGNER_KEY) \
-		-manifest $< -output $@
+	graphene-sgx-sign \
+		--key $(SGX_SIGNER_KEY) \
+		--manifest $< \
+		--output $@
 
 addressbook.sig: addressbook.manifest.sgx
 
 addressbook.token: addressbook.sig
-	$(GRAPHENEDIR)/Pal/src/host/Linux-SGX/signer/pal-sgx-get-token -output $@ -sig $^
+	graphene-sgx-get-token --output $@ --sig $^
 
 addressbook: $(SRCDIR)/addressbook
 	cp $< $@
 
-pal_loader:
-	ln -s $(GRAPHENEDIR)/Runtime/pal_loader $@
-
 .PHONY: clean
 clean:
-	$(RM) *.token *.sig *.manifest.sgx *.manifest pal_loader addressbook
+	$(RM) *.token *.sig *.manifest.sgx *.manifest addressbook
 
 .PHONY: distclean
 distclean: clean

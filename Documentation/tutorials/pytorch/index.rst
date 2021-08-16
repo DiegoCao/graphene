@@ -100,15 +100,14 @@ Prerequisites
 
 - Intel SGX Driver and SDK/PSW. You need a machine that supports Intel SGX and
   FLC/DCAP. Please follow `this guide
-  <https://download.01.org/intel-sgx/latest/linux-latest/docs/Intel_SGX_Installation_Guide_Linux_2.10_Open_Source.pdf>`__
+  <https://download.01.org/intel-sgx/latest/linux-latest/docs/Intel_SGX_Installation_Guide_Linux_2.13_Open_Source.pdf>`__
   to install the Intel SGX driver and SDK/PSW. Make sure to install the driver
   with ECDSA/DCAP attestation.
 
 - Graphene. Follow `Quick Start
   <https://graphene.readthedocs.io/en/latest/quickstart.html>`__ to build
   Graphene. In this tutorial, we will use both non-SGX and SGX-backed versions
-  of Graphene. Make sure you build both Graphene loaders (``Runtime/pal-Linux``
-  for non-SGX version and ``Runtime/pal-Linux-SGX`` for SGX version).
+  of Graphene. Make sure you build both Graphene loaders.
 
 Executing Native PyTorch
 ------------------------
@@ -191,16 +190,16 @@ command-line arguments and environment variables into the enclave. We
 keep these work-arounds in this tutorial for simplicity, but this configuration
 must not be used in production::
 
-   loader.insecure__use_cmdline_argv = 1
-   loader.insecure__use_host_env = 1
+   loader.insecure__use_cmdline_argv = true
+   loader.insecure__use_host_env = true
 
-We mount the entire ``<graphene repository>/Runtime/`` host-level directory to
-the ``/lib`` directory seen inside Graphene. This trick allows to transparently
-replace standard C libraries with Graphene-patched libraries::
+We mount the entire glibc host-level directory to the ``/lib`` directory seen
+inside Graphene. This trick allows to transparently replace standard C libraries
+with Graphene-patched libraries::
 
    fs.mount.lib.type = "chroot"
    fs.mount.lib.path = "/lib"
-   fs.mount.lib.uri  = "file:$(GRAPHENEDIR)/Runtime/"
+   fs.mount.lib.uri  = "file:{{ graphene.runtime() }}/"
 
 We also mount other directories such as ``/usr``,  ``/etc``, and ``/tmp``
 required by Python and PyTorch (they search for libraries and utility files in
@@ -209,8 +208,8 @@ these system directories).
 Finally, we mount the path containing the Python packages installed via pip::
 
    fs.mount.pip.type = "chroot"
-   fs.mount.pip.path = "$(HOME)/.local/lib"
-   fs.mount.pip.uri  = "file:$(HOME)/.local/lib"
+   fs.mount.pip.path = "{{ env.HOME }}/.local/lib"
+   fs.mount.pip.uri  = "file:{{ env.HOME }}/.local/lib"
 
 Now we can run ``make`` to build/copy all required Graphene files::
 
@@ -222,17 +221,14 @@ This command will autogenerate a couple new files:
    template manifest file. This file will be used by Graphene to decide on
    different manifest options how to execute PyTorch inside Graphene.
 
-#. Create a symbolic link to the generic Graphene loader (``pal_loader``). This
-   is just for convenience.
+Now, launch Graphene via :command:`graphene-direct`. You can simply append the
+arguments after the application path.  Our example takes
+:file:`pytorchexample.py` as an argument::
 
-Now, launch Graphene via ``pal_loader``. You can simply append the arguments
-after the application path.  Our example takes
-``pytorchexample.py`` as an argument::
-
-   ./pal_loader ./pytorch pytorchexample.py
+   graphene-direct ./pytorch pytorchexample.py
 
 That's it. You have run the PyTorch example with Graphene. You can check
-``result.txt`` to make sure it ran correctly.
+:file:`result.txt` to make sure it ran correctly.
 
 Executing PyTorch with Graphene in SGX Enclave
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -243,32 +239,33 @@ example inside an Intel SGX enclave.  Let's go back to the manifest template
 these entries are ignored if Graphene runs in non-SGX mode).
 
 Below, we will highlight some of the SGX-specific manifest options in
-``pytorch.manifest.template``.  SGX syntax is fully described `here
+:file:`pytorch.manifest.template`.  SGX syntax is fully described `here
 <https://graphene.readthedocs.io/en/latest/manifest-syntax.html?highlight=manifest#sgx-syntax>`__.
 
 First, here are the following SGX-specific lines in the manifest template::
 
-   sgx.trusted_files.ld   = "file:$(GRAPHENEDIR)/Runtime/ld-linux-x86-64.so.2"
-   sgx.trusted_files.libc = "file:$(GRAPHENEDIR)/Runtime/libc.so.6"
+   sgx.trusted_files.python3 = "file:{{ entrypoint }}"
+   sgx.trusted_files.runtime = "file:{{ graphene.runtime() }}/"
    ...
 
-``sgx.trusted_files.<name>`` specifies a file that will be verified and trusted
-by the SGX enclave.  Note that the key string ``<name>`` may be an arbitrary
-legal string (but without ``-`` and other special symbols) and does not have to
-be the same as the actual file name.
+``sgx.trusted_files.<name>`` specifies a file or a directory that will be
+verified and trusted by the SGX enclave (in the latter case it's recursively
+traversed and all files are added as trusted). Note that the key string
+``<name>`` may be an arbitrary legal string and does not have to be the same as
+the actual file name.
 
 The way these Trusted Files work is before Graphene runs PyTorch inside the SGX
-enclave, Graphene generates the final SGX manifest file using ``pal-sgx-sign``
-Graphene utility.  This utility calculates hashes of each trusted file and
-appends them as ``sgx.trusted_checksum.<name>`` to the final SGX manifest. When
-running PyTorch with SGX, Graphene reads trusted files, finds their
-corresponding trusted checksums, and compares the calculated-at-runtime checksum
-against the expected value in the manifest.
+enclave, Graphene generates the final SGX manifest file using
+:command:`graphene-sgx-sign` Graphene utility.  This utility calculates hashes
+of each trusted file and appends them as ``sgx.trusted_checksum.<name>`` to the
+final SGX manifest. When running PyTorch with SGX, Graphene reads trusted files,
+finds their corresponding trusted checksums, and compares the
+calculated-at-runtime checksum against the expected value in the manifest.
 
 The PyTorch manifest template also contains ``sgx.allowed_files.<name>``
 entries. They specify files unconditionally allowed by the enclave::
 
-   sgx.allowed_files.pythonhome = "file:$(HOME)/.local/lib"
+   sgx.allowed_files.pythonhome = "file:{{ env.HOME }}/.local/lib"
 
 This line unconditionally allows all Python libraries in the path to be loaded
 into the enclave.  Ideally, the developer needs to replace it with
@@ -289,23 +286,22 @@ an SGX enclave::
 
 The above command performs the following tasks:
 
-#. Generates the final SGX manifest file ``pytorch.manifest.sgx``.
+#. Generates the final SGX manifest file :file:`pytorch.manifest.sgx`.
 
 #. Signs the manifest and generates the SGX signature file containing SIGSTRUCT
-   (``pytorch.sig``).
+   (:file:`pytorch.sig`).
 
-#. Creates a dummy EINITTOKEN token file ``pytorch.token`` (this file is used
-   for backwards compatibility with SGX platforms with EPID and without Flexible
-   Launch Control).
+#. Creates a dummy EINITTOKEN token file :file:`pytorch.token` (this file is
+   used for backwards compatibility with SGX platforms with EPID and without
+   Flexible Launch Control).
 
-After running this command and building all the required files, we can simply
-set ``SGX=1`` environment variable and use ``pal_loader`` to launch the PyTorch
-workload inside an SGX enclave::
+After running this command and building all the required files, we can use
+:command:`graphene-sgx` to launch the PyTorch workload inside an SGX enclave::
 
-   SGX=1 ./pal_loader ./pytorch pytorchexample.py
+   graphene-sgx ./pytorch pytorchexample.py
 
 It will run exactly the same Python script but inside the SGX enclave. Again,
-you can verify that PyTorch ran correctly by examining ``result.txt``.
+you can verify that PyTorch ran correctly by examining :file:`result.txt`.
 
 End-To-End Confidential PyTorch Workflow
 ----------------------------------------
@@ -409,8 +405,8 @@ In real deployments, the user must replace this ``wrap-key`` with her own
 We also re-use the ``pf_crypt`` utility (with its ``libsgx_util.so`` helper
 library and required mbedTLS libraries) that encrypts/decrypts the files::
 
-   cp ../ra-tls-secret-prov/libsgx_util.so .
-   cp ../ra-tls-secret-prov/libmbed*.so* .
+   cp ../ra-tls-secret-prov/libs/libsgx_util.so .
+   cp ../ra-tls-secret-prov/libs/libmbed*.so* .
    cp ../ra-tls-secret-prov/pf_crypt .
 
 Let's also make sure that ``alexnet-pretrained.pt`` network-model file exists
@@ -438,7 +434,7 @@ The user must prepare the secret provisioning server and start it. For this,
 copy the secret provisioning executable and its helper library from
 ``Examples/ra-tls-secret-prov`` to the current directory::
 
-   cp ../ra-tls-secret-prov/libsecret_prov_verify_dcap.so .
+   cp ../ra-tls-secret-prov/libs/libsecret_prov_verify_dcap.so .
    cp ../ra-tls-secret-prov/secret_prov_server_dcap .
 
 Also, copy the server-identifying certificates so that in-Graphene secret
@@ -488,7 +484,7 @@ current directory ``./`` to ``LD_LIBRARY_PATH`` so that PyTorch and Graphene
 add-ons search for libraries in the current directory::
 
    # this instructs in-Graphene dynamic loader to search for dependencies in the current directory
-   loader.env.LD_LIBRARY_PATH = "/lib:/usr/lib:$(ARCH_LIBDIR):/usr/$(ARCH_LIBDIR):./"
+   loader.env.LD_LIBRARY_PATH = "/lib:/usr/lib:{{ arch_libdir }}:/usr/{{ arch_libdir }}:./"
 
 Add the following lines to enable remote secret provisioning and allow protected
 files to be transparently decrypted by the provisioned key. Recall that we
@@ -497,7 +493,7 @@ re-use the same ``certs/`` directory and specify ``localhost``. For more info on
 the used environment variables and other manifest options, see `here
 <https://github.com/oscarlab/graphene/tree/master/Pal/src/host/Linux-SGX/tools#secret-provisioning-libraries>`__::
 
-   sgx.remote_attestation = 1
+   sgx.remote_attestation = true
 
    loader.env.LD_PRELOAD = "libsecret_prov_attest.so"
    loader.env.SECRET_PROVISION_CONSTRUCTOR = "1"
@@ -513,7 +509,7 @@ the SGX enclave, Graphene instance, and the application running in it to the
 remote secret-provisioning server. Graphene needs to locate this library, so
 let's copy it to our working directory::
 
-   cp ../ra-tls-secret-prov/libsecret_prov_attest.so ./
+   cp ../ra-tls-secret-prov/libs/libsecret_prov_attest.so ./
 
 Building and Executing End-To-End PyTorch Example
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -524,9 +520,9 @@ files, tokens, and signatures::
    make clean
    make SGX=1
 
-It is also important to remove the file ``result.txt`` if it exists. Otherwise
-the Protected FS will detect the already-existing file and fail. So let's remove
-it unconditionally::
+It is also important to remove the file :file:`result.txt` if it exists.
+Otherwise the Protected FS will detect the already-existing file and fail. So
+let's remove it unconditionally::
 
    rm -f result.txt
 
@@ -534,23 +530,23 @@ We are ready to run the end-to-end PyTorch example. Notice that we didn't change
 a line of code in the Python script. Moreover, we can run it with exactly the
 same command used in the previous section::
 
-   SGX=1 ./pal_loader ./pytorch pytorchexample.py
+   graphene-sgx ./pytorch pytorchexample.py
 
 This should run PyTorch with encrypted input files and generate the encrypted
-``result.txt`` output file. Note that we already launched the secret
+:file:`result.txt` output file. Note that we already launched the secret
 provisioning server on the same machine, so secret provisioning will run
 locally.
 
 Decrypting Output File
 ^^^^^^^^^^^^^^^^^^^^^^
 
-After our protected PyTorch inference is finished, you'll see ``result.txt`` in
-the directory.  This file is encrypted with the same key as was used for
-encryption of input files.  In order to decrypt it, use the following command::
+After our protected PyTorch inference is finished, you'll see :file:`result.txt`
+in the directory. This file is encrypted with the same key as was used for
+encryption of input files. In order to decrypt it, use the following command::
 
    LD_LIBRARY_PATH=. ./pf_crypt decrypt -w files/wrap-key -i result.txt -o plaintext/result.txt
 
-You can check the result written in ``plaintext/result.txt``. It must be the
+You can check the result written in :file:`plaintext/result.txt`. It must be the
 same as in our previous runs.
 
 Cleaning Up

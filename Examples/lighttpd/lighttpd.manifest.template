@@ -2,23 +2,27 @@
 #
 # This manifest was prepared and tested on Ubuntu 16.04.
 #
-# lighttpd must be run with the pal_loader:
+# lighttpd must be run with the graphene-direct or graphene-sgx:
 #
-# ./pal_loader ./lighttpd <script>
+# graphene-direct ./lighttpd <script>
+# graphene-sgx ./lighttpd <script>
 
-libos.entrypoint = "file:$(INSTALL_DIR)/sbin/lighttpd"
+libos.entrypoint = "{{ install_dir }}/sbin/lighttpd"
 
 # Path to the library OS
-loader.preload = "file:$(GRAPHENEDIR)/Runtime/libsysdb.so"
+loader.preload = "file:{{ graphene.libos }}"
 
 # Graphene log level
-loader.log_level = "$(GRAPHENE_LOG_LEVEL)"
+loader.log_level = "{{ log_level }}"
 
 # Read application arguments directly from the command line. Don't use this on production!
-loader.insecure__use_cmdline_argv = 1
+loader.insecure__use_cmdline_argv = true
 
 # Environment variables for lighttpd
-loader.env.LD_LIBRARY_PATH = "/lib:$(ARCH_LIBDIR):$(INSTALL_DIR)/lib"
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:{{ install_dir }}/lib"
+
+# Allow for injecting SIGTERM signal from the host.
+sys.enable_sigterm_injection = true
 
 # Mounted FSes. The following "chroot" FSes mount a part of the host FS into the
 # guest. Other parts of the host FS will not be available in the guest.
@@ -26,12 +30,12 @@ loader.env.LD_LIBRARY_PATH = "/lib:$(ARCH_LIBDIR):$(INSTALL_DIR)/lib"
 # Default glibc files, mounted from the Runtime directory in GRAPHENEDIR.
 fs.mount.lib.type = "chroot"
 fs.mount.lib.path = "/lib"
-fs.mount.lib.uri = "file:$(GRAPHENEDIR)/Runtime"
+fs.mount.lib.uri = "file:{{ graphene.runtimedir() }}"
 
 # Host-level libraries (e.g., /lib/x86_64-linux-gnu) required by the lighttpd executable
 fs.mount.lib2.type = "chroot"
-fs.mount.lib2.path = "$(ARCH_LIBDIR)"
-fs.mount.lib2.uri = "file:$(ARCH_LIBDIR)"
+fs.mount.lib2.path = "{{ arch_libdir }}"
+fs.mount.lib2.uri = "file:{{ arch_libdir }}"
 
 # Host-level directory (/usr) required by the lighttpd executable
 fs.mount.usr.type = "chroot"
@@ -40,13 +44,13 @@ fs.mount.usr.uri = "file:/usr"
 
 # Mount the current working directory
 fs.mount.cwd.type = "chroot"
-fs.mount.cwd.path = "$(INSTALL_DIR_ABSPATH)"
-fs.mount.cwd.uri = "file:$(INSTALL_DIR)"
+fs.mount.cwd.path = "{{ install_dir_abspath }}"
+fs.mount.cwd.uri = "file:{{ install_dir }}"
 
 # Mount lighttpd's default server.upload-dirs path
-fs.mount.var_tmp.type = "chroot"
+fs.mount.var_tmp.type = "tmpfs"
 fs.mount.var_tmp.path = "/var/tmp"
-fs.mount.var_tmp.uri = "file:/var/tmp"
+fs.mount.var_tmp.uri = "file:dummy-unused-by-tmpfs-uri"
 
 # SGX general options
 
@@ -63,31 +67,16 @@ sgx.enclave_size = "256M"
 # the application can create is (sgx.thread_num - 2).
 sgx.thread_num = 3
 
-sgx.nonpie_binary = 1
+sgx.nonpie_binary = true
 
 # SGX trusted files
 
-sgx.trusted_files.lighttpd = "file:$(INSTALL_DIR)/sbin/lighttpd"
-
-# Glibc libraries
-sgx.trusted_files.ld = "file:$(GRAPHENEDIR)/Runtime/ld-linux-x86-64.so.2"
-sgx.trusted_files.libc = "file:$(GRAPHENEDIR)/Runtime/libc.so.6"
-sgx.trusted_files.libm = "file:$(GRAPHENEDIR)/Runtime/libm.so.6"
-sgx.trusted_files.libdl = "file:$(GRAPHENEDIR)/Runtime/libdl.so.2"
-sgx.trusted_files.librt = "file:$(GRAPHENEDIR)/Runtime/librt.so.1"
-sgx.trusted_files.libutil = "file:$(GRAPHENEDIR)/Runtime/libutil.so.1"
-sgx.trusted_files.libpthread = "file:$(GRAPHENEDIR)/Runtime/libpthread.so.0"
-sgx.trusted_files.libz = "file:$(ARCH_LIBDIR)/libz.so.1"
-sgx.trusted_files.nss_files = "file:$(ARCH_LIBDIR)/libnss_files.so.2"
-
-# lighttpd modules and dependencies
-sgx.trusted_files.mod_indexfile = "file:$(INSTALL_DIR)/lib/mod_indexfile.so"
-sgx.trusted_files.mod_dirlisting = "file:$(INSTALL_DIR)/lib/mod_dirlisting.so"
-sgx.trusted_files.mod_staticfile = "file:$(INSTALL_DIR)/lib/mod_staticfile.so"
+sgx.trusted_files.runtime = "file:{{ graphene.runtimedir() }}/"
+sgx.trusted_files.install_dir = "file:{{ install_dir }}/"
+sgx.trusted_files.arch_libdir = "file:{{ arch_libdir }}/"
+sgx.trusted_files.usr_arch_libdir = "file:/usr/{{ arch_libdir }}/"
 
 # Trusted configuration files
 sgx.trusted_files.conf = "file:lighttpd.conf"
 sgx.trusted_files.conf2 = "file:lighttpd-generic.conf"
 sgx.trusted_files.conf3 = "file:lighttpd-server.conf"
-
-sgx.allowed_files.install = "file:install"

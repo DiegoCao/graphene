@@ -16,17 +16,10 @@
 #include "sysdep-arch.h"
 #include "toml.h"
 
-#define IS_ERR   INTERNAL_SYSCALL_ERROR
 #define IS_ERR_P INTERNAL_SYSCALL_ERROR_P
-#define ERRNO    INTERNAL_SYSCALL_ERRNO
 #define ERRNO_P  INTERNAL_SYSCALL_ERRNO_P
 
-int printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-int snprintf(char* str, size_t size, const char* fmt, ...) __attribute__((format(printf, 3, 4)));
-
-/* constants and macros to help rounding addresses to page
-   boundaries */
-extern size_t g_page_size;
+extern const size_t g_page_size;
 
 #undef IS_ALLOC_ALIGNED
 #undef IS_ALLOC_ALIGNED_PTR
@@ -57,7 +50,7 @@ struct pal_enclave {
     unsigned long size;
     unsigned long thread_num;
     unsigned long rpc_thread_num;
-    unsigned long ssaframesize;
+    unsigned long ssa_frame_size;
     bool nonpie_binary;
     bool remote_attestation_enabled;
     bool use_epid_attestation; /* Valid only if `remote_attestation_enabled` is true, selects
@@ -68,11 +61,11 @@ struct pal_enclave {
     int token;
 
     char* libpal_uri; /* Path to the PAL binary */
-    char* entrypoint_uri; /* URI of the entry executable for the LibOS */
 
 #ifdef DEBUG
     /* profiling */
     bool profile_enable;
+    int profile_mode;
     char profile_filename[64];
     bool profile_with_stack;
     int profile_frequency;
@@ -164,6 +157,12 @@ void update_debugger(void);
 #define SGX_PROFILE_DEFAULT_FREQUENCY 50
 #define SGX_PROFILE_MAX_FREQUENCY 250
 
+enum {
+    SGX_PROFILE_MODE_AEX = 1,
+    SGX_PROFILE_MODE_OCALL_INNER = 2,
+    SGX_PROFILE_MODE_OCALL_OUTER = 3,
+};
+
 /* Filenames for saved data */
 #define SGX_PROFILE_FILENAME "sgx-perf.data"
 #define SGX_PROFILE_FILENAME_WITH_PID "sgx-perf-%d.data"
@@ -174,11 +173,20 @@ int sgx_profile_init(void);
 /* Finalize and close file */
 void sgx_profile_finish(void);
 
-/* Record a sample */
-void sgx_profile_sample(void* tcs);
+/* Record a sample during AEX */
+void sgx_profile_sample_aex(void* tcs);
 
-/* Record a new mmap of executable region */
-void sgx_profile_report_mmap(const char* filename, uint64_t addr, uint64_t len, uint64_t offset);
+/* Record a sample during OCALL (inner state) */
+void sgx_profile_sample_ocall_inner(void* enclave_gpr);
+
+/* Record a sample during OCALL (function to be executed) */
+void sgx_profile_sample_ocall_outer(void* ocall_func);
+
+/* Record a new mapped ELF */
+void sgx_profile_report_elf(const char* filename, void* addr);
+
+/* Record all ELFs from outer PAL */
+void sgx_profile_report_urts_elfs(void);
 #endif
 
 /* perf.data output (sgx_perf_data.h) */

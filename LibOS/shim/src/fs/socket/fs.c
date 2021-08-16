@@ -27,6 +27,7 @@ static int socket_close(struct shim_handle* hdl) {
 }
 
 static ssize_t socket_read(struct shim_handle* hdl, void* buf, size_t count) {
+    assert(hdl->type == TYPE_SOCK);
     struct shim_sock_handle* sock = &hdl->info.sock;
 
     lock(&hdl->lock);
@@ -47,25 +48,22 @@ static ssize_t socket_read(struct shim_handle* hdl, void* buf, size_t count) {
 
     unlock(&hdl->lock);
 
-    PAL_NUM bytes = DkStreamRead(hdl->pal_handle, 0, count, buf, NULL, 0);
+    size_t orig_count = count;
+    int ret = DkStreamRead(hdl->pal_handle, 0, &count, buf, NULL, 0);
+    ret = pal_to_unix_errno(ret);
+    maybe_epoll_et_trigger(hdl, ret, /*in=*/true, ret == 0 ? count < orig_count : false);
+    if (ret < 0) {
+        lock(&hdl->lock);
+        sock->error = -ret;
+        unlock(&hdl->lock);
+        return ret;
+    }
 
-    if (bytes == PAL_STREAM_ERROR)
-        switch (PAL_NATIVE_ERRNO()) {
-            case PAL_ERROR_ENDOFSTREAM:
-                return 0;
-            default: {
-                int err = PAL_ERRNO();
-                lock(&hdl->lock);
-                sock->error = err;
-                unlock(&hdl->lock);
-                return -err;
-            }
-        }
-
-    return (ssize_t)bytes;
+    return (ssize_t)count;
 }
 
 static ssize_t socket_write(struct shim_handle* hdl, const void* buf, size_t count) {
+    assert(hdl->type == TYPE_SOCK);
     struct shim_sock_handle* sock = &hdl->info.sock;
 
     lock(&hdl->lock);
@@ -86,28 +84,29 @@ static ssize_t socket_write(struct shim_handle* hdl, const void* buf, size_t cou
 
     unlock(&hdl->lock);
 
-    PAL_NUM bytes = DkStreamWrite(hdl->pal_handle, 0, count, (void*)buf, NULL);
-
-    if (bytes == PAL_STREAM_ERROR) {
-        int err = PAL_ERRNO();
-        if (err == EPIPE) {
+    size_t orig_count = count;
+    int ret = DkStreamWrite(hdl->pal_handle, 0, &count, (void*)buf, NULL);
+    ret = pal_to_unix_errno(ret);
+    maybe_epoll_et_trigger(hdl, ret, /*in=*/false, ret == 0 ? count < orig_count : false);
+    if (ret < 0) {
+        if (ret == -EPIPE) {
             siginfo_t info = {
                 .si_signo = SIGPIPE,
                 .si_pid = g_process.pid,
                 .si_code = SI_USER,
             };
             if (kill_current_proc(&info) < 0) {
-                debug("socket_write: failed to deliver a signal\n");
+                log_error("socket_write: failed to deliver a signal");
             }
         }
 
         lock(&hdl->lock);
-        sock->error = err;
+        sock->error = -ret;
         unlock(&hdl->lock);
-        return -err;
+        return ret;
     }
 
-    return (ssize_t)bytes;
+    return (ssize_t)count;
 }
 
 static int socket_hstat(struct shim_handle* hdl, struct stat* stat) {
@@ -116,8 +115,10 @@ static int socket_hstat(struct shim_handle* hdl, struct stat* stat) {
 
     PAL_STREAM_ATTR attr;
 
-    if (!DkStreamAttributesQueryByHandle(hdl->pal_handle, &attr))
-        return -PAL_ERRNO();
+    int ret = DkStreamAttributesQueryByHandle(hdl->pal_handle, &attr);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
     memset(stat, 0, sizeof(struct stat));
 
@@ -128,12 +129,8 @@ static int socket_hstat(struct shim_handle* hdl, struct stat* stat) {
     return 0;
 }
 
-static int socket_checkout(struct shim_handle* hdl) {
-    hdl->fs = NULL;
-    return 0;
-}
-
 static off_t socket_poll(struct shim_handle* hdl, int poll_type) {
+    assert(hdl->type == TYPE_SOCK);
     struct shim_sock_handle* sock = &hdl->info.sock;
     off_t ret = 0;
 
@@ -175,8 +172,9 @@ static off_t socket_poll(struct shim_handle* hdl, int poll_type) {
     }
 
     PAL_STREAM_ATTR attr;
-    if (!DkStreamAttributesQueryByHandle(hdl->pal_handle, &attr)) {
-        ret = -PAL_ERRNO();
+    int query_ret = DkStreamAttributesQueryByHandle(hdl->pal_handle, &attr);
+    if (query_ret < 0) {
+        ret = pal_to_unix_errno(query_ret);
         goto out;
     }
 
@@ -195,7 +193,7 @@ static off_t socket_poll(struct shim_handle* hdl, int poll_type) {
 
 out:
     if (ret < 0) {
-        debug("socket_poll failed (%ld)\n", ret);
+        log_error("socket_poll failed (%ld)", ret);
         sock->error = -ret;
     }
 
@@ -209,8 +207,10 @@ static int socket_setflags(struct shim_handle* hdl, int flags) {
 
     PAL_STREAM_ATTR attr;
 
-    if (!DkStreamAttributesQueryByHandle(hdl->pal_handle, &attr))
-        return -PAL_ERRNO();
+    int ret = DkStreamAttributesQueryByHandle(hdl->pal_handle, &attr);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
     if (attr.nonblocking) {
         if (flags & O_NONBLOCK)
@@ -224,8 +224,10 @@ static int socket_setflags(struct shim_handle* hdl, int flags) {
         attr.nonblocking = PAL_TRUE;
     }
 
-    if (!DkStreamAttributesSetByHandle(hdl->pal_handle, &attr))
-        return -PAL_ERRNO();
+    ret = DkStreamAttributesSetByHandle(hdl->pal_handle, &attr);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
     return 0;
 }
@@ -235,12 +237,11 @@ struct shim_fs_ops socket_fs_ops = {
     .read     = &socket_read,
     .write    = &socket_write,
     .hstat    = &socket_hstat,
-    .checkout = &socket_checkout,
     .poll     = &socket_poll,
     .setflags = &socket_setflags,
 };
 
-struct shim_mount socket_builtin_fs = {
-    .type   = "socket",
+struct shim_fs socket_builtin_fs = {
+    .name   = "socket",
     .fs_ops = &socket_fs_ops,
 };

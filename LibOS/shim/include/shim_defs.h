@@ -3,14 +3,18 @@
 
 #include "shim_syscalls.h"
 
+/* Names and values are taken from the Linux kernel. */
+#define ERESTARTSYS     512 /* Usual case - restart if SA_RESTART is set. */
+#define ERESTARTNOINTR  513 /* Always restart. */
+#define ERESTARTNOHAND  514 /* Restart if no signal handler. */
+
+/* Internal LibOS stack size: 7 pages + one guard page. */
+#define SHIM_THREAD_LIBOS_STACK_SIZE (7 * PAGE_SIZE + PAGE_SIZE)
+
 #define DEFAULT_BRK_MAX_SIZE   (256 * 1024)        /* 256KB */
 #define DEFAULT_SYS_STACK_SIZE (256 * 1024)        /* 256KB */
 
 #define CP_INIT_VMA_SIZE (64 * 1024 * 1024) /* 64MB */
-
-/* debug message printout */
-#define DEBUGBUF_SIZE  256
-#define DEBUGBUF_BREAK 0
 
 #define DEFAULT_VMA_COUNT 64
 

@@ -7,12 +7,7 @@
 #include "api.h"
 #include "assert.h"
 #include "pal.h"
-#include "pal_debug.h"
-
-noreturn void __abort(void) {
-    warn("ABORTED\n");
-    DkProcessExit(1);
-}
+#include "pal_regression.h"
 
 #define EXIT_UNBALANCED()                                 \
     do {                                                  \
@@ -306,7 +301,7 @@ int main(void) {
 
     uint32_t seed = 0;
     if (DkRandomBitsRead(&seed, sizeof(seed)) < 0) {
-        pal_printf("\n");
+        pal_printf("Getting a seed failed\n");
         return 1;
     }
     pal_printf("Running dynamic tests (with seed: %u): ", seed);

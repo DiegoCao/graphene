@@ -26,12 +26,18 @@ Prerequisites
 Update and install the required packages for Graphene::
 
    sudo apt update
-   sudo apt install -y build-essential autoconf gawk bison python3-protobuf \
-                       libprotobuf-c-dev protobuf-c-compiler libcurl4 python3
+   sudo apt install -y \
+       build-essential autoconf gawk bison wget python3 libcurl4-openssl-dev \
+       python3-protobuf libprotobuf-c-dev protobuf-c-compiler python3-pip meson
+   python3 -m pip install toml>=0.10
 
 Graphene requires the kernel to support FSGSBASE x86 instructions. Older Azure
 Confidential Compute VMs may not contain the required kernel patches and need to
 be updated.
+
+To be able to run all tests also install::
+
+    sudo apt install -y libunwind8
 
 Building
 ^^^^^^^^
@@ -43,18 +49,21 @@ Building
 
 #. Prepare the signing keys::
 
-       openssl genrsa -3 -out enclave-key.pem 3072
-       cp enclave-key.pem Pal/src/host/Linux-SGX/signer
+       openssl genrsa -3 -out Pal/src/host/Linux-SGX/signer/enclave-key.pem 3072
 
 #. Build Graphene::
 
-       ISGX_DRIVER_PATH=/usr/src/linux-headers-`uname -r`/arch/x86/ make SGX=1
+       make ISGX_DRIVER_PATH=/usr/src/linux-headers-`uname -r`/arch/x86/ SGX=1
+       meson build --buildtype=release -Dsgx=enabled -Ddirect=disabled
+       ninja -C build
+       sudo ninja -C build install
 
 #. Build and run :program:`helloworld`::
 
        cd LibOS/shim/test/regression
+       make SGX=1
        make SGX=1 sgx-tokens
-       SGX=1 ../../../../Runtime/pal_loader helloworld
+       graphene-sgx helloworld
 
 Azure Kubernetes Services (AKS)
 -------------------------------
@@ -93,10 +102,9 @@ cluster.
 
 .. warning::
 
-       This example relies on insecure arguments provided at runtime and should
-       not be used production. To use trusted arguments, please see the `manpage
-       of GSC
-       <https://graphene.readthedocs.io/en/latest/manpages/gsc.html#using-graphene-s-trusted-command-line-arguments>`__.
+   This example relies on insecure arguments provided at runtime and should not
+   be used production. To use trusted arguments, please see the `manpage of GSC
+   <https://graphene.readthedocs.io/en/latest/manpages/gsc.html#using-graphene-s-trusted-command-line-arguments>`__.
 
 #. Pull Python image::
 

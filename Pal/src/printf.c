@@ -2,79 +2,42 @@
 /* Copyright (C) 2014 Stony Brook University */
 
 #include "api.h"
+#include "assert.h"
+#include "pal.h"
 #include "pal_internal.h"
 
-#ifndef NO_INTERNAL_PRINTF
-
-// Collect up to PRINTBUF_SIZE characters into a buffer
-// and perform ONE system call to print all of them,
-// in order to make the lines output to the console atomic
-// and prevent interrupts from causing context switches
-// in the middle of a console output line and such.
-
-#define PRINTBUF_SIZE 256
-
-struct printbuf {
-    int idx;  // current buffer index
-    int cnt;  // total bytes printed so far
-    char buf[PRINTBUF_SIZE];
+/* NOTE: We could add "pal" prefix to the below strings for more fine-grained log info */
+static const char* log_level_to_prefix[] = {
+    [LOG_LEVEL_NONE]    = "",
+    [LOG_LEVEL_ERROR]   = "error: ",
+    [LOG_LEVEL_WARNING] = "warning: ",
+    [LOG_LEVEL_DEBUG]   = "debug: ",
+    [LOG_LEVEL_TRACE]   = "trace: ",
+    [LOG_LEVEL_ALL]     = "", // not a valid entry actually (no public wrapper uses this log level)
 };
 
-static int fputch(void* f, int ch, void* putdat) {
-    __UNUSED(f);
-    struct printbuf* b = putdat;
-
-    b->buf[b->idx++] = ch;
-    if (b->idx == PRINTBUF_SIZE - 1) {
-        _DkPrintConsole(b->buf, b->idx);
-        b->idx = 0;
-    }
-    b->cnt++;
+static int buf_write_all(const char* str, size_t size, void* arg) {
+    __UNUSED(arg);
+    _DkDebugLog(str, size);
     return 0;
 }
 
-int vprintf(const char* fmt, va_list ap) {
-    struct printbuf b;
+static void log_vprintf(const char* prefix, const char* fmt, va_list ap) {
+    struct print_buf buf = INIT_PRINT_BUF(buf_write_all);
 
-    b.idx = 0;
-    b.cnt = 0;
-    vfprintfmt(&fputch, NULL, &b, fmt, ap);
-    _DkPrintConsole(b.buf, b.idx);
-
-    return b.cnt;
+    if (prefix)
+        buf_puts(&buf, prefix);
+    buf_vprintf(&buf, fmt, ap);
+    buf_printf(&buf, "\n");
+    buf_flush(&buf);
 }
 
-int log_vprintf(const char* fmt, va_list ap) {
-    struct printbuf b;
-
-    b.idx = 0;
-    b.cnt = 0;
-    vfprintfmt(&fputch, NULL, &b, fmt, ap);
-    _DkDebugLog(b.buf, b.idx);
-
-    return b.cnt;
+void pal_log(int level, const char* fmt, ...) {
+    if (level <= g_pal_control.log_level) {
+        va_list ap;
+        va_start(ap, fmt);
+        assert(0 <= level && (size_t)level < ARRAY_SIZE(log_level_to_prefix));
+        log_vprintf(log_level_to_prefix[level], fmt, ap);
+        va_end(ap);
+    }
 }
-
-int printf(const char* fmt, ...) {
-    va_list ap;
-    int cnt;
-
-    va_start(ap, fmt);
-    cnt = vprintf(fmt, ap);
-    va_end(ap);
-
-    return cnt;
-}
-EXTERN_ALIAS(printf);
-
-int log_printf(const char* fmt, ...) {
-    va_list ap;
-    int cnt;
-
-    va_start(ap, fmt);
-    cnt = log_vprintf(fmt, ap);
-    va_end(ap);
-
-    return cnt;
-}
-#endif

@@ -12,7 +12,6 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_flags_conv.h"
@@ -27,7 +26,7 @@
 
 /* this macro is used to emulate mmap() via pread() in chunks of 128MB (mmapped files may be many
  * GBs in size, and a pread OCALL could fail with -ENOMEM, so we cap to reasonably small size) */
-#define MAX_READ_SIZE (PRESET_PAGESIZE * 1024L * 32)
+#define MAX_READ_SIZE (PRESET_PAGESIZE * 1024 * 32)
 
 /* 'open' operation for file streams */
 static int file_open(PAL_HANDLE* handle, const char* type, const char* uri, int access, int share,
@@ -36,8 +35,8 @@ static int file_open(PAL_HANDLE* handle, const char* type, const char* uri, int 
         return -PAL_ERROR_INVAL;
 
     /* prepare the file handle */
-    size_t len     = strlen(uri) + 1;
-    PAL_HANDLE hdl = calloc(1, HANDLE_SIZE(file) + len);
+    size_t uri_size = strlen(uri) + 1;
+    PAL_HANDLE hdl = calloc(1, HANDLE_SIZE(file) + uri_size);
     if (!hdl)
         return -PAL_ERROR_NOMEM;
 
@@ -45,8 +44,8 @@ static int file_open(PAL_HANDLE* handle, const char* type, const char* uri, int 
     HANDLE_HDR(hdl)->flags |= RFD(0) | WFD(0);
     char* path = (void*)hdl + HANDLE_SIZE(file);
     int ret;
-    if ((ret = get_norm_path(uri, path, &len)) < 0) {
-        SGX_DBG(DBG_E, "Could not normalize path (%s): %s\n", uri, pal_strerror(-ret));
+    if ((ret = get_norm_path(uri, path, &uri_size)) < 0) {
+        log_warning("Could not normalize path (%s): %s", uri, pal_strerror(ret));
         free(hdl);
         return ret;
     }
@@ -62,8 +61,8 @@ static int file_open(PAL_HANDLE* handle, const char* type, const char* uri, int 
                              PAL_CREATE_TO_LINUX_OPEN(create)  |
                              PAL_OPTION_TO_LINUX_OPEN(options),
                         share);
-    if (IS_ERR(fd)) {
-        ret = unix_to_pal_error(ERRNO(fd));
+    if (fd < 0) {
+        ret = unix_to_pal_error(fd);
         goto out;
     }
 
@@ -71,9 +70,9 @@ static int file_open(PAL_HANDLE* handle, const char* type, const char* uri, int 
 
     /* check if the file is seekable and get real file size */
     ret = ocall_fstat(fd, &st);
-    if (IS_ERR(ret)) {
-        SGX_DBG(DBG_E, "file_open(%s): fstat failed: %d\n", path, ret);
-        ret = unix_to_pal_error(ERRNO(ret));
+    if (ret < 0) {
+        log_warning("file_open(%s): fstat failed: %d", path, ret);
+        ret = unix_to_pal_error(ret);
         goto out;
     }
 
@@ -91,7 +90,7 @@ static int file_open(PAL_HANDLE* handle, const char* type, const char* uri, int 
         /* disallow opening more than one writable handle to a PF */
         if (pf_mode & PF_FILE_MODE_WRITE) {
             if (pf->writable_fd >= 0) {
-                SGX_DBG(DBG_D, "file_open(%s): disallowing concurrent writable handle\n", path);
+                log_warning("file_open(%s): disallowing concurrent writable handle", path);
                 ret = -PAL_ERROR_DENIED;
                 goto out;
             }
@@ -101,7 +100,7 @@ static int file_open(PAL_HANDLE* handle, const char* type, const char* uri, int 
 
         /* the protected files should be regular files (seekable) */
         if (!hdl->file.seekable) {
-            SGX_DBG(DBG_E, "file_open(%s): disallowing non-seekable file handle\n", path);
+            log_warning("file_open(%s): disallowing non-seekable file handle", path);
             goto out;
         }
 
@@ -112,26 +111,26 @@ static int file_open(PAL_HANDLE* handle, const char* type, const char* uri, int 
                 pf->writable_fd = fd;
             }
         } else {
-            SGX_DBG(DBG_E, "load_protected_file(%s, %d) failed\n", path, hdl->file.fd);
+            log_warning("load_protected_file(%s, %d) failed", path, hdl->file.fd);
             goto out;
         }
     } else {
-        sgx_stub_t* stubs;
+        sgx_chunk_hash_t* chunk_hashes;
         uint64_t total;
         void* umem;
-        ret = load_trusted_file(hdl, &stubs, &total, create, &umem);
+        ret = load_trusted_file(hdl, &chunk_hashes, &total, create, &umem);
         if (ret < 0) {
-            SGX_DBG(DBG_E, "Accessing file:%s is denied (%s). This file is not trusted or allowed."
-                    " Trusted files should be regular files (seekable).\n", hdl->file.realpath,
-                    pal_strerror(-ret));
+            log_warning("Accessing file:%s is denied (%s). This file is not trusted or allowed."
+                        " Trusted files should be regular files (seekable).", hdl->file.realpath,
+                        pal_strerror(ret));
             goto out;
         }
 
-        if (stubs && total) {
+        if (chunk_hashes && total) {
             assert(umem);
         }
 
-        hdl->file.stubs = (PAL_PTR)stubs;
+        hdl->file.chunk_hashes = (PAL_PTR)chunk_hashes;
         hdl->file.total = total;
         hdl->file.umem  = umem;
     }
@@ -156,7 +155,7 @@ static int64_t pf_file_read(struct protected_file* pf, PAL_HANDLE handle, uint64
     int fd = handle->file.fd;
 
     if (!pf->context) {
-        SGX_DBG(DBG_E, "pf_file_read(PF fd %d): PF not initialized\n", fd);
+        log_warning("pf_file_read(PF fd %d): PF not initialized", fd);
         return -PAL_ERROR_BADHANDLE;
     }
 
@@ -164,7 +163,7 @@ static int64_t pf_file_read(struct protected_file* pf, PAL_HANDLE handle, uint64
     pf_status_t pfs = pf_read(pf->context, offset, count, buffer, &bytes_read);
 
     if (PF_FAILURE(pfs)) {
-        SGX_DBG(DBG_E, "pf_file_read(PF fd %d): pf_read failed: %d\n", fd, pfs);
+        log_warning("pf_file_read(PF fd %d): pf_read failed: %s", fd, pf_strerror(pfs));
         return -PAL_ERROR_DENIED;
     }
 
@@ -179,17 +178,17 @@ static int64_t file_read(PAL_HANDLE handle, uint64_t offset, uint64_t count, voi
         return pf_file_read(pf, handle, offset, count, buffer);
 
     int64_t ret;
-    sgx_stub_t* stubs = (sgx_stub_t*)handle->file.stubs;
+    sgx_chunk_hash_t* chunk_hashes = (sgx_chunk_hash_t*)handle->file.chunk_hashes;
 
-    if (!stubs) {
+    if (!chunk_hashes) {
         if (handle->file.seekable) {
             ret = ocall_pread(handle->file.fd, buffer, count, offset);
         } else {
             ret = ocall_read(handle->file.fd, buffer, count);
         }
 
-        if (IS_ERR(ret))
-            return unix_to_pal_error(ERRNO(ret));
+        if (ret < 0)
+            return unix_to_pal_error(ret);
 
         return ret;
     }
@@ -199,15 +198,12 @@ static int64_t file_read(PAL_HANDLE handle, uint64_t offset, uint64_t count, voi
     if (offset >= total)
         return 0;
 
-    uint64_t end       = (offset + count > total) ? total : offset + count;
-    uint64_t map_start = ALIGN_DOWN(offset, TRUSTED_STUB_SIZE);
-    uint64_t map_end   = ALIGN_UP(end, TRUSTED_STUB_SIZE);
+    off_t end = MIN(offset + count, total);
+    off_t aligned_offset = ALIGN_DOWN(offset, TRUSTED_CHUNK_SIZE);
+    off_t aligned_end    = ALIGN_UP(end, TRUSTED_CHUNK_SIZE);
 
-    if (map_end > total)
-        map_end = ALLOC_ALIGN_UP(total);
-
-    ret = copy_and_verify_trusted_file(handle->file.realpath, handle->file.umem + map_start,
-                                       map_start, map_end, buffer, offset, end - offset, stubs,
+    ret = copy_and_verify_trusted_file(handle->file.realpath, buffer, handle->file.umem,
+                                       aligned_offset, aligned_end, offset, end, chunk_hashes,
                                        total);
     if (ret < 0)
         return ret;
@@ -220,14 +216,14 @@ static int64_t pf_file_write(struct protected_file* pf, PAL_HANDLE handle, uint6
     int fd = handle->file.fd;
 
     if (!pf->context) {
-        SGX_DBG(DBG_E, "pf_file_write(PF fd %d): PF not initialized\n", fd);
+        log_warning("pf_file_write(PF fd %d): PF not initialized", fd);
         return -PAL_ERROR_BADHANDLE;
     }
 
     pf_status_t pf_ret = pf_write(pf->context, offset, count, buffer);
 
     if (PF_FAILURE(pf_ret)) {
-        SGX_DBG(DBG_E, "pf_file_write(PF fd %d): pf_write failed: %d\n", fd, pf_ret);
+        log_warning("pf_file_write(PF fd %d): pf_write failed: %s", fd, pf_strerror(pf_ret));
         return -PAL_ERROR_DENIED;
     }
 
@@ -242,23 +238,23 @@ static int64_t file_write(PAL_HANDLE handle, uint64_t offset, uint64_t count, co
         return pf_file_write(pf, handle, offset, count, buffer);
 
     int64_t ret;
-    sgx_stub_t* stubs = (sgx_stub_t*)handle->file.stubs;
+    sgx_chunk_hash_t* chunk_hashes = (sgx_chunk_hash_t*)handle->file.chunk_hashes;
 
-    if (!stubs) {
+    if (!chunk_hashes) {
         if (handle->file.seekable) {
             ret = ocall_pwrite(handle->file.fd, buffer, count, offset);
         } else {
             ret = ocall_write(handle->file.fd, buffer, count);
         }
 
-        if (IS_ERR(ret))
-            return unix_to_pal_error(ERRNO(ret));
+        if (ret < 0)
+            return unix_to_pal_error(ret);
 
         return ret;
     }
 
     /* case of trusted file: disallow writing completely */
-    SGX_DBG(DBG_E, "Writing to a trusted file (%s) is disallowed!\n", handle->file.realpath);
+    log_warning("Writing to a trusted file (%s) is disallowed!", handle->file.realpath);
     return -PAL_ERROR_DENIED;
 }
 
@@ -266,7 +262,7 @@ static int pf_file_close(struct protected_file* pf, PAL_HANDLE handle) {
     int fd = handle->file.fd;
 
     if (pf->refcount == 0) {
-        SGX_DBG(DBG_E, "pf_file_close(PF fd %d): refcount == 0\n", fd);
+        log_error("pf_file_close(PF fd %d): refcount == 0", fd);
         return -PAL_ERROR_INVAL;
     }
 
@@ -293,7 +289,7 @@ static int file_close(PAL_HANDLE handle) {
             return ret;
     }
 
-    if (handle->file.stubs && handle->file.total) {
+    if (handle->file.chunk_hashes && handle->file.total) {
         /* case of trusted file: the whole file was mmapped in untrusted memory */
         ocall_munmap_untrusted(handle->file.umem, handle->file.total);
     }
@@ -314,7 +310,7 @@ static int file_delete(PAL_HANDLE handle, int access) {
         return -PAL_ERROR_INVAL;
 
     int ret = ocall_delete(handle->file.realpath);
-    return IS_ERR(ret) ? unix_to_pal_error(ERRNO(ret)) : ret;
+    return ret < 0 ? unix_to_pal_error(ret) : ret;
 }
 
 static int pf_file_map(struct protected_file* pf, PAL_HANDLE handle, void** addr, int prot,
@@ -328,12 +324,12 @@ static int pf_file_map(struct protected_file* pf, PAL_HANDLE handle, void** addr
 
     assert(WITHIN_MASK(prot, PAL_PROT_MASK));
     if ((prot & PAL_PROT_READ) && (prot & PAL_PROT_WRITE)) {
-        SGX_DBG(DBG_E, "pf_file_map(PF fd %d): trying to map with R+W access\n", fd);
+        log_warning("pf_file_map(PF fd %d): trying to map with R+W access", fd);
         return -PAL_ERROR_NOTSUPPORT;
     }
 
     if (!pf->context) {
-        SGX_DBG(DBG_E, "pf_file_map(PF fd %d): PF not initialized\n", fd);
+        log_warning("pf_file_map(PF fd %d): PF not initialized", fd);
         return -PAL_ERROR_BADHANDLE;
     }
 
@@ -342,8 +338,8 @@ static int pf_file_map(struct protected_file* pf, PAL_HANDLE handle, void** addr
     __UNUSED(pfs);
     assert(PF_SUCCESS(pfs));
 
-    SGX_DBG(DBG_D, "pf_file_map(PF fd %d): pf %p, addr %p, prot %d, offset %lu, size %lu\n", fd, pf,
-            *addr, prot, offset, size);
+    log_debug("pf_file_map(PF fd %d): pf %p, addr %p, prot %d, offset %lu, size %lu", fd, pf,
+              *addr, prot, offset, size);
 
     if (*addr == NULL) {
         /* LibOS didn't provide address at which to map, can happen on sendfile() */
@@ -374,8 +370,8 @@ static int pf_file_map(struct protected_file* pf, PAL_HANDLE handle, void** addr
     if (prot & PAL_PROT_READ) {
         /* we don't check this on writes since file size may be extended then */
         if (offset >= pf_size) {
-            SGX_DBG(DBG_E, "pf_file_map(PF fd %d): offset (%lu) >= file size (%lu)\n", fd, offset,
-                    pf_size);
+            log_warning("pf_file_map(PF fd %d): offset (%lu) >= file size (%lu)", fd, offset,
+                        pf_size);
             ret = -PAL_ERROR_INVAL;
             goto out;
         }
@@ -389,7 +385,7 @@ static int pf_file_map(struct protected_file* pf, PAL_HANDLE handle, void** addr
             pf_ret = PF_STATUS_CORRUPTED;
         }
         if (PF_FAILURE(pf_ret)) {
-            SGX_DBG(DBG_E, "pf_file_map(PF fd %d): pf_read failed: %d\n", fd, pf_ret);
+            log_warning("pf_file_map(PF fd %d): pf_read failed: %s", fd, pf_strerror(pf_ret));
             ret = -PAL_ERROR_DENIED;
             goto out;
         }
@@ -408,7 +404,13 @@ out:
 
 /* 'map' operation for file stream. */
 static int file_map(PAL_HANDLE handle, void** addr, int prot, uint64_t offset, uint64_t size) {
+    assert(IS_ALLOC_ALIGNED(offset) && IS_ALLOC_ALIGNED(size));
     int ret;
+
+    uint64_t dummy;
+    if (__builtin_add_overflow(offset, size, &dummy)) {
+        return -PAL_ERROR_INVAL;
+    }
 
     if (size > SIZE_MAX) {
         /* for compatibility with 32-bit systems */
@@ -419,25 +421,25 @@ static int file_map(PAL_HANDLE handle, void** addr, int prot, uint64_t offset, u
     if (pf)
         return pf_file_map(pf, handle, addr, prot, offset, size);
 
-    sgx_stub_t* stubs = (sgx_stub_t*)handle->file.stubs;
-    void* mem         = *addr;
+    sgx_chunk_hash_t* chunk_hashes = (sgx_chunk_hash_t*)handle->file.chunk_hashes;
+    void* mem = *addr;
 
     /* If the file is listed in the manifest as an "allowed" file, we allow mapping the file outside
      * the enclave, if the library OS does not request a specific address. */
-    if (!mem && !stubs && !(prot & PAL_PROT_WRITECOPY)) {
+    if (!mem && !chunk_hashes && !(prot & PAL_PROT_WRITECOPY)) {
         ret = ocall_mmap_untrusted(&mem, size, PAL_PROT_TO_LINUX(prot), MAP_SHARED, handle->file.fd,
                                    offset);
-        if (!IS_ERR(ret))
+        if (ret >= 0)
             *addr = mem;
-        return IS_ERR(ret) ? unix_to_pal_error(ERRNO(ret)) : ret;
+        return ret < 0 ? unix_to_pal_error(ret) : ret;
     }
 
     if (!(prot & PAL_PROT_WRITECOPY) && (prot & PAL_PROT_WRITE)) {
-        SGX_DBG(DBG_E,
-                "file_map does not currently support writable pass-through mappings on SGX.  You "
-                "may add the PAL_PROT_WRITECOPY (MAP_PRIVATE) flag to your file mapping to keep "
-                "the writes inside the enclave but they won't be reflected outside of the "
-                "enclave.\n");
+        log_warning(
+            "file_map does not currently support writable pass-through mappings on SGX. You "
+            "may add the PAL_PROT_WRITECOPY (MAP_PRIVATE) flag to your file mapping to keep "
+            "the writes inside the enclave but they won't be reflected outside of the "
+            "enclave.");
         return -PAL_ERROR_DENIED;
     }
 
@@ -445,13 +447,12 @@ static int file_map(PAL_HANDLE handle, void** addr, int prot, uint64_t offset, u
     if (!mem)
         return -PAL_ERROR_NOMEM;
 
-    if (stubs) {
+    if (chunk_hashes) {
         /* case of trusted file: already mmaped in umem, copy from there into enclave memory and
          * verify hashes along the way */
-        off_t end            = (offset + size > handle->file.total) ? handle->file.total
-                                                                    : offset + size;
-        off_t aligned_offset = ALIGN_DOWN(offset, TRUSTED_STUB_SIZE);
-        off_t aligned_end    = ALIGN_UP(end, TRUSTED_STUB_SIZE);
+        off_t end = MIN(offset + size, handle->file.total);
+        off_t aligned_offset = ALIGN_DOWN(offset, TRUSTED_CHUNK_SIZE);
+        off_t aligned_end    = ALIGN_UP(end, TRUSTED_CHUNK_SIZE);
         off_t total_size     = aligned_end - aligned_offset;
 
         if ((uint64_t)total_size > SIZE_MAX) {
@@ -460,51 +461,37 @@ static int file_map(PAL_HANDLE handle, void** addr, int prot, uint64_t offset, u
             goto out;
         }
 
-        ret = copy_and_verify_trusted_file(handle->file.realpath,
-                                           handle->file.umem + aligned_offset,
-                                           aligned_offset, aligned_end,
-                                           mem, offset, end - offset,
-                                           stubs, handle->file.total);
+        ret = copy_and_verify_trusted_file(handle->file.realpath, mem, handle->file.umem,
+                                           aligned_offset, aligned_end, offset, end, chunk_hashes,
+                                           handle->file.total);
         if (ret < 0) {
-            SGX_DBG(DBG_E, "file_map - copy & verify on trusted file returned %d\n", ret);
+            log_error("file_map - copy & verify on trusted file returned %d", ret);
             goto out;
         }
     } else {
         /* case of allowed file: simply read from underlying file descriptor into enclave memory */
-        off_t end            = offset + size;
-        off_t aligned_offset = ALLOC_ALIGN_DOWN(offset);
-        off_t aligned_end    = ALLOC_ALIGN_UP(end);
-        off_t total_size     = aligned_end - aligned_offset;
-
-        if ((uint64_t)total_size > SIZE_MAX) {
-            /* for compatibility with 32-bit systems */
-            ret = -PAL_ERROR_INVAL;
-            goto out;
-        }
-
-        ssize_t bytes_read = 0;
-        while (bytes_read < total_size) {
-            size_t read_size = total_size - bytes_read < MAX_READ_SIZE ?
-                               total_size - bytes_read : MAX_READ_SIZE;
+        size_t bytes_read = 0;
+        while (bytes_read < size) {
+            size_t read_size = MIN(size - bytes_read, MAX_READ_SIZE);
             ssize_t bytes = ocall_pread(handle->file.fd, mem + bytes_read, read_size,
-                                        aligned_offset + bytes_read);
+                                        offset + bytes_read);
             if (bytes > 0) {
                 bytes_read += bytes;
             } else if (bytes == 0) {
                 break; /* EOF */
-            } else if (ERRNO(bytes) == EINTR || ERRNO(bytes) == EAGAIN) {
+            } else if (bytes == -EINTR || bytes == -EAGAIN) {
                 continue;
             } else {
-                SGX_DBG(DBG_E, "file_map - ocall_pread on allowed file returned %ld\n", bytes);
-                ret = unix_to_pal_error(ERRNO(bytes));
+                log_warning("file_map - ocall_pread on allowed file returned %ld", bytes);
+                ret = unix_to_pal_error(bytes);
                 goto out;
             }
         }
 
-        if (total_size - bytes_read > 0) {
+        if (size - bytes_read > 0) {
             /* file ended before all requested memory was filled -- remaining memory has to be
              * zeroed */
-            memset(mem + bytes_read, 0, total_size - bytes_read);
+            memset(mem + bytes_read, 0, size - bytes_read);
         }
     }
 
@@ -523,8 +510,8 @@ static int64_t pf_file_setlength(struct protected_file* pf, PAL_HANDLE handle, u
 
     pf_status_t pfs = pf_set_size(pf->context, length);
     if (PF_FAILURE(pfs)) {
-        SGX_DBG(DBG_E, "pf_file_setlength(PF fd %d, %lu): pf_set_size returned %d\n", fd, length,
-                pfs);
+        log_warning("pf_file_setlength(PF fd %d, %lu): pf_set_size returned %s", fd, length,
+                    pf_strerror(pfs));
         return -PAL_ERROR_DENIED;
     }
     return length;
@@ -537,8 +524,8 @@ static int64_t file_setlength(PAL_HANDLE handle, uint64_t length) {
         return pf_file_setlength(pf, handle, length);
 
     int ret = ocall_ftruncate(handle->file.fd, length);
-    if (IS_ERR(ret))
-        return unix_to_pal_error(ERRNO(ret));
+    if (ret < 0)
+        return unix_to_pal_error(ret);
 
     handle->file.total = length;
     return (int64_t)length;
@@ -551,12 +538,12 @@ static int file_flush(PAL_HANDLE handle) {
     if (pf) {
         int ret = flush_pf_maps(pf, /*buffer=*/NULL, /*remove=*/false);
         if (ret < 0) {
-            SGX_DBG(DBG_E, "file_flush(PF fd %d): flush_pf_maps returned %d\n", fd, ret);
+            log_warning("file_flush(PF fd %d): flush_pf_maps returned %s", fd, pal_strerror(ret));
             return ret;
         }
         pf_status_t pfs = pf_flush(pf->context);
         if (PF_FAILURE(pfs)) {
-            SGX_DBG(DBG_E, "file_flush(PF fd %d): pf_flush returned %d\n", fd, pfs);
+            log_warning("file_flush(PF fd %d): pf_flush returned %s", fd, pf_strerror(pfs));
             return -PAL_ERROR_DENIED;
         }
     } else {
@@ -597,8 +584,8 @@ static int pf_file_attrquery(struct protected_file* pf, int fd_from_attrquery, c
     pf = load_protected_file(path, &fd_from_attrquery, real_size, PF_FILE_MODE_READ,
                              /*create=*/false, pf);
     if (!pf) {
-        SGX_DBG(DBG_E, "pf_file_attrquery: load_protected_file(%s, %d) failed\n", path,
-                fd_from_attrquery);
+        log_warning("pf_file_attrquery: load_protected_file(%s, %d) failed", path,
+                    fd_from_attrquery);
         /* The call above will fail for PFs that were tampered with or have a wrong path.
          * glibc kills the process if this fails during directory enumeration, but that
          * should be fine given the scenario.
@@ -633,25 +620,30 @@ static int file_attrquery(const char* type, const char* uri, PAL_STREAM_ATTR* at
     /* open the file with O_NONBLOCK to avoid blocking the current thread if it is actually a FIFO
      * pipe; O_NONBLOCK will be reset below if it is a regular file */
     int fd = ocall_open(uri, O_NONBLOCK, 0);
-    if (IS_ERR(fd))
-        return unix_to_pal_error(ERRNO(fd));
+    if (fd < 0)
+        return unix_to_pal_error(fd);
 
+    char* path = NULL;
     struct stat stat_buf;
     int ret = ocall_fstat(fd, &stat_buf);
 
     /* if it failed, return the right error code */
-    if (IS_ERR(ret)) {
-        ret = unix_to_pal_error(ERRNO(ret));
+    if (ret < 0) {
+        ret = unix_to_pal_error(ret);
         goto out;
     }
 
     file_attrcopy(attr, &stat_buf);
 
-    char path[URI_MAX];
     size_t len = URI_MAX;
+    path = malloc(len);
+    if (!path) {
+        ret = -PAL_ERROR_NOMEM;
+        goto out;
+    }
     ret = get_norm_path(uri, path, &len);
     if (ret < 0) {
-        SGX_DBG(DBG_E, "Could not normalize path (%s): %s\n", uri, pal_strerror(-ret));
+        log_warning("Could not normalize path (%s): %s", uri, pal_strerror(ret));
         goto out;
     }
 
@@ -667,8 +659,8 @@ static int file_attrquery(const char* type, const char* uri, PAL_STREAM_ATTR* at
         /* reset O_NONBLOCK because pf_file_attrquery() may issue reads which don't expect
          * non-blocking mode */
         ret = ocall_fsetnonblock(fd, 0);
-        if (IS_ERR(ret)) {
-            ret = unix_to_pal_error(ERRNO(ret));
+        if (ret < 0) {
+            ret = unix_to_pal_error(ret);
             goto out;
         }
 
@@ -678,6 +670,7 @@ static int file_attrquery(const char* type, const char* uri, PAL_STREAM_ATTR* at
     }
 
 out:
+    free(path);
     ocall_close(fd);
     return ret;
 }
@@ -688,8 +681,8 @@ static int file_attrquerybyhdl(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
     struct stat stat_buf;
 
     int ret = ocall_fstat(fd, &stat_buf);
-    if (IS_ERR(ret))
-        return unix_to_pal_error(ERRNO(ret));
+    if (ret < 0)
+        return unix_to_pal_error(ret);
 
     file_attrcopy(attr, &stat_buf);
 
@@ -714,8 +707,8 @@ static int file_attrquerybyhdl(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
 static int file_attrsetbyhdl(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) {
     int fd  = handle->file.fd;
     int ret = ocall_fchmod(fd, attr->share_flags | PERM_rw_______);
-    if (IS_ERR(ret))
-        return unix_to_pal_error(ERRNO(ret));
+    if (ret < 0)
+        return unix_to_pal_error(ret);
 
     return 0;
 }
@@ -729,9 +722,9 @@ static int file_rename(PAL_HANDLE handle, const char* type, const char* uri) {
         return -PAL_ERROR_NOMEM;
 
     int ret = ocall_rename(handle->file.realpath, uri);
-    if (IS_ERR(ret)) {
+    if (ret < 0) {
         free(tmp);
-        return unix_to_pal_error(ERRNO(ret));
+        return unix_to_pal_error(ret);
     }
 
     /* initial realpath is part of handle object and will be freed with it */
@@ -747,7 +740,7 @@ static int file_getname(PAL_HANDLE handle, char* buffer, size_t count) {
     if (!handle->file.realpath)
         return 0;
 
-    int len   = strlen(handle->file.realpath);
+    size_t len = strlen(handle->file.realpath);
     char* tmp = strcpy_static(buffer, URI_PREFIX_FILE, count);
 
     if (!tmp || buffer + count < tmp + len + 1)
@@ -788,29 +781,31 @@ static int dir_open(PAL_HANDLE* handle, const char* type, const char* uri, int a
     if (!WITHIN_MASK(access, PAL_ACCESS_MASK))
         return -PAL_ERROR_INVAL;
 
-    int ret;
-
     if (create & PAL_CREATE_TRY || create & PAL_CREATE_ALWAYS) {
-        ret = ocall_mkdir(uri, share);
+        int ret = ocall_mkdir(uri, share);
 
-        if (IS_ERR(ret)) {
-            if (ERRNO(ret) == EEXIST && create & PAL_CREATE_ALWAYS)
+        if (ret < 0) {
+            if (ret == -EEXIST && create & PAL_CREATE_ALWAYS)
                 return -PAL_ERROR_STREAMEXIST;
-            if (ERRNO(ret) != EEXIST)
-                return unix_to_pal_error(ERRNO(ret));
-            assert(ERRNO(ret) == EEXIST && create & PAL_CREATE_TRY);
+            if (ret != -EEXIST)
+                return unix_to_pal_error(ret);
+            assert(ret == -EEXIST && create & PAL_CREATE_TRY);
         }
     }
 
-    ret = ocall_open(uri, O_DIRECTORY | PAL_OPTION_TO_LINUX_OPEN(options), 0);
-    if (IS_ERR(ret))
-        return unix_to_pal_error(ERRNO(ret));
+    int fd = ocall_open(uri, O_DIRECTORY | PAL_OPTION_TO_LINUX_OPEN(options), 0);
+    if (fd < 0)
+        return unix_to_pal_error(fd);
 
-    int len        = strlen(uri);
+    size_t len = strlen(uri);
     PAL_HANDLE hdl = malloc(HANDLE_SIZE(dir) + len + 1);
+    if (!hdl) {
+        ocall_close(fd);
+        return -PAL_ERROR_NOMEM;
+    }
     SET_HANDLE_TYPE(hdl, dir);
     HANDLE_HDR(hdl)->flags |= RFD(0);
-    hdl->dir.fd = ret;
+    hdl->dir.fd = fd;
     char* path  = (void*)hdl + HANDLE_SIZE(dir);
     memcpy(path, uri, len + 1);
     hdl->dir.realpath    = (PAL_STR)path;
@@ -838,7 +833,7 @@ static int64_t dir_read(PAL_HANDLE handle, uint64_t offset, size_t count, void* 
     }
 
     if (handle->dir.endofstream == PAL_TRUE) {
-        return -PAL_ERROR_ENDOFSTREAM;
+        return 0;
     }
 
     while (1) {
@@ -882,7 +877,7 @@ static int64_t dir_read(PAL_HANDLE handle, uint64_t offset, size_t count, void* 
         }
 
         int size = ocall_getdents(handle->dir.fd, handle->dir.buf, DIRBUF_SIZE);
-        if (IS_ERR(size)) {
+        if (size < 0) {
             /*
              * If something was written just return that and pretend no error
              * was seen - it will be caught next time.
@@ -890,7 +885,7 @@ static int64_t dir_read(PAL_HANDLE handle, uint64_t offset, size_t count, void* 
             if (bytes_written) {
                 return bytes_written;
             }
-            return unix_to_pal_error(ERRNO(size));
+            return unix_to_pal_error(size);
         }
 
         if (!size) {
@@ -903,7 +898,7 @@ static int64_t dir_read(PAL_HANDLE handle, uint64_t offset, size_t count, void* 
     }
 
 out:
-    return (int64_t)bytes_written ?: -PAL_ERROR_ENDOFSTREAM;
+    return (int64_t)bytes_written;
 }
 
 /* 'close' operation of directory streams */
@@ -934,7 +929,7 @@ static int dir_delete(PAL_HANDLE handle, int access) {
         return ret;
 
     ret = ocall_delete(handle->dir.realpath);
-    return IS_ERR(ret) ? unix_to_pal_error(ERRNO(ret)) : ret;
+    return ret < 0 ? unix_to_pal_error(ret) : ret;
 }
 
 static int dir_rename(PAL_HANDLE handle, const char* type, const char* uri) {
@@ -946,9 +941,9 @@ static int dir_rename(PAL_HANDLE handle, const char* type, const char* uri) {
         return -PAL_ERROR_NOMEM;
 
     int ret = ocall_rename(handle->dir.realpath, uri);
-    if (IS_ERR(ret)) {
+    if (ret < 0) {
         free(tmp);
-        return unix_to_pal_error(ERRNO(ret));
+        return unix_to_pal_error(ret);
     }
 
     /* initial realpath is part of handle object and will be freed with it */

@@ -1,11 +1,16 @@
 #ifndef PAL_LINUX_DEFS_H
 #define PAL_LINUX_DEFS_H
 
+#define SSA_FRAME_NUM  2 /* one frame for normal context, one frame for signal preparation */
+
 #define THREAD_STACK_SIZE (PRESET_PAGESIZE * 512) /* 2MB untrusted stack */
 #define ALT_STACK_SIZE    (PRESET_PAGESIZE * 16)  /* 64KB untrusted signal stack */
 #define RPC_STACK_SIZE    (PRESET_PAGESIZE * 2)
 
-#define SSAFRAMENUM            2
+/* one SSA frame stores all GPRs + enabled XSAVE area + SGX.SSA.MISC region + padding; we
+ * overapproximate to 4 pages which is enough for even feature-rich Intel CPUs from year 2021 */
+#define SSA_FRAME_SIZE (PRESET_PAGESIZE * 4)
+
 #define ENCLAVE_STACK_SIZE     (PRESET_PAGESIZE * 64)
 #define ENCLAVE_SIG_STACK_SIZE (PRESET_PAGESIZE * 16)
 
@@ -20,11 +25,9 @@
 #define DEBUG_ECALL 0
 #define DEBUG_OCALL 0
 
-#define TRUSTED_STUB_SIZE (PRESET_PAGESIZE * 4UL)
+#define TRUSTED_CHUNK_SIZE (PRESET_PAGESIZE * 4UL)
 
 #define MAX_ARGS_SIZE 10000000
 #define MAX_ENV_SIZE  10000000
-
-#define RED_ZONE_SIZE 128
 
 #endif /* PAL_LINUX_DEFS_H */

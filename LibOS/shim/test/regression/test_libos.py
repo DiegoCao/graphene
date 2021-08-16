@@ -102,9 +102,11 @@ class TC_01_Bootstrap(RegressionTestCase):
         self.assertIn('Local Address in Executable: 0x', stdout)
         self.assertIn('argv[0] = bootstrap_pie', stdout)
 
+    @unittest.skipUnless(ON_X86, "x86-specific")
     def test_110_basic_bootstrapping_cpp(self):
         stdout, _ = self.run_binary(['bootstrap_cpp'])
         self.assertIn('User Program Started', stdout)
+        self.assertIn('Exception \'test runtime error\' caught', stdout)
 
     def test_200_exec(self):
         stdout, _ = self.run_binary(['exec'])
@@ -141,6 +143,11 @@ class TC_01_Bootstrap(RegressionTestCase):
         self.assertIn('Set up handler for SIGCHLD', stdout)
         self.assertIn('child exited with status: 0', stdout)
         self.assertIn('test completed successfully', stdout)
+
+    def test_205_double_fork(self):
+        stdout, stderr = self.run_binary(['double_fork'])
+        self.assertIn('TEST OK', stdout)
+        self.assertNotIn('grandchild', stderr)
 
     def test_210_exec_invalid_args(self):
         stdout, _ = self.run_binary(['exec_invalid_args'])
@@ -203,14 +210,14 @@ class TC_01_Bootstrap(RegressionTestCase):
         stdout, _ = self.run_binary(['multi_pthread'])
 
         # Multiple thread creation
-        self.assertIn('128 Threads Created', stdout)
+        self.assertIn('256 Threads Created', stdout)
 
     @unittest.skipUnless(HAS_SGX, 'This test is only meaningful on SGX PAL')
     def test_601_multi_pthread_exitless(self):
         stdout, _ = self.run_binary(['multi_pthread_exitless'], timeout=60)
 
         # Multiple thread creation
-        self.assertIn('128 Threads Created', stdout)
+        self.assertIn('256 Threads Created', stdout)
 
     def test_602_fp_multithread(self):
         stdout, _ = self.run_binary(['fp_multithread'])
@@ -224,8 +231,8 @@ class TC_01_Bootstrap(RegressionTestCase):
         self.assertIn('FE_TOWARDZERO parent: 42.5 = 42.0, -42.5 = -42.0', stdout)
 
     def test_700_debug_log_inline(self):
-        stdout, _ = self.run_binary(['debug_log_inline'])
-        self._verify_debug_log(stdout)
+        _, stderr = self.run_binary(['debug_log_inline'])
+        self._verify_debug_log(stderr)
 
     def test_701_debug_log_file(self):
         log_path = 'tmp/debug_log_file.log'
@@ -261,29 +268,36 @@ class TC_02_OpenMP(RegressionTestCase):
     'only relevant to SGX.')
 class TC_03_FileCheckPolicy(RegressionTestCase):
     def test_000_strict_success(self):
-        stdout, _ = self.run_binary(['file_check_policy_strict', 'trusted_testfile'])
-
+        stdout, _ = self.run_binary(['file_check_policy_strict', 'read', 'trusted_testfile'])
         self.assertIn('file_check_policy succeeded', stdout)
 
     def test_001_strict_fail(self):
         with self.expect_returncode(2):
-            self.run_binary(['file_check_policy_strict', 'unknown_testfile'])
+            self.run_binary(['file_check_policy_strict', 'read', 'unknown_testfile'])
 
-    def test_002_allow_all_but_log_success(self):
-        stdout, stderr = self.run_binary(['file_check_policy_allow_all_but_log',
+    def test_002_strict_fail_create(self):
+        with self.expect_returncode(2):
+            # this tests a previous bug in Graphene that allowed creating unknown files
+            self.run_binary(['file_check_policy_strict', 'append', 'unknown_testfile'])
+
+    def test_003_allow_all_but_log_unknown(self):
+        stdout, stderr = self.run_binary(['file_check_policy_allow_all_but_log', 'read',
                                           'unknown_testfile'])
-
         self.assertIn('Allowing access to an unknown file due to file_check_policy settings: '
                       'file:unknown_testfile', stderr)
         self.assertIn('file_check_policy succeeded', stdout)
 
-    def test_003_allow_all_but_log_fail(self):
-        stdout, stderr = self.run_binary(['file_check_policy_allow_all_but_log',
+    def test_004_allow_all_but_log_trusted(self):
+        stdout, stderr = self.run_binary(['file_check_policy_allow_all_but_log', 'read',
                                           'trusted_testfile'])
-
         self.assertNotIn('Allowing access to an unknown file due to file_check_policy settings: '
                          'file:trusted_testfile', stderr)
         self.assertIn('file_check_policy succeeded', stdout)
+
+    def test_005_allow_all_but_log_trusted_create_fail(self):
+        with self.expect_returncode(2):
+            # this fails because modifying trusted files is prohibited
+            self.run_binary(['file_check_policy_allow_all_but_log', 'append', 'trusted_testfile'])
 
 @unittest.skipUnless(HAS_SGX,
     'These tests are only meaningful on SGX PAL because only SGX supports attestation.')
@@ -347,6 +361,12 @@ class TC_30_Syscall(RegressionTestCase):
         self.assertIn('getdents64: file2 [0x8]', stdout)
         self.assertIn('getdents64: dir3 [0x4]', stdout)
 
+        # Directory listing across fork (we don't guarantee the exact names, just that there be at
+        # least one of each)
+        self.assertIn('getdents64 before fork:', stdout)
+        self.assertIn('parent getdents64:', stdout)
+        self.assertIn('child getdents64:', stdout)
+
     def test_021_getdents_large_dir(self):
         if os.path.exists("tmp/large_dir"):
             shutil.rmtree("tmp/large_dir")
@@ -354,7 +374,37 @@ class TC_30_Syscall(RegressionTestCase):
 
         self.assertIn('Success!', stdout)
 
-    def test_022_host_root_fs(self):
+    def test_022_getdents_lseek(self):
+        if os.path.exists("root"):
+            shutil.rmtree("root")
+
+        stdout, _ = self.run_binary(['getdents_lseek'])
+
+        # First listing
+        self.assertIn('getdents64 1: .', stdout)
+        self.assertIn('getdents64 1: ..', stdout)
+        self.assertIn('getdents64 1: file0', stdout)
+        self.assertIn('getdents64 1: file1', stdout)
+        self.assertIn('getdents64 1: file2', stdout)
+        self.assertIn('getdents64 1: file3', stdout)
+        self.assertIn('getdents64 1: file4', stdout)
+        self.assertNotIn('getdents64 1: file5', stdout)
+
+        # Second listing, after modifying directory and seeking back to 0
+        self.assertIn('getdents64 2: .', stdout)
+        self.assertIn('getdents64 2: ..', stdout)
+        self.assertNotIn('getdents64 2: file0', stdout)
+        self.assertIn('getdents64 2: file1', stdout)
+        self.assertIn('getdents64 2: file2', stdout)
+        self.assertIn('getdents64 2: file3', stdout)
+        self.assertIn('getdents64 2: file4', stdout)
+        self.assertIn('getdents64 2: file5', stdout)
+
+    def test_023_readdir(self):
+        stdout, _ = self.run_binary(['readdir'])
+        self.assertIn('test completed successfully', stdout)
+
+    def test_024_host_root_fs(self):
         stdout, _ = self.run_binary(['host_root_fs'])
         self.assertIn('Test was successful', stdout)
 
@@ -366,13 +416,18 @@ class TC_30_Syscall(RegressionTestCase):
         # fopen corner cases
         self.assertIn('Successfully read from file: Hello World', stdout)
 
-    def test_031_readdir(self):
-        stdout, _ = self.run_binary(['readdir'])
-        self.assertIn('test completed successfully', stdout)
-
-    def test_032_file_size(self):
+    def test_031_file_size(self):
         stdout, _ = self.run_binary(['file_size'])
         self.assertIn('test completed successfully', stdout)
+
+    def test_032_large_file(self):
+        try:
+            stdout, _ = self.run_binary(['large_file'])
+        finally:
+            # This test generates a 4 GB file, don't leave it in FS.
+            os.remove('tmp/large_file')
+
+        self.assertIn('TEST OK', stdout)
 
     def test_040_futex_bitset(self):
         stdout, _ = self.run_binary(['futex_bitset'])
@@ -515,6 +570,10 @@ class TC_30_Syscall(RegressionTestCase):
         stdout, _ = self.run_binary(['signal_multithread'])
         self.assertIn('TEST OK', stdout)
 
+    def test_095_kill_all(self):
+        stdout, _ = self.run_binary(['kill_all'])
+        self.assertIn('TEST OK', stdout)
+
     def test_100_get_set_groups(self):
         stdout, _ = self.run_binary(['groups'])
         self.assertIn('child OK', stdout)
@@ -528,49 +587,77 @@ class TC_30_Syscall(RegressionTestCase):
         stdout, _ = self.run_binary(['pthread_set_get_affinity', '1000'])
         self.assertIn('TEST OK', stdout)
 
-@unittest.skipUnless(HAS_SGX,
-    'This test is only meaningful on SGX PAL because only SGX catches raw '
-    'syscalls and redirects to Graphene\'s LibOS. If we will add seccomp to '
-    'Linux PAL, then we should allow this test on Linux PAL as well.')
-class TC_31_SyscallSGX(RegressionTestCase):
+    def test_103_gettimeofday(self):
+        stdout, _ = self.run_binary(['gettimeofday'])
+        self.assertIn('TEST OK', stdout)
+
+    def test_110_fcntl_lock(self):
+        try:
+            stdout, _ = self.run_binary(['fcntl_lock'])
+        finally:
+            if os.path.exists('tmp/lock_file'):
+                os.remove('tmp/lock_file')
+        self.assertIn('TEST OK', stdout)
+
+class TC_31_Syscall(RegressionTestCase):
+    @unittest.skipUnless(HAS_SGX,
+        'This test is only meaningful on SGX PAL because only SGX catches raw '
+        'syscalls and redirects to Graphene\'s LibOS. If we will add seccomp to '
+        'Linux PAL, then we should allow this test on Linux PAL as well.')
     def test_000_syscall_redirect(self):
         stdout, _ = self.run_binary(['syscall'])
 
         # Syscall Instruction Redirection
         self.assertIn('Hello world', stdout)
 
+    def test_010_syscall_restart(self):
+        stdout, _ = self.run_binary(['syscall_restart'])
+        self.assertIn('Got: R', stdout)
+        self.assertIn('TEST 1 OK', stdout)
+        self.assertIn('Handling signal 15', stdout)
+        self.assertIn('Got: P', stdout)
+        self.assertIn('TEST 2 OK', stdout)
+
 class TC_40_FileSystem(RegressionTestCase):
     def test_000_proc(self):
-        (DT_DIR, DT_REG) = (4, 8,)
         stdout, _ = self.run_binary(['proc_common'])
-        self.assertIn('/proc/1/..', stdout)
-        self.assertIn('/proc/1/cwd', stdout)
-        self.assertIn('/proc/1/exe', stdout)
-        self.assertIn('/proc/1/root', stdout)
-        self.assertIn('/proc/1/fd', stdout)
-        self.assertIn('/proc/1/maps', stdout)
-        self.assertIn('/proc/self/..', stdout)
-        self.assertIn('/proc/self/cwd', stdout)
-        self.assertIn('/proc/self/exe', stdout)
-        self.assertIn('/proc/self/root', stdout)
-        self.assertIn('/proc/self/fd', stdout)
-        self.assertIn('/proc/self/maps', stdout)
-        self.assertIn('/proc/., type: {0}'.format(DT_DIR), stdout)
-        self.assertIn('/proc/1, type: {0}'.format(DT_DIR), stdout)
-        self.assertIn('/proc/2, type: {0}'.format(DT_DIR), stdout)
-        self.assertIn('/proc/3, type: {0}'.format(DT_DIR), stdout)
-        self.assertIn('/proc/4, type: {0}'.format(DT_DIR), stdout)
-        self.assertIn('/proc/self, type: {0}'.format(DT_DIR), stdout)
-        self.assertIn('/proc/meminfo, type: {0}'.format(DT_REG), stdout)
-        self.assertIn('/proc/cpuinfo, type: {0}'.format(DT_REG), stdout)
-        self.assertIn('symlink /proc/self/exec resolves to /proc_common', stdout)
-        self.assertIn('/proc/2/cwd/proc_common.c', stdout)
-        self.assertIn('/lib/libpthread.so', stdout)
-        self.assertIn('stack', stdout)
-        self.assertIn('vendor_id', stdout)
+        lines = stdout.splitlines()
 
-    def test_001_dev(self):
-        stdout, _ = self.run_binary(['dev'])
+        self.assertIn('/proc/meminfo: file', lines)
+        self.assertIn('/proc/cpuinfo: file', lines)
+
+        # /proc/self, /proc/[pid]
+        self.assertIn('/proc/self: link: 2', lines)
+        self.assertIn('/proc/2: directory', lines)
+        self.assertIn('/proc/2/cwd: link: /', lines)
+        self.assertIn('/proc/2/exe: link: /proc_common', lines)
+        self.assertIn('/proc/2/root: link: /', lines)
+        self.assertIn('/proc/2/maps: file', lines)
+
+        # /proc/[pid]/fd
+        self.assertIn('/proc/2/fd/0: link: /dev/tty', lines)
+        self.assertIn('/proc/2/fd/1: link: /dev/tty', lines)
+        self.assertIn('/proc/2/fd/2: link: /dev/tty', lines)
+        self.assertIn('/proc/2/fd/3: link: pipe:[?]', lines)
+        self.assertIn('/proc/2/fd/4: link: pipe:[?]', lines)
+
+        # /proc/[pid]/task/[tid]
+        self.assertIn('/proc/2/task/2: directory', lines)
+        self.assertIn('/proc/2/task/33: directory', lines)
+        self.assertIn('/proc/2/task/33/cwd: link: /', lines)
+        self.assertIn('/proc/2/task/33/exe: link: /proc_common', lines)
+        self.assertIn('/proc/2/task/33/root: link: /', lines)
+        self.assertIn('/proc/2/task/33/fd/0: link: /dev/tty', lines)
+        self.assertIn('/proc/2/task/33/fd/1: link: /dev/tty', lines)
+        self.assertIn('/proc/2/task/33/fd/2: link: /dev/tty', lines)
+
+        # /proc/[ipc-pid]/*
+        self.assertIn('/proc/1/cwd: link: /', lines)
+        self.assertIn('/proc/1/exe: link: /proc_common', lines)
+        self.assertIn('/proc/1/root: link: /', lines)
+
+    def test_001_devfs(self):
+        stdout, _ = self.run_binary(['devfs'])
         self.assertIn('/dev/.', stdout)
         self.assertIn('/dev/null', stdout)
         self.assertIn('/dev/zero', stdout)
@@ -580,9 +667,10 @@ class TC_40_FileSystem(RegressionTestCase):
         self.assertIn('/dev/stdout', stdout)
         self.assertIn('/dev/stderr', stdout)
         self.assertIn('Four bytes from /dev/urandom', stdout)
+        self.assertIn('TEST OK', stdout)
 
-    def test_002_device(self):
-        stdout, _ = self.run_binary(['device'])
+    def test_002_device_passthrough(self):
+        stdout, _ = self.run_binary(['device_passthrough'])
         self.assertIn('TEST OK', stdout)
 
     def test_010_path(self):
@@ -599,9 +687,59 @@ class TC_40_FileSystem(RegressionTestCase):
         stdout, _ = self.run_binary(['fdleak'], timeout=10)
         self.assertIn("Test succeeded.", stdout)
 
-    def test_040_str_close_leak(self):
-        stdout, _ = self.run_binary(['str_close_leak'], timeout=60)
-        self.assertIn("Success", stdout)
+    def get_num_cache_levels(self):
+        cpu0 = '/sys/devices/system/cpu/cpu0/'
+        self.assertTrue(os.path.exists(f'{cpu0}/cache/'))
+
+        n = 0
+        while os.path.exists(f'{cpu0}/cache/index{n}'):
+            n += 1
+
+        self.assertGreater(n, 0, "no information about CPU cache found")
+        return n
+
+    def test_040_sysfs(self):
+        num_cpus = os.cpu_count()
+        num_cache_levels = self.get_num_cache_levels()
+
+        stdout, _ = self.run_binary(['sysfs_common'])
+        lines = stdout.splitlines()
+
+        self.assertIn('/sys/devices/system/cpu: directory', lines)
+        for i in range(num_cpus):
+            cpu = f'/sys/devices/system/cpu/cpu{i}'
+            self.assertIn(f'{cpu}: directory', lines)
+            if i == 0:
+                self.assertNotIn(f'{cpu}/online: file', lines)
+            else:
+                self.assertIn(f'{cpu}/online: file', lines)
+
+            self.assertIn(f'{cpu}/topology/core_id: file', lines)
+            self.assertIn(f'{cpu}/topology/physical_package_id: file', lines)
+            self.assertIn(f'{cpu}/topology/core_siblings: file', lines)
+            self.assertIn(f'{cpu}/topology/thread_siblings: file', lines)
+
+            for j in range(num_cache_levels):
+                cache = f'{cpu}/cache/index{j}'
+                self.assertIn(f'{cache}: directory', lines)
+                self.assertIn(f'{cache}/shared_cpu_map: file', lines)
+                self.assertIn(f'{cache}/level: file', lines)
+                self.assertIn(f'{cache}/type: file', lines)
+                self.assertIn(f'{cache}/size: file', lines)
+                self.assertIn(f'{cache}/coherency_line_size: file', lines)
+                self.assertIn(f'{cache}/physical_line_partition: file', lines)
+
+        self.assertIn('/sys/devices/system/node: directory', lines)
+        num_nodes = len([line for line in lines
+                         if re.match(r'/sys/devices/system/node/node[0-9]+:', line)])
+        self.assertGreater(num_nodes, 0)
+        for i in range(num_nodes):
+            node = f'/sys/devices/system/node/node{i}'
+            self.assertIn(f'{node}: directory', lines)
+            self.assertIn(f'{node}/cpumap: file', lines)
+            self.assertIn(f'{node}/distance: file', lines)
+            self.assertIn(f'{node}/hugepages/hugepages-2048kB/nr_hugepages: file', lines)
+            self.assertIn(f'{node}/hugepages/hugepages-1048576kB/nr_hugepages: file', lines)
 
 
 class TC_50_GDB(RegressionTestCase):
@@ -618,7 +756,7 @@ class TC_50_GDB(RegressionTestCase):
         # pylint: disable=fixme
         #
         # To run this test manually, use:
-        # GDB=1 GDB_SCRIPT=debug.gdb ./pal_loader debug
+        # GDB=1 GDB_SCRIPT=debug.gdb graphene-{direct|sgx} debug
         #
         # TODO: strengthen this test after SGX includes enclave entry.
         #
@@ -651,7 +789,7 @@ class TC_50_GDB(RegressionTestCase):
     @unittest.skipUnless(ON_X86, 'x86-specific')
     def test_010_regs_x86_64(self):
         # To run this test manually, use:
-        # GDB=1 GDB_SCRIPT=debug_regs-x86_64.gdb ./pal_loader debug_regs-x86_64
+        # GDB=1 GDB_SCRIPT=debug_regs-x86_64.gdb graphene-{direct|sgx} debug_regs-x86_64
 
         stdout, _ = self.run_gdb(['debug_regs-x86_64'], 'debug_regs-x86_64.gdb')
 
@@ -681,10 +819,17 @@ class TC_80_Socket(RegressionTestCase):
         # epoll_wait timeout
         self.assertIn('epoll_wait test passed', stdout)
 
+    def test_011_epoll_epollet(self):
+        stdout, _ = self.run_binary(['epoll_epollet', 'EMULATE_GRAPHENE_BUG'])
+        self.assertIn('TEST OK', stdout)
+
     def test_020_poll(self):
-        stdout, _ = self.run_binary(['poll'])
-        self.assertIn('poll(POLLOUT) returned 1 file descriptors', stdout)
-        self.assertIn('poll(POLLIN) returned 1 file descriptors', stdout)
+        try:
+            stdout, _ = self.run_binary(['poll'])
+        finally:
+            if os.path.exists("tmp/host_file"):
+                os.remove("tmp/host_file")
+        self.assertIn('TEST OK', stdout)
 
     def test_021_poll_many_types(self):
         stdout, _ = self.run_binary(['poll_many_types'])
@@ -729,8 +874,13 @@ class TC_80_Socket(RegressionTestCase):
         self.assertIn('TEST OK', stdout)
 
     def test_095_mkfifo(self):
-        stdout, _ = self.run_binary(['mkfifo'], timeout=60)
+        try:
+            stdout, _ = self.run_binary(['mkfifo'], timeout=60)
+        finally:
+            if os.path.exists('tmp/fifo'):
+                os.remove('tmp/fifo')
         self.assertIn('read on FIFO: Hello from write end of FIFO!', stdout)
+        self.assertIn('[parent] TEST OK', stdout)
 
     def test_100_socket_unix(self):
         stdout, _ = self.run_binary(['unix'])
@@ -747,20 +897,21 @@ class TC_80_Socket(RegressionTestCase):
 
     def test_200_socket_udp(self):
         stdout, _ = self.run_binary(['udp'], timeout=50)
-        self.assertIn('Data: This is packet 0', stdout)
-        self.assertIn('Data: This is packet 1', stdout)
-        self.assertIn('Data: This is packet 2', stdout)
-        self.assertIn('Data: This is packet 3', stdout)
-        self.assertIn('Data: This is packet 4', stdout)
-        self.assertIn('Data: This is packet 5', stdout)
-        self.assertIn('Data: This is packet 6', stdout)
-        self.assertIn('Data: This is packet 7', stdout)
-        self.assertIn('Data: This is packet 8', stdout)
-        self.assertIn('Data: This is packet 9', stdout)
+        self.assertIn('This is packet 0', stdout)
+        self.assertIn('This is packet 1', stdout)
+        self.assertIn('This is packet 2', stdout)
+        self.assertIn('This is packet 3', stdout)
+        self.assertIn('This is packet 4', stdout)
+        self.assertIn('This is packet 5', stdout)
+        self.assertIn('This is packet 6', stdout)
+        self.assertIn('This is packet 7', stdout)
+        self.assertIn('This is packet 8', stdout)
+        self.assertIn('This is packet 9', stdout)
 
     def test_300_socket_tcp_msg_peek(self):
         stdout, _ = self.run_binary(['tcp_msg_peek'], timeout=50)
         self.assertIn('[client] receiving with MSG_PEEK: Hello from server!', stdout)
+        self.assertIn('[client] receiving with MSG_PEEK again: Hello from server!', stdout)
         self.assertIn('[client] receiving without MSG_PEEK: Hello from server!', stdout)
         self.assertIn('[client] checking how many bytes are left unread: 0', stdout)
         self.assertIn('[client] done', stdout)

@@ -15,8 +15,10 @@ These tests perform common FS operations in various ways to exercise the Graphen
 How to execute
 --------------
 
-Run `make test` (tests both regular files and protected files).
-Run `make fs-test` to only test regular files.
+- `make test` to run all tests
+- `make fs-test` to test regular files
+- `make tmpfs-test` to test tmpfs (temporary in-memory) files
+- `make pf-test` to test protected files (SGX only)
 
 (SGX only) Protected file tests assume that the SGX tools were installed in this directory:
 

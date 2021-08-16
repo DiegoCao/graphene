@@ -1,16 +1,11 @@
-#include <string.h>
-
 #include "pal.h"
-#include "pal_debug.h"
+#include "pal_regression.h"
 
 int main(int argc, char** argv, char** envp) {
     /* check if the program is loaded */
     pal_printf("User Program Started\n");
 
     /* check control block */
-    /* check executable name */
-    pal_printf("Loaded Executable: %s\n", pal_control.executable);
-
     /* check arguments */
     pal_printf("# of Arguments: %d\n", argc);
     for (int i = 0; i < argc; i++) {
@@ -25,7 +20,11 @@ int main(int argc, char** argv, char** envp) {
 
     /* test debug stream */
     char* msg = "Written to Debug Stream\n";
-    DkDebugLog(msg, strlen(msg));
+    int ret = DkDebugLog(msg, strlen(msg));
+    if (ret < 0) {
+        pal_printf("Failed to write the debug message.\n");
+        return 1;
+    }
 
     /* Allocation Alignment */
     pal_printf("Allocation Alignment: %ld\n", pal_control.alloc_align);

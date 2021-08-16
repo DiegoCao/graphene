@@ -1,6 +1,6 @@
 /*
  *  SSL client demonstration program (with RA-TLS).
- *  This program is heavily based on an mbedTLS 2.21.0 example ssl_client.c
+ *  This program is heavily based on an mbedTLS 2.26.0 example ssl_client1.c
  *  but uses RA-TLS flows (SGX Remote Attestation flows) if RA-TLS library
  *  is required by user.
  *
@@ -173,9 +173,8 @@ int main(int argc, char** argv) {
     } else if (!strcmp(argv[1], "dcap")) {
         if (in_sgx) {
             /*
-             * RA-TLS verification with DCAP inside SGX enclave uses dummies
-             * instead of real functions from libsgx_urts.so, thus we don't
-             * need to load this helper library.
+             * RA-TLS verification with DCAP inside SGX enclave uses dummies instead of real
+             * functions from libsgx_urts.so, thus we don't need to load this helper library.
              */
             ra_tls_verify_lib = dlopen("libra_tls_verify_dcap_graphene.so", RTLD_LAZY);
             if (!ra_tls_verify_lib) {

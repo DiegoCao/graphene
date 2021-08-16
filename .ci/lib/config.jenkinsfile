@@ -1,12 +1,10 @@
-env.DOCKER_ARGS_COMMON = '''
-    --device=/dev/kmsg:/dev/kmsg
-'''
-env.DOCKER_ARGS_SGX = '''
-    --volume=/lib/modules:/lib/modules:ro
-    --volume=/usr/src:/usr/src:ro
-    --volume=/var/run/aesmd/aesm.socket:/var/run/aesmd/aesm.socket
-    --device=/dev/gsgx:/dev/gsgx
-    --device=/dev/isgx:/dev/isgx
-'''
 env.WERROR = '1'
 env.MAKEOPTS = '-j8'
+
+python_platlib = sh(returnStdout: true, script: 'python3 Scripts/get-python-platlib.py "$PREFIX"')
+env.PYTHONPATH = python_platlib + ':' + env.WORKSPACE + '/Scripts'
+
+env.RA_TLS_ALLOW_OUTDATED_TCB_INSECURE = '1'
+
+env.LC_ALL = 'C.UTF-8'
+env.LANG = env.LC_ALL

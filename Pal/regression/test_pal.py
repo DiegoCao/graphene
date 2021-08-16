@@ -36,24 +36,12 @@ class TC_00_Basic(RegressionTestCase):
 
 @unittest.skipIf(HAS_SGX, "Not yet tested on SGX")
 class TC_00_BasicSet2(RegressionTestCase):
-    def test_Event2(self):
-        _, stderr = self.run_binary(['Event2'])
-        self.assertIn('Enter main thread', stderr)
-        self.assertIn('In thread 1', stderr)
-        self.assertIn('Success, leave main thread', stderr)
-
     @unittest.skipUnless(ON_X86, "x86-specific")
     def test_Exception2(self):
         _, stderr = self.run_binary(['Exception2'])
         self.assertIn('Enter Main Thread', stderr)
         self.assertIn('failure in the handler: 0x', stderr)
         self.assertNotIn('Leave Main Thread', stderr)
-
-    def test_Failure(self):
-        _, stderr = self.run_binary(['Failure'])
-        self.assertIn('Enter Main Thread', stderr)
-        self.assertIn('Failure notified: Function not supported', stderr)
-        self.assertIn('Leave Main Thread', stderr)
 
     def test_File2(self):
         _, stderr = self.run_binary(['File2'])
@@ -67,7 +55,7 @@ class TC_00_BasicSet2(RegressionTestCase):
 
     def test_Pie(self):
         stdout, stderr = self.run_binary(['Pie'])
-        self.assertIn('start program: file:Pie', stderr)
+        self.assertIn('start program: Pie', stderr)
         self.assertIn('Hello World', stdout)
 
     def test_Process4(self):
@@ -92,12 +80,6 @@ class TC_00_BasicSet2(RegressionTestCase):
         self.assertIn('Leave main thread', stderr)
         self.assertIn('Leave thread', stderr)
 
-    def test_Sleep(self):
-        _, stderr = self.run_binary(['Sleep'], timeout=3)
-        self.assertIn('Enter Main Thread', stderr)
-        self.assertIn('Sleeping 3000000 microsecond...', stderr)
-        self.assertIn('Leave Main Thread', stderr)
-
     def test_Tcp(self):
         _, stderr = self.run_binary(['Tcp'])
         self.assertIn('start time = ', stderr)
@@ -114,39 +96,20 @@ class TC_00_BasicSet2(RegressionTestCase):
         self.assertIn('Hello World', stderr)
         self.assertIn('wall time = ', stderr)
 
-    def test_Wait(self):
-        _, stderr = self.run_binary(['Wait'])
-        self.assertIn('Enter Main Thread', stderr)
-        self.assertIn('DkStreamsWaitEvents did not return any events', stderr)
-        self.assertIn('Enter thread 2', stderr)
-        self.assertIn('Enter thread 1', stderr)
-        self.assertIn('Leave thread 2', stderr)
-        self.assertIn('Leave thread 1', stderr)
-
-    def test_Yield(self):
-        _, stderr = self.run_binary(['Yield'])
-        self.assertIn('Enter Parent Thread', stderr)
-        self.assertIn('Enter Child Thread', stderr)
-        self.assertIn('child yielded', stderr)
-        self.assertIn('parent yielded', stderr)
-
 
 class TC_01_Bootstrap(RegressionTestCase):
     def test_100_basic_boostrapping(self):
-        stdout, stderr = self.run_binary(['Bootstrap'])
+        _, stderr = self.run_binary(['Bootstrap'])
 
         # Basic Bootstrapping
         self.assertIn('User Program Started', stderr)
-
-        # Control Block: Executable Name
-        self.assertIn('Loaded Executable: file:Bootstrap', stderr)
 
         # One Argument Given
         self.assertIn('# of Arguments: 1', stderr)
         self.assertIn('argv[0] = Bootstrap', stderr)
 
         # Control Block: Debug Stream (Inline)
-        self.assertIn('Written to Debug Stream', stdout)
+        self.assertIn('Written to Debug Stream', stderr)
 
         # Control Block: Allocation Alignment
         self.assertIn('Allocation Alignment: {}'.format(mmap.ALLOCATIONGRANULARITY), stderr)
@@ -234,23 +197,18 @@ class TC_02_Symbols(RegressionTestCase):
         'DkStreamGetName',
         'DkStreamChangeName',
         'DkThreadCreate',
-        'DkThreadDelayExecution',
         'DkThreadYieldExecution',
         'DkThreadExit',
         'DkThreadResume',
         'DkSetExceptionHandler',
-        'DkMutexCreate',
-        'DkMutexRelease',
-        'DkNotificationEventCreate',
-        'DkSynchronizationEventCreate',
+        'DkEventCreate',
         'DkEventSet',
         'DkEventClear',
-        'DkSynchronizationObjectWait',
+        'DkEventWait',
         'DkStreamsWaitEvents',
         'DkObjectClose',
         'DkSystemTimeQuery',
         'DkRandomBitsRead',
-        'DkInstructionCacheFlush',
         'DkMemoryAvailableQuota',
     ]
     if ON_X86:
@@ -259,8 +217,9 @@ class TC_02_Symbols(RegressionTestCase):
 
     def test_000_symbols(self):
         _, stderr = self.run_binary(['Symbols'])
-        found_symbols = dict(line.split(' = ')
-            for line in stderr.strip().split('\n') if line.startswith('Dk'))
+        prefix = 'symbol: '
+        found_symbols = dict(line[len(prefix):].split(' = ')
+            for line in stderr.strip().split('\n') if line.startswith(prefix))
         self.assertCountEqual(found_symbols, self.ALL_SYMBOLS)
         for k, value in found_symbols.items():
             value = ast.literal_eval(value)
@@ -360,12 +319,6 @@ class TC_20_SingleProcess(RegressionTestCase):
         self.assertIn(
             'Map Test 2 (200th - 240th): {}'.format(file_exist[200:240].hex()),
             stderr)
-        self.assertIn(
-            'Map Test 3 (4096th - 4136th): {}'.format(file_exist[4096:4136].hex()),
-            stderr)
-        self.assertIn(
-            'Map Test 4 (4296th - 4336th): {}'.format(file_exist[4296:4336].hex()),
-            stderr)
 
         # Set File Length
         self.assertEqual(
@@ -418,19 +371,7 @@ class TC_20_SingleProcess(RegressionTestCase):
 
     def test_200_event(self):
         _, stderr = self.run_binary(['Event'])
-        self.assertIn('Wait with too short timeout ok.', stderr)
-        self.assertIn('Wait with long enough timeout ok.', stderr)
-
-    def test_210_semaphore(self):
-        _, stderr = self.run_binary(['Semaphore'])
-
-        # Semaphore: Timeout on Locked Semaphores
-        self.assertIn('Locked binary semaphore timed out (1000).', stderr)
-        self.assertIn('Locked binary semaphore timed out (0).', stderr)
-
-        # Semaphore: Acquire Unlocked Semaphores
-        self.assertIn('Locked binary semaphore successfully (-1).', stderr)
-        self.assertIn('Locked binary semaphore successfully (0).', stderr)
+        self.assertIn('TEST OK', stderr)
 
     def test_300_memory(self):
         _, stderr = self.run_binary(['Memory'])
@@ -597,13 +538,6 @@ class TC_21_ProcessCreation(RegressionTestCase):
         self.assertEqual(counter['Process Read 1: Hello World 1'], 3)
         self.assertEqual(counter['Process Write 2 OK'], 3)
         self.assertEqual(counter['Process Read 2: Hello World 2'], 3)
-
-    @unittest.skip("Temporarily broken, TODO: reenable after finishing loader rework")
-    def test_200_process2(self):
-        # Process Creation with a Different Binary
-        _, stderr = self.run_binary(['Process2'])
-        counter = collections.Counter(stderr.split('\n'))
-        self.assertEqual(counter['User Program Started'], 1)
 
     def test_300_process3(self):
         # Process Creation without Executable

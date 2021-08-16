@@ -1,40 +1,32 @@
-loader.preload = "file:../../src/libsysdb.so"
-libos.entrypoint = "file:$(ENTRYPOINT)"
-loader.env.LD_LIBRARY_PATH = "/lib:$(ARCH_LIBDIR):/usr/$(ARCH_LIBDIR)"
-loader.insecure__use_cmdline_argv = 1
+loader.preload = "file:{{ graphene.libos }}"
+libos.entrypoint = "{{ entrypoint }}"
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:/usr/{{ arch_libdir }}"
+loader.insecure__use_cmdline_argv = true
 
 # for eventfd test
-sys.insecure__allow_eventfd = 1
+sys.insecure__allow_eventfd = true
 
 fs.mount.graphene_lib.type = "chroot"
 fs.mount.graphene_lib.path = "/lib"
-fs.mount.graphene_lib.uri = "file:../../../../Runtime"
+fs.mount.graphene_lib.uri = "file:{{ graphene.runtimedir() }}"
 
 fs.mount.host_lib.type = "chroot"
-fs.mount.host_lib.path = "$(ARCH_LIBDIR)"
-fs.mount.host_lib.uri = "file:$(ARCH_LIBDIR)"
+fs.mount.host_lib.path = "{{ arch_libdir }}"
+fs.mount.host_lib.uri = "file:{{ arch_libdir }}"
 
 fs.mount.host_usr_lib.type = "chroot"
-fs.mount.host_usr_lib.path = "/usr/$(ARCH_LIBDIR)"
-fs.mount.host_usr_lib.uri = "file:/usr/$(ARCH_LIBDIR)"
+fs.mount.host_usr_lib.path = "/usr/{{ arch_libdir }}"
+fs.mount.host_usr_lib.uri = "file:/usr/{{ arch_libdir }}"
 
 fs.mount.bin.type = "chroot"
 fs.mount.bin.path = "/bin"
 fs.mount.bin.uri = "file:/bin"
 
-fs.mount.devkmsg.type = "chroot"
-fs.mount.devkmsg.path = "/dev/kmsg"
-fs.mount.devkmsg.uri = "dev:/dev/kmsg"
+sgx.trusted_files.runtime = "file:{{ graphene.runtimedir() }}/"
+sgx.trusted_files.libgcc_s = "file:{{ arch_libdir }}/libgcc_s.so.1"
+sgx.trusted_files.libstdcxx = "file:/usr{{ arch_libdir }}/libstdc++.so.6"
 
-sgx.trusted_files.ld = "file:../../../../Runtime/ld-linux-x86-64.so.2"
-sgx.trusted_files.libc = "file:../../../../Runtime/libc.so.6"
-sgx.trusted_files.libdl = "file:../../../../Runtime/libdl.so.2"
-sgx.trusted_files.libm = "file:../../../../Runtime/libm.so.6"
-sgx.trusted_files.libpthread = "file:../../../../Runtime/libpthread.so.0"
-sgx.trusted_files.libgcc_s = "file:$(ARCH_LIBDIR)/libgcc_s.so.1"
-sgx.trusted_files.libstdcxx = "file:/usr$(ARCH_LIBDIR)/libstdc++.so.6"
-
-sgx.trusted_files.entrypoint = "file:$(ENTRYPOINT)"
+sgx.trusted_files.entrypoint = "file:{{ entrypoint }}"
 sgx.trusted_files.exec_victim = "file:exec_victim"
 
 sgx.allowed_files.tmp_dir = "file:tmp/"
@@ -43,4 +35,4 @@ sgx.allowed_files.testfile = "file:testfile" # for mmap_file test
 
 sgx.thread_num = 16
 
-sgx.nonpie_binary = 1
+sgx.nonpie_binary = true

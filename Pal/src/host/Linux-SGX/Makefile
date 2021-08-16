@@ -4,15 +4,15 @@ include Makefile.am
 CFLAGS += \
 	-I. \
 	-I../.. \
+	-I../../../../common/include \
+	-I../../../../common/include/arch/$(ARCH) \
+	-I../../../../common/src/crypto/mbedtls/include \
 	-I../../../include \
 	-I../../../include/pal \
 	-I../../../include/arch/$(ARCH) \
 	-I../../../include/arch/$(ARCH)/Linux \
 	-I../../../include/host/Linux-SGX \
 	-I../../../include/host/Linux-common \
-	-I../../../include/lib \
-	-I../../../lib/crypto/mbedtls/include \
-	-I../../../lib/crypto/mbedtls/crypto/include \
 	-Iprotected-files
 
 # Some of the code uses alignof on expressions, which is a GNU extension.
@@ -31,8 +31,8 @@ defs	= -DIN_PAL
 CFLAGS += $(defs)
 ASFLAGS += $(defs)
 
-commons_objs_encl = bogomips.o stack_protector.o
-commons_objs_urts = file_utils.o main_exec_path.o
+commons_objs_encl = bogomips.o
+commons_objs_urts = debug_map.o file_utils.o main_exec_path.o timespec_utils.o topo_info.o
 
 enclave-objs = \
 	db_devices.o \
@@ -41,10 +41,8 @@ enclave-objs = \
 	db_exception.o \
 	db_files.o \
 	db_main.o \
-	db_main-$(ARCH).o \
 	db_memory.o \
 	db_misc.o \
-	db_mutex.o \
 	db_object.o \
 	db_pipes.o \
 	db_process.o \
@@ -67,17 +65,17 @@ enclave-objs = \
 enclave-asm-objs = enclave_entry.o
 
 urts-objs = \
-	clone-x86_64.o \
+	clone.o \
 	sgx_enclave.o \
 	sgx_exception.o \
 	sgx_framework.o \
-	sgx_graphene.o \
 	sgx_log.o \
 	sgx_main.o \
 	sgx_perf_data.o \
 	sgx_platform.o \
 	sgx_process.o \
 	sgx_profile.o \
+	sgx_profile_glibc.o \
 	sgx_gdb_info.o \
 	sgx_thread.o \
 	quote/aesm.pb-c.o \
@@ -148,7 +146,7 @@ gdb_integration/sgx_gdb.so: gdb_integration/sgx_gdb.c
 enclave_entry.o sgx_entry.o: asm-offsets.h
 
 gsgx.h: gsgx.h.in
-	./link-intel-driver.py < $< > $@
+	./link-intel-driver.py --input $< --output $@
 
 ifeq ($(filter %clean,$(MAKECMDGOALS)),)
 include $(wildcard *.d) $(wildcard gdb_integration/*.d)

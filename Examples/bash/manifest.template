@@ -2,17 +2,17 @@
 # including ls, cat, cp, date, and rm.
 #
 # This manifest was prepared and tested on Ubuntu 16.04.
-loader.preload = "file:$(GRAPHENEDIR)/Runtime/libsysdb.so"
-libos.entrypoint = "file:$(EXECDIR)/bash"
+loader.preload = "file:{{ graphene.libos }}"
+libos.entrypoint = "{{ execdir }}/bash"
 
 # Read application arguments directly from the command line. Don't use this on production!
-loader.insecure__use_cmdline_argv = 1
+loader.insecure__use_cmdline_argv = true
 
-loader.log_level = "$(GRAPHENE_LOG_LEVEL)"
+loader.log_level = "{{ log_level }}"
 
 # Environment variables
-loader.env.LD_LIBRARY_PATH = "/lib:$(ARCH_LIBDIR):/usr$(ARCH_LIBDIR)"
-loader.env.PATH = "$(EXECDIR)"
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:/usr{{ arch_libdir }}"
+loader.env.PATH = "{{ execdir }}"
 
 # Mounted FSes. The following "chroot" FSes mount a part of the host FS into the
 # guest. Other parts of the host FS will not be available in the guest.
@@ -20,25 +20,21 @@ loader.env.PATH = "$(EXECDIR)"
 # Default glibc files, mounted from the Runtime directory in GRAPHENEDIR.
 fs.mount.lib.type = "chroot"
 fs.mount.lib.path = "/lib"
-fs.mount.lib.uri = "file:$(GRAPHENEDIR)/Runtime"
+fs.mount.lib.uri = "file:{{ graphene.runtimedir() }}"
 
 # Host-level libraries (e.g., /lib/x86_64-linux-gnu) required by Bash
 fs.mount.lib64.type = "chroot"
-fs.mount.lib64.path = "/lib64"
-fs.mount.lib64.uri = "file:/lib64"
+fs.mount.lib64.path = "{{ arch_libdir }}"
+fs.mount.lib64.uri = "file:{{ arch_libdir }}"
 
 fs.mount.usr_lib.type = "chroot"
 fs.mount.usr_lib.path = "/usr/lib"
 fs.mount.usr_lib.uri = "file:/usr/lib"
 
-fs.mount.lib2.type = "chroot"
-fs.mount.lib2.path = "$(ARCH_LIBDIR)"
-fs.mount.lib2.uri = "file:$(ARCH_LIBDIR)"
-
 # Mount /bin
 fs.mount.bin.type = "chroot"
-fs.mount.bin.path = "$(EXECDIR)"
-fs.mount.bin.uri = "file:$(EXECDIR)"
+fs.mount.bin.path = "{{ execdir }}"
+fs.mount.bin.uri = "file:{{ execdir }}"
 
 # SGX general options
 
@@ -57,27 +53,11 @@ sgx.thread_num = 4
 
 # SGX trusted files
 
-sgx.trusted_files.bash = "file:$(EXECDIR)/bash"
-sgx.trusted_files.ls = "file:$(EXECDIR)/ls"
-sgx.trusted_files.cat = "file:$(EXECDIR)/cat"
-sgx.trusted_files.rm = "file:$(EXECDIR)/rm"
-sgx.trusted_files.cp = "file:$(EXECDIR)/cp"
-sgx.trusted_files.date = "file:$(EXECDIR)/date"
+sgx.trusted_files.execs = "file:{{ execdir }}/"
+sgx.trusted_files.runtime = "file:{{ graphene.runtimedir() }}/"
+sgx.trusted_files.arch_libdir = "file:{{ arch_libdir }}/"
+sgx.trusted_files.usr_arch_libdir = "file:/usr/{{ arch_libdir }}/"
 
-# Glibc libraries
-sgx.trusted_files.ld = "file:$(GRAPHENEDIR)/Runtime/ld-linux-x86-64.so.2"
-sgx.trusted_files.libc = "file:$(GRAPHENEDIR)/Runtime/libc.so.6"
-sgx.trusted_files.libm = "file:$(GRAPHENEDIR)/Runtime/libm.so.6"
-sgx.trusted_files.libdl = "file:$(GRAPHENEDIR)/Runtime/libdl.so.2"
-sgx.trusted_files.librt = "file:$(GRAPHENEDIR)/Runtime/librt.so.1"
-sgx.trusted_files.libutil = "file:$(GRAPHENEDIR)/Runtime/libutil.so.1"
-sgx.trusted_files.libpthread = "file:$(GRAPHENEDIR)/Runtime/libpthread.so.0"
+sgx.allowed_files.scripts = "file:scripts/"
 
-# Name Service Switch (NSS) libraries (Glibc dependencies)
-sgx.trusted_files.libnsscompat = "file:$(ARCH_LIBDIR)/libnss_compat.so.2"
-sgx.trusted_files.libnssfiles = "file:$(ARCH_LIBDIR)/libnss_files.so.2"
-sgx.trusted_files.libnssnis = "file:$(ARCH_LIBDIR)/libnss_nis.so.2"
-
-sgx.allowed_files.scripts = "file:scripts"
-
-sgx.nonpie_binary = 1
+sgx.nonpie_binary = true

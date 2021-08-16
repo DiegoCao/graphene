@@ -23,11 +23,12 @@ static int create_eventfd(PAL_HANDLE* efd, unsigned count, int flags) {
     int ret;
 
     assert(g_manifest_root);
-    int64_t allow_eventfd;
-    ret = toml_int_in(g_manifest_root, "sys.insecure__allow_eventfd", /*defaultval=*/0,
-                      &allow_eventfd);
-    if (ret < 0 || (allow_eventfd != 0 && allow_eventfd != 1)) {
-        debug("Cannot parse \'sys.insecure__allow_eventfd\' (the value must be 0 or 1)\n");
+    bool allow_eventfd;
+    ret = toml_bool_in(g_manifest_root, "sys.insecure__allow_eventfd", /*defaultval=*/false,
+                       &allow_eventfd);
+    if (ret < 0) {
+        log_error("Cannot parse \'sys.insecure__allow_eventfd\' (the value must be `true` or "
+                  "`false`)");
         return -ENOSYS;
     }
 
@@ -45,9 +46,10 @@ static int create_eventfd(PAL_HANDLE* efd, unsigned count, int flags) {
 
     /* eventfd() requires count (aka initval) but PAL's DkStreamOpen() doesn't have such an
      * argument. Using create arg as a work-around (note: initval is uint32 but create is int32). */
-    if (!(hdl = DkStreamOpen(URI_PREFIX_EVENTFD, 0, 0, count, pal_flags))) {
-        debug("eventfd open failure\n");
-        return -PAL_ERRNO();
+    ret = DkStreamOpen(URI_PREFIX_EVENTFD, 0, 0, count, pal_flags, &hdl);
+    if (ret < 0) {
+        log_error("eventfd open failure");
+        return pal_to_unix_errno(ret);
     }
 
     *efd = hdl;
@@ -64,8 +66,8 @@ long shim_do_eventfd2(unsigned int count, int flags) {
     }
 
     hdl->type = TYPE_EVENTFD;
-    set_handle_fs(hdl, &eventfd_builtin_fs);
-    hdl->flags    = O_RDWR;
+    hdl->fs = &eventfd_builtin_fs;
+    hdl->flags = O_RDWR;
     hdl->acc_mode = MAY_READ | MAY_WRITE;
 
     if ((ret = create_eventfd(&hdl->pal_handle, count, flags)) < 0)

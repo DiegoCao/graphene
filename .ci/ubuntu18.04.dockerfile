@@ -13,6 +13,7 @@ RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     gdb \
     gettext \
     git \
+    jq \
     libapr1-dev \
     libaprutil1-dev \
     libcurl4-openssl-dev \
@@ -28,6 +29,7 @@ RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     libpcre3-dev \
     libprotobuf-c-dev \
     libssl-dev \
+    libunwind8 \
     libxfixes3 \
     libxi6 \
     libxml2-dev \
@@ -36,6 +38,7 @@ RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     linux-headers-4.15.0-20-generic \
     meson \
     net-tools \
+    netcat-openbsd \
     pkg-config \
     protobuf-c-compiler \
     pylint3 \
@@ -43,11 +46,13 @@ RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     python3-apport \
     python3-apt \
     python3-breathe \
-    python3-pyelftools \
+    python3-click \
+    python3-jinja2 \
     python3-lxml \
     python3-numpy \
     python3-pip \
     python3-protobuf \
+    python3-pyelftools \
     python3-pytest \
     python3-scipy \
     r-base-core \
@@ -61,7 +66,8 @@ RUN python3 -m pip install \
     asv \
     recommonmark \
     'Sphinx==1.8' \
-    sphinx_rtd_theme
+    sphinx_rtd_theme \
+    toml>=0.10
 
 # Add the user UID:1001, GID:1001, home at /leeroy
 RUN groupadd -r leeroy -g 1001 && useradd -u 1001 -r -g leeroy -m -d /leeroy -c "Leeroy Jenkins" leeroy && \

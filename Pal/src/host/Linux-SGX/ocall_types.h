@@ -55,13 +55,12 @@ enum {
     OCALL_SETSOCKOPT,
     OCALL_SHUTDOWN,
     OCALL_GETTIME,
-    OCALL_SLEEP,
+    OCALL_SCHED_YIELD,
     OCALL_POLL,
     OCALL_RENAME,
     OCALL_DELETE,
     OCALL_DEBUG_MAP_ADD,
     OCALL_DEBUG_MAP_REMOVE,
-    OCALL_REPORT_MMAP,
     OCALL_EVENTFD,
     OCALL_GET_QUOTE,
     OCALL_NR,
@@ -169,7 +168,6 @@ typedef struct {
 
 typedef struct {
     unsigned int ms_pid;
-    const char* ms_uri;
     int ms_stream_fd;
     size_t ms_nargs;
     const char* ms_args[];
@@ -190,7 +188,7 @@ typedef struct {
 typedef struct {
     uint32_t* ms_futex;
     int ms_op, ms_val;
-    int64_t ms_timeout_us;
+    uint64_t ms_timeout_us;
 } ms_ocall_futex_t;
 
 typedef struct {
@@ -265,10 +263,6 @@ typedef struct {
 } ms_ocall_gettime_t;
 
 typedef struct {
-    uint64_t ms_microsec;
-} ms_ocall_sleep_t;
-
-typedef struct {
     struct pollfd* ms_fds;
     size_t ms_nfds;
     int64_t ms_timeout_us;
@@ -295,13 +289,6 @@ typedef struct {
 typedef struct {
     void* ms_addr;
 } ms_ocall_debug_map_remove_t;
-
-typedef struct {
-    const char* ms_filename;
-    uint64_t ms_addr;
-    uint64_t ms_len;
-    uint64_t ms_offset;
-} ms_ocall_report_mmap_t;
 
 typedef struct {
     unsigned int ms_initval;

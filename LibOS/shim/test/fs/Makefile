@@ -13,6 +13,7 @@ copy_execs = \
 execs = \
 	$(copy_execs) \
 	delete \
+	multiple_writers \
 	open_close \
 	open_flags \
 	read_write \
@@ -20,13 +21,13 @@ execs = \
 	stat \
 	truncate
 
-manifests = $(addsuffix .manifest,$(execs))
+all_manifests = $(addsuffix .manifest,$(execs))
 
 exec_target = $(execs)
 
 target = \
 	$(exec_target) \
-	$(manifests)
+	$(all_manifests)
 
 clean-extra += clean-tmp
 
@@ -45,6 +46,8 @@ $(copy_execs): common_copy.o
 
 $(copy_mmap_execs): CFLAGS += -DCOPY_MMAP
 
+multiple_writers: LDLIBS += -lpthread
+
 %.o: %.c
 	$(call cmd,cc_o_c)
 
@@ -58,12 +61,23 @@ fs-test: $(target)
 	$(RM) fs-test.xml
 	$(MAKE) fs-test.xml
 
-.PHONY: test
-test: $(target)
+.PHONY: tmpfs-test
+tmpfs-test: $(target)
+	$(RM) tmpfs-test.xml
+	$(MAKE) tmpfs-test.xml
+
+.PHONY: pf-test
+pf-test: $(target)
 	$(RM) pf-test.xml
 	$(MAKE) pf-test.xml
 
+.PHONY: test
+test: fs-test tmpfs-test pf-test
+
 fs-test.xml: test_fs.py $(call expand_target_to_token,$(target))
+	$(SCRIPTS_DIR)/run-pytest --junit-xml $@ -v $<
+
+tmpfs-test.xml: test_tmpfs.py $(call expand_target_to_token,$(target))
 	$(SCRIPTS_DIR)/run-pytest --junit-xml $@ -v $<
 
 pf-test.xml: test_pf.py $(call expand_target_to_token,$(target))
@@ -71,5 +85,5 @@ pf-test.xml: test_pf.py $(call expand_target_to_token,$(target))
 
 .PHONY: clean-tmp
 clean-tmp:
-	$(RM) -r *.tmp *.cached pal_loader $(manifests) *.manifest.sgx *~ *.sig *.token *.o \
+	$(RM) -r *.tmp *.cached $(all_manifests) *.manifest.sgx *~ *.sig *.token *.o \
 	         __pycache__ .pytest_cache .cache *.xml bin lib

@@ -4,16 +4,19 @@
  * Copyright (C) 2011-2019 Intel Corporation
  */
 
-#include "api.h"
+#ifndef IN_PAL
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define USE_STDLIB
+#endif
+
 #include "protected_files.h"
 #include "protected_files_format.h"
 #include "protected_files_internal.h"
 
-#ifndef IN_PAL
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#endif
+#include "api.h"
 
 /* Function for scrubbing sensitive memory buffers.
  * memset() can be optimized away and memset_s() is not available in PAL.
@@ -33,6 +36,7 @@ static pf_write_f    g_cb_write    = NULL;
 static pf_truncate_f g_cb_truncate = NULL;
 static pf_debug_f    g_cb_debug    = NULL;
 
+static pf_aes_cmac_f        g_cb_aes_cmac        = NULL;
 static pf_aes_gcm_encrypt_f g_cb_aes_gcm_encrypt = NULL;
 static pf_aes_gcm_decrypt_f g_cb_aes_gcm_decrypt = NULL;
 static pf_random_f          g_cb_random          = NULL;
@@ -67,11 +71,47 @@ static pf_random_f          g_cb_random          = NULL;
 static pf_iv_t g_empty_iv = {0};
 static bool g_initialized = false;
 
+static const char* g_pf_error_list[] = {
+    [PF_STATUS_SUCCESS] = "Success",
+    [-PF_STATUS_UNKNOWN_ERROR] = "Unknown error",
+    [-PF_STATUS_UNINITIALIZED] = "Protected Files uninitialized",
+    [-PF_STATUS_INVALID_PARAMETER] = "Invalid parameter",
+    [-PF_STATUS_INVALID_MODE] = "Invalid mode",
+    [-PF_STATUS_NO_MEMORY] = "Not enough memory",
+    [-PF_STATUS_INVALID_VERSION] = "Invalid version",
+    [-PF_STATUS_INVALID_HEADER] = "Invalid header",
+    [-PF_STATUS_INVALID_PATH] = "Invalid path",
+    [-PF_STATUS_MAC_MISMATCH] = "MAC mismatch",
+    [-PF_STATUS_NOT_IMPLEMENTED] = "Functionality not implemented",
+    [-PF_STATUS_CALLBACK_FAILED] = "Callback failed",
+    [-PF_STATUS_PATH_TOO_LONG] = "Path is too long",
+    [-PF_STATUS_RECOVERY_NEEDED] = "File recovery needed",
+    [-PF_STATUS_FLUSH_ERROR] = "Flush error",
+    [-PF_STATUS_CRYPTO_ERROR] = "Crypto error",
+    [-PF_STATUS_CORRUPTED] = "File is corrupted",
+    [-PF_STATUS_WRITE_TO_DISK_FAILED] = "Write to disk failed",
+};
+
+const char* pf_strerror(int err) {
+    unsigned err_idx = err >= 0 ? err : -err;
+    if (err_idx >= ARRAY_SIZE(g_pf_error_list) || !g_pf_error_list[err_idx]) {
+        return "Unknown error";
+    }
+    return g_pf_error_list[err_idx];
+}
+
 // The key derivation function follow recommendations from NIST Special Publication 800-108:
 // Recommendation for Key Derivation Using Pseudorandom Functions
 // https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-108.pdf
-
-// derive a metadata key from user key (if restore is false, the derived key is randomized)
+//
+// This function derives a metadata key in two modes:
+//   - restore == false: derives a per-file random key from user_kdk_key using a random nonce, to
+//                       encrypt the metadata block of the protected file; the nonce is stored in
+//                       plaintext part of the metadata block so that the file can be loaded later
+//                       and decrypted using the same key
+//   - restore == true:  derives a key from user_kdk_key + nonce stored in plaintext part of the
+//                       metadata block, to decrypt the encrypted part of the metadata block (and
+//                       thus "restore" access to the whole protected file)
 static bool ipf_import_metadata_key(pf_context_t* pf, bool restore, pf_key_t* output) {
     kdf_input_t buf = {0};
     pf_status_t status;
@@ -93,8 +133,7 @@ static bool ipf_import_metadata_key(pf_context_t* pf, bool restore, pf_key_t* ou
     // length of output (128 bits)
     buf.output_len = 0x80;
 
-    status = g_cb_aes_gcm_encrypt(&pf->user_kdk_key, &g_empty_iv, &buf, sizeof(buf), NULL, 0, NULL,
-                                  output);
+    status = g_cb_aes_cmac(&pf->user_kdk_key, &buf, sizeof(buf), output);
     if (PF_FAILURE(status)) {
         pf->last_error = status;
         return false;
@@ -221,14 +260,14 @@ static pf_context_t* ipf_open(const char* path, pf_file_mode_t mode, bool create
     DEBUG_PF("OK (data size %lu)\n", pf->encrypted_part_plain.size);
 
 out:
+    if (pf)
+        *status = pf->last_error;
+
     if (pf && PF_FAILURE(pf->last_error)) {
         DEBUG_PF("failed: %d\n", pf->last_error);
         free(pf);
         pf = NULL;
     }
-
-    if (pf)
-        *status = pf->last_error;
 
     return pf;
 }
@@ -378,7 +417,6 @@ static bool ipf_close(pf_context_t* pf) {
     free(pf->debug_buffer);
 #endif
     erase_memory(pf, sizeof(struct pf_context));
-    free(pf);
 
     return retval;
 }
@@ -1173,12 +1211,13 @@ static file_node_t* ipf_read_mht_node(pf_context_t* pf, uint64_t mht_node_number
 // public API
 
 void pf_set_callbacks(pf_read_f read_f, pf_write_f write_f, pf_truncate_f truncate_f,
-                      pf_aes_gcm_encrypt_f aes_gcm_encrypt_f,
+                      pf_aes_cmac_f aes_cmac_f, pf_aes_gcm_encrypt_f aes_gcm_encrypt_f,
                       pf_aes_gcm_decrypt_f aes_gcm_decrypt_f, pf_random_f random_f,
                       pf_debug_f debug_f) {
     g_cb_read            = read_f;
     g_cb_write           = write_f;
     g_cb_truncate        = truncate_f;
+    g_cb_aes_cmac        = aes_cmac_f;
     g_cb_aes_gcm_encrypt = aes_gcm_encrypt_f;
     g_cb_aes_gcm_decrypt = aes_gcm_decrypt_f;
     g_cb_random          = random_f;
@@ -1200,9 +1239,14 @@ pf_status_t pf_close(pf_context_t* pf) {
     if (!g_initialized)
         return PF_STATUS_UNINITIALIZED;
 
-    if (ipf_close(pf))
+    if (ipf_close(pf)) {
+        free(pf);
         return PF_STATUS_SUCCESS;
-    return pf->last_error;
+    }
+
+    pf_status_t ret = pf->last_error;
+    free(pf);
+    return ret;
 }
 
 pf_status_t pf_get_size(pf_context_t* pf, uint64_t* size) {

@@ -18,16 +18,17 @@ long shim_do_gettimeofday(struct __kernel_timeval* tv, struct __kernel_timezone*
     if (!tv)
         return -EINVAL;
 
-    if (test_user_memory(tv, sizeof(*tv), /*write=*/true))
+    if (!is_user_memory_writable(tv, sizeof(*tv)))
         return -EFAULT;
 
-    if (tz && test_user_memory(tz, sizeof(*tz), /*write=*/true))
+    if (tz && !is_user_memory_writable(tz, sizeof(*tz)))
         return -EFAULT;
 
-    uint64_t time = DkSystemTimeQuery();
-
-    if (time == (uint64_t)-1)
-        return -PAL_ERRNO();
+    uint64_t time = 0;
+    int ret = DkSystemTimeQuery(&time);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
     tv->tv_sec  = time / 1000000;
     tv->tv_usec = time % 1000000;
@@ -35,13 +36,14 @@ long shim_do_gettimeofday(struct __kernel_timeval* tv, struct __kernel_timezone*
 }
 
 long shim_do_time(time_t* tloc) {
-    uint64_t time = DkSystemTimeQuery();
-
-    if (time == (uint64_t)-1)
-        return -PAL_ERRNO();
-
-    if (tloc && test_user_memory(tloc, sizeof(*tloc), /*write=*/true))
+    if (tloc && !is_user_memory_writable(tloc, sizeof(*tloc)))
         return -EFAULT;
+
+    uint64_t time = 0;
+    int ret = DkSystemTimeQuery(&time);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
     time_t t = time / 1000000;
 
@@ -59,13 +61,14 @@ long shim_do_clock_gettime(clockid_t which_clock, struct timespec* tp) {
     if (!tp)
         return -EINVAL;
 
-    if (test_user_memory(tp, sizeof(*tp), /*write=*/true))
+    if (!is_user_memory_writable(tp, sizeof(*tp)))
         return -EFAULT;
 
-    uint64_t time = DkSystemTimeQuery();
-
-    if (time == (uint64_t)-1)
-        return -PAL_ERRNO();
+    uint64_t time = 0;
+    int ret = DkSystemTimeQuery(&time);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
     tp->tv_sec  = time / 1000000;
     tp->tv_nsec = (time % 1000000) * 1000;
@@ -78,7 +81,7 @@ long shim_do_clock_getres(clockid_t which_clock, struct timespec* tp) {
         return -EINVAL;
 
     if (tp) {
-        if (test_user_memory(tp, sizeof(*tp), /*write=*/true))
+        if (!is_user_memory_writable(tp, sizeof(*tp)))
             return -EFAULT;
 
         tp->tv_sec  = 0;

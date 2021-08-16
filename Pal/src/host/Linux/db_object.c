@@ -12,24 +12,11 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
 #include "pal_linux.h"
 #include "pal_linux_defs.h"
-
-/* Wait on a synchronization handle and return 0 if this handle's event was triggered or error
- * code otherwise (e.g., due to timeout). */
-int _DkSynchronizationObjectWait(PAL_HANDLE handle, int64_t timeout_us) {
-    assert(IS_HANDLE_TYPE(handle, mutex) || IS_HANDLE_TYPE(handle, event));
-
-    const struct handle_ops* ops = HANDLE_OPS(handle);
-    if (!ops || !ops->wait)
-        return -PAL_ERROR_NOTIMPLEMENTED;
-
-    return ops->wait(handle, timeout_us);
-}
 
 /* Wait for specific events on all handles in the handle array and return multiple events
  * (including errors) reported by the host. Return 0 on success, PAL error on failure. */
@@ -53,7 +40,6 @@ int _DkStreamsWaitEvents(size_t count, PAL_HANDLE* handle_array, PAL_FLG* events
 
     /* collect all FDs of all PAL handles that may report read/write events */
     size_t nfds = 0;
-    size_t ret_events_updated = 0;
     for (size_t i = 0; i < count; i++) {
         ret_events[i] = 0;
 
@@ -65,18 +51,9 @@ int _DkStreamsWaitEvents(size_t count, PAL_HANDLE* handle_array, PAL_FLG* events
         for (size_t j = 0; j < MAX_FDS; j++) {
             PAL_FLG flags = HANDLE_HDR(hdl)->flags;
 
-            /* hdl might be a mutex/event/non-pollable object, simply ignore it */
+            /* hdl might be a event/non-pollable object, simply ignore it */
             if (hdl->generic.fds[j] == PAL_IDX_POISON)
                 continue;
-            if (flags & ERROR(j)) {
-                /* PAL handle is requested for read/write but already marked with error:
-                 * skip it but update its ret_events */
-                if (events[i] & (PAL_WAIT_READ | PAL_WAIT_WRITE)) {
-                    ret_events[i] |= PAL_WAIT_ERROR;
-                    ret_events_updated++;
-                }
-                continue;
-            }
 
             int fdevents = 0;
             fdevents |= ((flags & RFD(j)) && (events[i] & PAL_WAIT_READ)) ? POLLIN : 0;
@@ -93,13 +70,8 @@ int _DkStreamsWaitEvents(size_t count, PAL_HANDLE* handle_array, PAL_FLG* events
     }
 
     if (!nfds) {
-        if (ret_events_updated > 0) {
-            /* we skip actual ppoll, but there was at least one PAL handle with updated ret_events */
-            ret = 0;
-        } else {
-            /* did not find any waitable FDs (LibOS supplied closed/errored FDs or empty events) */
-            ret = -PAL_ERROR_TRYAGAIN;
-        }
+        /* did not find any waitable FDs (LibOS supplied closed FDs or empty events) */
+        ret = -PAL_ERROR_INVAL;
         goto out;
     }
 
@@ -114,16 +86,8 @@ int _DkStreamsWaitEvents(size_t count, PAL_HANDLE* handle_array, PAL_FLG* events
 
     ret = INLINE_SYSCALL(ppoll, 5, fds, nfds, timeout_us >= 0 ? &timeout_ts : NULL, NULL, 0);
 
-    if (IS_ERR(ret)) {
-        switch (ERRNO(ret)) {
-            case EINTR:
-            case ERESTART:
-                ret = -PAL_ERROR_INTERRUPTED;
-                break;
-            default:
-                ret = unix_to_pal_error(ERRNO(ret));
-                break;
-        }
+    if (ret < 0) {
+        ret = unix_to_pal_error(ret);
         goto out;
     }
 
@@ -153,6 +117,8 @@ int _DkStreamsWaitEvents(size_t count, PAL_HANDLE* handle_array, PAL_FLG* events
         for (size_t k = 0; k < MAX_FDS; k++) {
             if (hdl->generic.fds[k] != (PAL_IDX)fds[i].fd)
                 continue;
+            if (HANDLE_HDR(hdl)->flags & ERROR(k))
+                ret_events[j] |= PAL_WAIT_ERROR;
             if (fds[i].revents & (POLLHUP | POLLERR | POLLNVAL))
                 HANDLE_HDR(hdl)->flags |= ERROR(k);
         }

@@ -8,6 +8,7 @@
 
 #include "pal.h"
 #include "pal_error.h"
+#include "shim_fs_lock.h"
 #include "shim_handle.h"
 #include "shim_internal.h"
 #include "shim_ipc.h"
@@ -19,28 +20,43 @@
 #include "shim_utils.h"
 
 static noreturn void libos_clean_and_exit(int exit_code) {
-    struct shim_thread* async_thread = terminate_async_helper();
+    /*
+     * TODO: if we are the IPC leader, we need to either:
+     * 1) kill all other Graphene processes
+     * 2) wait for them to exit here, before we terminate the IPC helper
+     */
+
+    shutdown_sync_client();
+
+    struct shim_thread* async_thread = terminate_async_worker();
     if (async_thread) {
-        /* TODO: wait for the thread to exit in host.
-         * This is tracked by the following issue.
-         * https://github.com/oscarlab/graphene/issues/440
+        /* TODO: wait for the thread to finish its tasks and exit in the host OS.
+         * This is tracked by the following issue: https://github.com/oscarlab/graphene/issues/440
          */
         put_thread(async_thread);
     }
 
-    struct shim_thread* ipc_thread = terminate_ipc_helper();
-    if (ipc_thread) {
-        /* TODO: wait for the thread to exit in host.
-         * This is tracked by the following issue.
-         * https://github.com/oscarlab/graphene/issues/440
-         */
-        put_thread(ipc_thread);
-    }
+    /*
+     * At this point there should be only 2 threads running: this + IPC worker.
+     * XXX: We release current thread's ID, yet we are still running. We never put the (possibly)
+     * last reference to the current thread (from TCB) and there should be no other references to it
+     * lying around, so nothing bad should happen™. Hopefully...
+     */
+    /*
+     * We might still be a zombie in the parent process. In an unlikely case that the parent does
+     * not wait for us for a long time and pids overflow (currently we can have 2**32 pids), IPC
+     * leader could give this ID to somebody else. This could be a nasty conflict.
+     * The problem is that solving this is hard: we would need to make the parent own (or at least
+     * release) our pid, but that would require "reparenting" in case the parent dies before us.
+     * Such solution would also have some nasty consequences: Graphene pid 1 (which I guess would
+     * be the new parent) might not be expecting to have more children than it spawned (normal apps
+     * do not expect that, init process is pretty special).
+     */
+    release_id(get_cur_thread()->tid);
 
-    store_all_msg_persist();
-    del_all_ipc_ports();
+    terminate_ipc_worker();
 
-    debug("process %u exited with status %d\n", g_process_ipc_info.vmid, exit_code);
+    log_debug("process %u exited with status %d", g_self_vmid, exit_code);
 
     /* TODO: We exit whole libos, but there are some objects that might need cleanup, e.g. we should
      * release this (last) thread pid. We should do a proper cleanup of everything. */
@@ -48,14 +64,11 @@ static noreturn void libos_clean_and_exit(int exit_code) {
 }
 
 noreturn void thread_exit(int error_code, int term_signal) {
-    /* Disable preemption as soon we won't be able to process signals. */
-    disable_preempt(NULL);
-
     /* Remove current thread from the threads list. */
     if (!check_last_thread(/*mark_self_dead=*/true)) {
         struct shim_thread* cur_thread = get_cur_thread();
 
-        /* ask Async Helper thread to cleanup this thread */
+        /* ask async worker thread to cleanup this thread */
         cur_thread->clear_child_tid_pal = 1; /* any non-zero value suffices */
         /* We pass this ownership to `cleanup_thread`. */
         get_thread(cur_thread);
@@ -69,8 +82,8 @@ noreturn void thread_exit(int error_code, int term_signal) {
         put_thread(cur_thread);
 
         if (ret < 0) {
-            debug("failed to set up async cleanup_thread (exiting without clear child tid),"
-                  " return code: %ld\n", ret);
+            log_error("failed to set up async cleanup_thread (exiting without clear child tid),"
+                      " return code: %ld", ret);
             /* `cleanup_thread` did not get this reference, clean it. We have to be careful, as
              * this is most likely the last reference and will free this `cur_thread`. */
             put_thread(cur_thread);
@@ -82,10 +95,16 @@ noreturn void thread_exit(int error_code, int term_signal) {
         /* UNREACHABLE */
     }
 
+    /* Clear POSIX locks before we notify parent: after a successful `wait()` by parent, our locks
+     * should already be gone. */
+    int ret = posix_lock_clear_pid(g_process.pid);
+    if (ret < 0)
+        log_warning("error clearing POSIX locks: %d", ret);
+
     /* This is the last thread of the process. Let parent know we exited. */
-    int ret = ipc_cld_exit_send(error_code, term_signal);
+    ret = ipc_cld_exit_send(error_code, term_signal);
     if (ret < 0) {
-        debug("Sending IPC process-exit notification failed: %d\n", ret);
+        log_error("Sending IPC process-exit notification failed: %d", ret);
     }
 
     /* At this point other threads might be still in the middle of an exit routine, but we don't
@@ -98,20 +117,13 @@ static int mark_thread_to_die(struct shim_thread* thread, void* arg) {
         return 0;
     }
 
-    bool need_wakeup = false;
+    bool need_wakeup = !__atomic_exchange_n(&thread->time_to_die, true, __ATOMIC_ACQ_REL);
 
-    lock(&thread->lock);
-    if (!thread->time_to_die) {
-        need_wakeup = true;
-    }
-    thread->time_to_die = true;
-    unlock(&thread->lock);
-
-    /* Now let's kick `thread`, so that it notices (in `__handle_signals`) the flag `time_to_die`
+    /* Now let's kick `thread`, so that it notices (in `handle_signal`) the flag `time_to_die`
      * set above (but only if we really set that flag). */
     if (need_wakeup) {
         thread_wakeup(thread);
-        DkThreadResume(thread->pal_handle);
+        (void)DkThreadResume(thread->pal_handle); // There is nothing we can do on errors.
     }
     return 1;
 }
@@ -155,22 +167,22 @@ noreturn void process_exit(int error_code, int term_signal) {
     thread_exit(error_code, term_signal);
 }
 
-noreturn long shim_do_exit_group(int error_code) {
+long shim_do_exit_group(int error_code) {
     assert(!is_internal(get_cur_thread()));
 
     error_code &= 0xFF;
 
-    debug("---- shim_exit_group (returning %d)\n", error_code);
+    log_debug("---- shim_exit_group (returning %d)", error_code);
 
     process_exit(error_code, 0);
 }
 
-noreturn long shim_do_exit(int error_code) {
+long shim_do_exit(int error_code) {
     assert(!is_internal(get_cur_thread()));
 
     error_code &= 0xFF;
 
-    debug("---- shim_exit (returning %d)\n", error_code);
+    log_debug("---- shim_exit (returning %d)", error_code);
 
     thread_exit(error_code, 0);
 }

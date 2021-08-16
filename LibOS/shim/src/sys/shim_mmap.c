@@ -46,7 +46,7 @@
                        | MAP_HUGE_2MB           \
                        | MAP_HUGE_1GB)
 
-void* shim_do_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
+void* shim_do_mmap(void* addr, size_t length, int prot, int flags, int fd, unsigned long offset) {
     struct shim_handle* hdl = NULL;
     long ret = 0;
 
@@ -133,8 +133,8 @@ void* shim_do_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t
 
     if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
         /* We know that `addr + length` does not overflow (`access_ok` above). */
-        if (addr < PAL_CB(user_address.start)
-                || (uintptr_t)PAL_CB(user_address.end) < (uintptr_t)addr + length) {
+        if (addr < g_pal_control->user_address.start
+                || (uintptr_t)g_pal_control->user_address.end < (uintptr_t)addr + length) {
             ret = -EINVAL;
             goto out_handle;
         }
@@ -144,10 +144,10 @@ void* shim_do_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t
         }
     } else {
         /* We know that `addr + length` does not overflow (`access_ok` above). */
-        if (addr && (uintptr_t)PAL_CB(user_address.start) <= (uintptr_t)addr
-                && (uintptr_t)addr + length <= (uintptr_t)PAL_CB(user_address.end)) {
-            ret = bkeep_mmap_any_in_range(PAL_CB(user_address.start), (char*)addr + length, length,
-                                          prot, flags, hdl, offset, NULL, &addr);
+        if (addr && (uintptr_t)g_pal_control->user_address.start <= (uintptr_t)addr
+                && (uintptr_t)addr + length <= (uintptr_t)g_pal_control->user_address.end) {
+            ret = bkeep_mmap_any_in_range(g_pal_control->user_address.start, (char*)addr + length,
+                                          length, prot, flags, hdl, offset, NULL, &addr);
         } else {
             /* Hacky way to mark we had no hit and need to search below. */
             ret = -1;
@@ -165,18 +165,19 @@ void* shim_do_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t
     /* From now on `addr` contains the actual address we want to map (and already bookkeeped). */
 
     if (!hdl) {
-        if (DkVirtualMemoryAlloc(addr, length, 0, LINUX_PROT_TO_PAL(prot, flags)) != addr) {
-            if (PAL_NATIVE_ERRNO() == PAL_ERROR_DENIED) {
+        ret = DkVirtualMemoryAlloc(&addr, length, 0, LINUX_PROT_TO_PAL(prot, flags));
+        if (ret < 0) {
+            if (ret == -PAL_ERROR_DENIED) {
                 ret = -EPERM;
             } else {
-                ret = -PAL_ERRNO();
+                ret = pal_to_unix_errno(ret);
             }
         }
     } else {
         void* ret_addr = addr;
         ret = hdl->fs->fs_ops->mmap(hdl, &ret_addr, length, prot, flags, offset);
         if (ret_addr != addr) {
-            debug("Requested address (%p) differs from allocated (%p)!\n", addr, ret_addr);
+            log_error("Requested address (%p) differs from allocated (%p)!", addr, ret_addr);
             BUG();
         }
     }
@@ -184,8 +185,8 @@ void* shim_do_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t
     if (ret < 0) {
         void* tmp_vma = NULL;
         if (bkeep_munmap(addr, length, /*is_internal=*/false, &tmp_vma) < 0) {
-            debug("[mmap] Failed to remove bookkeeped memory that was not allocated at %p-%p!\n",
-                  addr, (char*)addr + length);
+            log_error("[mmap] Failed to remove bookkeeped memory that was not allocated at %p-%p!",
+                      addr, (char*)addr + length);
             BUG();
         }
         bkeep_remove_tmp_vma(tmp_vma);
@@ -251,13 +252,16 @@ long shim_do_mprotect(void* addr, size_t length, int prot) {
                 put_handle(vma_info.file);
             }
         } else {
-            warn("Memory that was about to be mprotected was unmapped, your program is buggy!\n");
+            log_warning("Memory that was about to be mprotected was unmapped, your program is "
+                        "buggy!");
             return -ENOTRECOVERABLE;
         }
     }
 
-    if (!DkVirtualMemoryProtect(addr, length, LINUX_PROT_TO_PAL(prot, /*map_flags=*/0)))
-        return -PAL_ERRNO();
+    ret = DkVirtualMemoryProtect(addr, length, LINUX_PROT_TO_PAL(prot, /*map_flags=*/0));
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
     return 0;
 }
@@ -282,7 +286,9 @@ long shim_do_munmap(void* addr, size_t length) {
         return ret;
     }
 
-    DkVirtualMemoryFree(addr, length);
+    if (DkVirtualMemoryFree(addr, length) < 0) {
+        BUG();
+    }
 
     bkeep_remove_tmp_vma(tmp_vma);
 
@@ -297,21 +303,23 @@ long shim_do_mincore(void* addr, size_t len, unsigned char* vec) {
     if (!IS_ALLOC_ALIGNED_PTR(addr))
         return -EINVAL;
 
-    if (test_user_memory(addr, len, false))
-        return -ENOMEM;
-
-    unsigned long pages = ALLOC_ALIGN_UP(len) / g_pal_alloc_align;
-    if (test_user_memory(vec, pages, true))
-        return -EFAULT;
-
-    if (!is_in_adjacent_user_vmas(addr, len)) {
+    if (!access_ok(addr, len)) {
         return -ENOMEM;
     }
+
+    if (!is_in_adjacent_user_vmas(addr, len, /*prot=*/0)) {
+        return -ENOMEM;
+    }
+
+    unsigned long pages = ALLOC_ALIGN_UP(len) / ALLOC_ALIGNMENT;
+    if (!is_user_memory_writable(vec, pages))
+        return -EFAULT;
 
     static atomic_bool warned = false;
     if (!warned) {
         warned = true;
-        warn("mincore emulation always tells pages are _NOT_ in RAM. This may cause issues.\n");
+        log_warning(
+            "mincore emulation always tells pages are _NOT_ in RAM. This may cause issues.");
     }
 
     /* There is no good way to know if the page is in RAM.
@@ -406,4 +414,40 @@ long shim_do_madvise(unsigned long start, size_t len_in, int behavior) {
         }
     }
     return -EINVAL;
+}
+
+long shim_do_msync(unsigned long start, size_t len_orig, int flags) {
+    if (flags & ~(MS_ASYNC | MS_SYNC | MS_INVALIDATE)) {
+        return -EINVAL;
+    }
+
+    if ((flags & MS_ASYNC) && (flags & MS_SYNC)) {
+        return -EINVAL;
+    }
+
+    if (!IS_ALIGNED_POW2(start, PAGE_SIZE)) {
+        return -EINVAL;
+    }
+
+    size_t len = ALIGN_UP_POW2(len_orig, PAGE_SIZE);
+    if (len < len_orig) {
+        return -ENOMEM;
+    }
+
+    if (!flags) {
+        /* Currently Linux treats empty flags with semantics equal to `MS_ASYNC`. */
+        flags = MS_ASYNC;
+    }
+
+    if (flags != MS_ASYNC) {
+        log_warning("Graphene does not support flags to msync other than MS_ASYNC");
+        return -ENOSYS;
+    }
+
+    if (!is_user_memory_readable((void*)start, len)) {
+        return -ENOMEM;
+    }
+
+    /* `MS_ASYNC` is a no-op on Linux. */
+    return 0;
 }

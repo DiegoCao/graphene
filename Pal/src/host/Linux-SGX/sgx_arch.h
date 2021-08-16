@@ -4,14 +4,18 @@
 #ifndef SGX_ARCH_H
 #define SGX_ARCH_H
 
-#include "pal_linux_defs.h"
+#define RED_ZONE_SIZE 128
 
 #ifndef __ASSEMBLER__
 
+#ifdef USE_STDLIB
+#include <assert.h>
+#else
+#include "assert.h"
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
-
-#include "assert.h"
 
 #pragma pack(push, 1)
 

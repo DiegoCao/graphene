@@ -21,48 +21,42 @@ GRAPHENE_LOG_LEVEL = error
 endif
 
 .PHONY: all
-all: nodejs.manifest | pal_loader
+all: nodejs.manifest
 ifeq ($(SGX),1)
 all: nodejs.manifest.sgx nodejs.sig nodejs.token
 endif
 
 include ../../Scripts/Makefile.configs
 
-# Generate manifest rules for Node.js dependencies.
-# We'll duplicate some Glibc libraries (which Graphene provides in a customized version), but
-# there's no harm in this.
-.INTERMEDIATE: trusted-libs
-trusted-libs: ../common_tools/get_deps.sh
-	../common_tools/get_deps.sh $(NODEJS_DIR)/nodejs > $@
-
-nodejs.manifest: nodejs.manifest.template trusted-libs
-	(sed -e 's|$$(GRAPHENEDIR)|'"$(GRAPHENEDIR)"'|g' \
-	     -e 's|$$(GRAPHENE_LOG_LEVEL)|'"$(GRAPHENE_LOG_LEVEL)"'|g' \
-	     -e 's|$$(NODEJS_DIR)|'"$(NODEJS_DIR)"'|g' \
-	     -e 's|$$(ARCH_LIBDIR)|'"$(ARCH_LIBDIR)"'|g' \
-	     $<; \
-	cat trusted-libs) > $@
+nodejs.manifest: nodejs.manifest.template
+	graphene-manifest \
+		-Dlog_level=$(GRAPHENE_LOG_LEVEL) \
+		-Darch_libdir=$(ARCH_LIBDIR) \
+		-Dnodejs_dir=$(NODEJS_DIR) \
+		$< >$@
 
 # Generate SGX-specific manifest, enclave signature, and token for enclave initialization
 nodejs.manifest.sgx: nodejs.manifest helloworld.js
-	$(GRAPHENEDIR)/Pal/src/host/Linux-SGX/signer/pal-sgx-sign \
-		-libpal $(GRAPHENEDIR)/Runtime/libpal-Linux-SGX.so \
-		-key $(SGX_SIGNER_KEY) \
-		-manifest $< \
-		-output $@
+	graphene-sgx-sign \
+		--key $(SGX_SIGNER_KEY) \
+		--manifest $< \
+		--output $@
 
 nodejs.sig: nodejs.manifest.sgx
 
 nodejs.token: nodejs.sig
-	$(GRAPHENEDIR)/Pal/src/host/Linux-SGX/signer/pal-sgx-get-token -output $@ -sig $^
+	graphene-sgx-get-token --output $@ --sig $^
 
-pal_loader:
-	ln -s $(GRAPHENEDIR)/Runtime/pal_loader $@
+ifeq ($(SGX),)
+GRAPHENE = graphene-direct
+else
+GRAPHENE = graphene-sgx
+endif
 
 .PHONY: check
 check: all
-	./pal_loader ./nodejs helloworld.js 3000 & SERVER_ID=$$!; \
-	sleep 3; \
+	$(GRAPHENE) ./nodejs helloworld.js 3000 & SERVER_ID=$$!; \
+	../../Scripts/wait_for_server 5 127.0.0.1 3000; \
 	curl localhost:3000 > OUTPUT; \
 	kill -9 $$SERVER_ID;
 	@grep -q "Hello World!" OUTPUT && echo "[ Success 1/1 ]"
@@ -70,7 +64,7 @@ check: all
 
 .PHONY: clean
 clean:
-	$(RM) *.manifest *.manifest.sgx *.token *.sig pal_loader OUTPUT
+	$(RM) *.manifest *.manifest.sgx *.token *.sig OUTPUT
 
 .PHONY: distclean
 distclean: clean

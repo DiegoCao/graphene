@@ -2,19 +2,19 @@
 #
 # This manifest was prepared and tested on Ubuntu 18.04.
 
-libos.entrypoint = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/object_detection_sample_ssd"
+libos.entrypoint = "{{ openvino_dir }}/bin/intel64/{{ openvino_build }}/object_detection_sample_ssd"
 
 # Path to the library OS
-loader.preload = "file:$(GRAPHENE_DIR)/Runtime/libsysdb.so"
+loader.preload = "file:{{ graphene.libos }}"
 
 # Graphene log level
-loader.log_level = "$(GRAPHENE_LOG_LEVEL)"
+loader.log_level = "{{ log_level }}"
 
 # Read application arguments directly from the command line. Don't use this on production!
-loader.insecure__use_cmdline_argv = 1
+loader.insecure__use_cmdline_argv = true
 
 # Environment variables
-loader.env.LD_LIBRARY_PATH = "/lib:$(ARCH_LIBDIR):/usr/$(ARCH_LIBDIR)"
+loader.env.LD_LIBRARY_PATH = "/lib:{{ openvino_dir }}/inference-engine/temp/tbb/lib:{{ arch_libdir }}:/usr/{{ arch_libdir }}"
 
 # Mounted FSes. The following "chroot" FSes mount a part of the host FS into the
 # guest. Other parts of the host FS will not be available in the guest.
@@ -22,17 +22,17 @@ loader.env.LD_LIBRARY_PATH = "/lib:$(ARCH_LIBDIR):/usr/$(ARCH_LIBDIR)"
 # Default glibc files, mounted from the Runtime directory in GRAPHENE_DIR.
 fs.mount.lib.type = "chroot"
 fs.mount.lib.path = "/lib"
-fs.mount.lib.uri = "file:$(GRAPHENE_DIR)/Runtime"
+fs.mount.lib.uri = "file:{{ graphene.runtimedir() }}"
 
 # Host-level libraries (e.g., /lib/x86_64-linux-gnu) required by OpenVINO.
 fs.mount.lib2.type = "chroot"
-fs.mount.lib2.path = "$(ARCH_LIBDIR)"
-fs.mount.lib2.uri = "file:$(ARCH_LIBDIR)"
+fs.mount.lib2.path = "{{ arch_libdir }}"
+fs.mount.lib2.uri = "file:{{ arch_libdir }}"
 
 # More host-level libraries (e.g., /usr/lib/x86_64-linux-gnu) required by OpenVINO.
 fs.mount.lib3.type = "chroot"
-fs.mount.lib3.path = "/usr/$(ARCH_LIBDIR)"
-fs.mount.lib3.uri = "file:/usr/$(ARCH_LIBDIR)"
+fs.mount.lib3.path = "/usr/{{ arch_libdir }}"
+fs.mount.lib3.uri = "file:/usr/{{ arch_libdir }}"
 
 # Host-level directory to NSS files required by Glibc + NSS libs.
 fs.mount.etc.type = "chroot"
@@ -41,8 +41,8 @@ fs.mount.etc.uri = "file:/etc"
 
 # Mount the current working directory
 fs.mount.cwd.type = "chroot"
-fs.mount.cwd.path = "$(OPENVINO_DIR_ABSPATH)"
-fs.mount.cwd.uri = "file:$(OPENVINO_DIR)"
+fs.mount.cwd.path = "{{ openvino_dir }}"
+fs.mount.cwd.uri = "file:{{ openvino_dir }}"
 
 # SGX general options
 
@@ -63,63 +63,17 @@ sgx.thread_num = 16
 
 # SGX trusted files
 
-sgx.trusted_files.object_detection_sample_ssd = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/object_detection_sample_ssd"
+sgx.trusted_files.object_detection_sample_ssd = "file:{{ openvino_dir }}/bin/intel64/{{ openvino_build }}/object_detection_sample_ssd"
 
-# Glibc libraries
-sgx.trusted_files.ld = "file:$(GRAPHENE_DIR)/Runtime/ld-linux-x86-64.so.2"
-sgx.trusted_files.libc = "file:$(GRAPHENE_DIR)/Runtime/libc.so.6"
-sgx.trusted_files.libm = "file:$(GRAPHENE_DIR)/Runtime/libm.so.6"
-sgx.trusted_files.libdl = "file:$(GRAPHENE_DIR)/Runtime/libdl.so.2"
-sgx.trusted_files.librt = "file:$(GRAPHENE_DIR)/Runtime/librt.so.1"
-sgx.trusted_files.libutil = "file:$(GRAPHENE_DIR)/Runtime/libutil.so.1"
-sgx.trusted_files.libpthread = "file:$(GRAPHENE_DIR)/Runtime/libpthread.so.0"
+sgx.trusted_files.runtime = "file:{{ graphene.runtimedir() }}/"
+sgx.trusted_files.arch_libdir = "file:{{ arch_libdir }}/"
+sgx.trusted_files.usr_arch_libdir = "file:/usr/{{ arch_libdir }}/"
+sgx.trusted_files.openvino_libs = "file:{{ openvino_dir }}/bin/intel64/{{ openvino_build }}/"
+sgx.trusted_files.opencv_libs = "file:{{ openvino_dir }}/inference-engine/temp/"
+sgx.trusted_files.modelxml = "file:{{ model_dir }}/VGG_VOC0712Plus_SSD_300x300_ft_iter_160000.xml"
+sgx.trusted_files.modelbin = "file:{{ model_dir }}/VGG_VOC0712Plus_SSD_300x300_ft_iter_160000.bin"
 
-# Name Service Switch (NSS) libraries (Glibc dependencies)
-sgx.trusted_files.libnsscompat = "file:$(ARCH_LIBDIR)/libnss_compat.so.2"
-sgx.trusted_files.libnssfiles = "file:$(ARCH_LIBDIR)/libnss_files.so.2"
-sgx.trusted_files.libnssnis = "file:$(ARCH_LIBDIR)/libnss_nis.so.2"
-
-# libNSL is a dependency of libnss_compat above
-sgx.trusted_files.libnsl = "file:$(ARCH_LIBDIR)/libnsl.so.1"
-
-# OpenVINO C++ dependencies
-sgx.trusted_files.libcpp = "file:/usr/$(ARCH_LIBDIR)/libstdc++.so.6"
-sgx.trusted_files.libgcc = "file:$(ARCH_LIBDIR)/libgcc_s.so.1"
-
-# OpenVINO TBB dependencies
-sgx.trusted_files.libtbbmalloc = "file:/usr/$(ARCH_LIBDIR)/libtbbmalloc.so.2"
-sgx.trusted_files.libtbb = "file:/usr/$(ARCH_LIBDIR)/libtbb.so.2"
-
-# OpenVINO main libraries
-sgx.trusted_files.libformatreader = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libformat_reader.so"
-sgx.trusted_files.libinferencenegine = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libinference_engine.so"
-sgx.trusted_files.libmkldnnplugin = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libMKLDNNPlugin.so"
-sgx.trusted_files.libgnapplugin = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libGNAPlugin.so"
-sgx.trusted_files.libcldnnpplugin = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libclDNNPlugin.so"
-sgx.trusted_files.libmyriadplugin = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libmyriadPlugin.so"
-sgx.trusted_files.libngraph = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libngraph.so"
-sgx.trusted_files.libHeteroPlugin = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libHeteroPlugin.so"
-sgx.trusted_files.libMultiDevicePlugin = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libMultiDevicePlugin.so"
-sgx.trusted_files.libinferenceengine_onnx_reader = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libinference_engine_onnx_reader.so"
-sgx.trusted_files.libinferenceengine_ir_reader = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libinference_engine_ir_reader.so"
-sgx.trusted_files.libinferenceengine_legacy = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libinference_engine_legacy.so"
-sgx.trusted_files.libinferenceengine_transformations = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libinference_engine_transformations.so"
-sgx.trusted_files.libinferenceengine_lptransformations = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/libinference_engine_lp_transformations.so"
-
-# OpenVINO OpenCV libraries
-sgx.trusted_files.libimgcodecs = "file:$(OPENVINO_DIR)/inference-engine/temp/opencv_4.3.0_ubuntu18/opencv/lib/libopencv_imgcodecs.so.4.3"
-sgx.trusted_files.libimgproc = "file:$(OPENVINO_DIR)/inference-engine/temp/opencv_4.3.0_ubuntu18/opencv/lib/libopencv_imgproc.so.4.3"
-sgx.trusted_files.libopencvcore = "file:$(OPENVINO_DIR)/inference-engine/temp/opencv_4.3.0_ubuntu18/opencv/lib/libopencv_core.so.4.3"
-
-# OpenVINO OMP libraries
-sgx.trusted_files.libiomp5 = "file:$(OPENVINO_DIR)/inference-engine/temp/omp/lib/libiomp5.so"
-
-# OpenVINO SSD300 model
-sgx.trusted_files.pluginsxml = "file:$(OPENVINO_DIR)/bin/intel64/$(OPENVINO_BUILD)/lib/plugins.xml"
-sgx.trusted_files.modelxml = "file:$(MODEL_DIR)/VGG_VOC0712Plus_SSD_300x300_ft_iter_160000.xml"
-sgx.trusted_files.modelbin = "file:$(MODEL_DIR)/VGG_VOC0712Plus_SSD_300x300_ft_iter_160000.bin"
-
-# OpenVINO images (allowed instead of trusted for simplicity)
+# OpenVINO images (allowed instead of trusted for simplicity, but insecure!)
 sgx.allowed_files.imagesdir = "file:images"
 
 # Name Service Switch (NSS) files (Glibc reads these files)

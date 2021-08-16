@@ -1,27 +1,24 @@
-loader.preload = "file:../../src/libsysdb.so"
-libos.entrypoint = "file:attestation"
+loader.preload = "file:{{ graphene.libos }}"
+libos.entrypoint = "attestation"
 loader.argv0_override = "attestation"
 
 loader.env.LD_LIBRARY_PATH = "/lib"
-loader.insecure__use_cmdline_argv = 1
+loader.insecure__use_cmdline_argv = true
 
 fs.mount.lib.type = "chroot"
 fs.mount.lib.path = "/lib"
-fs.mount.lib.uri = "file:../../../../Runtime"
+fs.mount.lib.uri = "file:{{ graphene.runtimedir() }}"
 
 fs.mount.bin.type = "chroot"
 fs.mount.bin.path = "/bin"
 fs.mount.bin.uri = "file:/bin"
 
 # sgx-related
-sgx.trusted_files.ld = "file:../../../../Runtime/ld-linux-x86-64.so.2"
-sgx.trusted_files.libc = "file:../../../../Runtime/libc.so.6"
-sgx.trusted_files.libdl = "file:../../../../Runtime/libdl.so.2"
-sgx.trusted_files.libm = "file:../../../../Runtime/libm.so.6"
+sgx.trusted_files.runtime = "file:{{ graphene.runtimedir() }}/"
 sgx.trusted_files.attestation = "file:attestation"
 
-sgx.nonpie_binary = 1
+sgx.nonpie_binary = true
 
-sgx.remote_attestation = 1
-sgx.ra_client_spid = "$(RA_CLIENT_SPID)"
-sgx.ra_client_linkable = $(RA_CLIENT_LINKABLE)
+sgx.remote_attestation = true
+sgx.ra_client_spid = "{{ ra_client_spid }}"
+sgx.ra_client_linkable = {{ ra_client_linkable }}

@@ -7,10 +7,7 @@
  * This file contains APIs to set up signal handlers.
  */
 
-#include <stddef.h> /* linux/signal.h misses this dependency (for size_t), at least on Ubuntu 16.04.
-                     * We must include it ourselves before including linux/signal.h.
-                     */
-
+#include <stddef.h> /* needed by <linux/signal.h> for size_t */
 #include <linux/signal.h>
 
 #include "api.h"
@@ -56,7 +53,7 @@ noreturn static void restore_pal_context(sgx_cpu_context_t* uc, PAL_CONTEXT* ctx
     uc->rflags = ctx->efl;
     uc->rip    = ctx->rip;
 
-    restore_sgx_context(uc, ctx->fpregs);
+    restore_sgx_context(uc, ctx->is_fpregs_used ? ctx->fpregs : NULL);
 }
 
 static void save_pal_context(PAL_CONTEXT* ctx, sgx_cpu_context_t* uc,
@@ -87,10 +84,11 @@ static void save_pal_context(PAL_CONTEXT* ctx, sgx_cpu_context_t* uc,
         .gs = 0,
         .ss = 0x2b, // __USER_DS(6) | 0(GDT) | 3(RPL)
     };
-    ctx->csgsfs = csgsfs.csgsfs;
+    ctx->csgsfsss = csgsfs.csgsfs;
 
     assert(xregs_state);
     ctx->fpregs = xregs_state;
+    ctx->is_fpregs_used = 1;
 
     /* Emulate format for fp registers Linux sets up as signal frame.
      * https://elixir.bootlin.com/linux/v5.4.13/source/arch/x86/kernel/fpu/signal.c#L86
@@ -113,14 +111,17 @@ static void save_pal_context(PAL_CONTEXT* ctx, sgx_cpu_context_t* uc,
 static void emulate_rdtsc_and_print_warning(sgx_cpu_context_t* uc) {
     static int first = 0;
     if (__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED) == 0) {
-        SGX_DBG(DBG_E, "WARNING: all RDTSC/RDTSCP instructions are emulated (imprecisely) via "
-                       "gettime() syscall.\n");
+        /* if we end up emulating RDTSC/RDTSCP instruction, we cannot use invariant TSC */
+        extern uint64_t g_tsc_hz;
+        g_tsc_hz = 0;
+        log_warning("all RDTSC/RDTSCP instructions are emulated (imprecisely) via gettime() "
+                    "syscall.");
     }
 
     uint64_t usec;
     int res = _DkSystemTimeQuery(&usec);
     if (res < 0) {
-        SGX_DBG(DBG_E, "_DkSystemTimeQuery() failed in unrecoverable context, exiting.\n");
+        log_error("_DkSystemTimeQuery() failed in unrecoverable context, exiting.");
         _DkProcessExit(1);
     }
     /* FIXME: Ideally, we would like to scale microseconds back to RDTSC clock cycles */
@@ -157,14 +158,15 @@ static bool handle_ud(sgx_cpu_context_t* uc) {
     } else if (instr[0] == 0xf3 && (instr[1] & ~1) == 0x48 && instr[2] == 0x0f &&
                instr[3] == 0xae && instr[4] >> 6 == 0b11 && ((instr[4] >> 3) & 0b111) < 4) {
         /* A disabled {RD,WR}{FS,GS}BASE instruction generated a #UD */
-        SGX_DBG(DBG_E, "The {RD,WR}{FS,GS}BASE instruction is not currently enabled. "
-                       "Please reload Graphene SGX kernel module.\n");
+        log_error(
+            "{RD,WR}{FS,GS}BASE instructions are not permitted on this platform. Please check the "
+            "instructions under \"Building with SGX support\" from Graphene documentation.");
         return false;
     } else if (instr[0] == 0x0f && instr[1] == 0x05) {
         /* syscall: LibOS may know how to handle this */
         return false;
     }
-    SGX_DBG(DBG_E, "Unknown or illegal instruction at RIP 0x%016lx\n", uc->rip);
+    log_error("Unknown or illegal instruction executed");
     return false;
 }
 
@@ -182,10 +184,15 @@ void _DkExceptionHandler(unsigned int exit_info, sgx_cpu_context_t* uc,
 
     if (!ei.info.valid) {
         event_num = exit_info;
+        if (event_num <= 0 || event_num >= PAL_EVENT_NUM_BOUND) {
+            log_error("Illegal exception reported by untrusted PAL: %d", event_num);
+            _DkProcessExit(1);
+        }
     } else {
         switch (ei.info.vector) {
             case SGX_EXCEPTION_VECTOR_BR:
-                event_num = PAL_EVENT_NUM_BOUND;
+                log_error("Handling #BR exceptions is currently unsupported by Graphene");
+                _DkProcessExit(1);
                 break;
             case SGX_EXCEPTION_VECTOR_UD:
                 if (handle_ud(uc)) {
@@ -213,29 +220,17 @@ void _DkExceptionHandler(unsigned int exit_info, sgx_cpu_context_t* uc,
     if (ADDR_IN_PAL(uc->rip) &&
         /* event isn't asynchronous (i.e., synchronous exception) */
         event_num != PAL_EVENT_QUIT &&
-        event_num != PAL_EVENT_SUSPEND &&
-        event_num != PAL_EVENT_RESUME) {
-        printf("*** Unexpected exception occurred inside PAL at RIP = +0x%08lx! ***\n",
-               uc->rip - (uintptr_t)TEXT_START);
+        event_num != PAL_EVENT_INTERRUPTED) {
+        log_error("*** Unexpected exception occurred inside PAL at RIP = +0x%08lx! ***",
+                  uc->rip - (uintptr_t)TEXT_START);
 
         if (ei.info.valid) {
             /* EXITINFO field: vector = exception number, exit_type = 0x3 for HW / 0x6 for SW */
-            printf("(SGX HW reported AEX vector 0x%x with exit_type = 0x%x)\n", ei.info.vector,
-                   ei.info.exit_type);
+            log_debug("(SGX HW reported AEX vector 0x%x with exit_type = 0x%x)", ei.info.vector,
+                      ei.info.exit_type);
         } else {
-            printf("(untrusted PAL sent PAL event 0x%x)\n", ei.intval);
+            log_debug("(untrusted PAL sent PAL event 0x%x)", ei.intval);
         }
-
-        printf("rax: 0x%08lx rcx: 0x%08lx rdx: 0x%08lx rbx: 0x%08lx\n"
-               "rsp: 0x%08lx rbp: 0x%08lx rsi: 0x%08lx rdi: 0x%08lx\n"
-               "r8 : 0x%08lx r9 : 0x%08lx r10: 0x%08lx r11: 0x%08lx\n"
-               "r12: 0x%08lx r13: 0x%08lx r14: 0x%08lx r15: 0x%08lx\n"
-               "rflags: 0x%08lx rip: 0x%08lx\n",
-               uc->rax, uc->rcx, uc->rdx, uc->rbx,
-               uc->rsp, uc->rbp, uc->rsi, uc->rdi,
-               uc->r8, uc->r9, uc->r10, uc->r11,
-               uc->r12, uc->r13, uc->r14, uc->r15,
-               uc->rflags, uc->rip);
 
         _DkProcessExit(1);
     }
@@ -245,63 +240,52 @@ void _DkExceptionHandler(unsigned int exit_info, sgx_cpu_context_t* uc,
 
     /* TODO: save EXINFO from MISC region and populate below fields */
     ctx.err     = 0;
-    ctx.trapno  = ei.info.valid ? ei.info.vector : event_num;
+    ctx.trapno  = ei.info.valid ? ei.info.vector : 0;
     ctx.oldmask = 0;
     ctx.cr2     = 0;
 
-    PAL_NUM arg = 0;
+    PAL_NUM addr = 0;
     switch (event_num) {
         case PAL_EVENT_ILLEGAL:
-            arg = uc->rip;
+            addr = uc->rip;
             break;
         case PAL_EVENT_MEMFAULT:
             /* TODO: SGX1 doesn't provide fault address but SGX2 does (with lower bits masked) */
             break;
         default:
-            /* nothing */
             break;
     }
 
     PAL_EVENT_HANDLER upcall = _DkGetExceptionHandler(event_num);
     if (upcall) {
-        (*upcall)(arg, &ctx);
+        (*upcall)(ADDR_IN_PAL(uc->rip), addr, &ctx);
     }
 
     restore_pal_context(uc, &ctx);
 }
 
-void _DkRaiseFailure(int error) {
-    PAL_EVENT_HANDLER upcall = _DkGetExceptionHandler(PAL_EVENT_FAILURE);
-    if (upcall) {
-        (*upcall)(error, /*context=*/NULL);
-    }
-}
-
+/* TODO: remove this function (SGX signal handling needs to be revisited)
+ * actually what is the point of this function?
+ * Tracked: https://github.com/oscarlab/graphene/issues/2140 */
 noreturn void _DkHandleExternalEvent(PAL_NUM event, sgx_cpu_context_t* uc,
                                      PAL_XREGS_STATE* xregs_state) {
-    assert(event > 0 && event < PAL_EVENT_NUM_BOUND);
     assert(IS_ALIGNED_PTR(xregs_state, PAL_XSTATE_ALIGN));
 
-    /* we only end up in _DkHandleExternalEvent() if interrupted during host syscall; inform LibOS
-     * layer that PAL was interrupted (by setting PAL_ERRNO) */
-    _DkRaiseFailure(PAL_ERROR_INTERRUPTED);
+    if (event != PAL_EVENT_QUIT && event != PAL_EVENT_INTERRUPTED) {
+        log_error("Illegal exception reported by untrusted PAL: %lu", event);
+        _DkProcessExit(1);
+    }
 
     PAL_CONTEXT ctx;
     save_pal_context(&ctx, uc, xregs_state);
-    ctx.err     = 0;
-    ctx.trapno  = event; /* TODO: event is a PAL event; is that what LibOS/app wants to see? */
-    ctx.oldmask = 0;
-    ctx.cr2     = 0;
 
     PAL_EVENT_HANDLER upcall = _DkGetExceptionHandler(event);
     if (upcall) {
-        (*upcall)(/*arg=*/0, &ctx);
+        (*upcall)(ADDR_IN_PAL(uc->rip), /*addr=*/0, &ctx);
     }
 
     /* modification to PAL_CONTEXT is discarded; it is assumed that LibOS won't change context
      * (GPRs, FP registers) if RIP is in PAL.
-     *
-     * TODO: in long term, record the signal and trigger the signal handler when returning from PAL
-     * via ENTER_PAL_CALL/LEAVE_PAL_CALL/LEAVE_PAL_CALL_RETURN. */
+     */
     restore_sgx_context(uc, xregs_state);
 }

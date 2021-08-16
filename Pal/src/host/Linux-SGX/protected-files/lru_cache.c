@@ -7,10 +7,7 @@
 /* TODO: add regression tests for this */
 
 #include "lru_cache.h"
-
-#include "api.h"
 #include "list.h"
-#include "uthash.h"
 
 #ifdef IN_PAL
 #include "assert.h"
@@ -19,6 +16,13 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#define uthash_fatal(msg)                            \
+    do {                                             \
+        fprintf(stderr, "uthash error: %s\n", msg);  \
+        exit(-1);                                    \
+    } while(0)
+#include "uthash.h"
 #endif
 
 DEFINE_LIST(_lruc_list_node);

@@ -1,19 +1,19 @@
-loader.preload = "file:../../src/libsysdb.so"
-libos.entrypoint = "file:$(ENTRYPOINT)"
-loader.env.LD_LIBRARY_PATH = "/lib:$(ARCH_LIBDIR):/usr/$(ARCH_LIBDIR)"
-loader.insecure__use_cmdline_argv = 1
+loader.preload = "file:{{ graphene.libos }}"
+libos.entrypoint = "{{ entrypoint }}"
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:/usr/{{ arch_libdir }}"
+loader.insecure__use_cmdline_argv = true
 
 fs.mount.graphene_lib.type = "chroot"
 fs.mount.graphene_lib.path = "/lib"
-fs.mount.graphene_lib.uri = "file:../../../../Runtime"
+fs.mount.graphene_lib.uri = "file:{{ graphene.runtimedir() }}"
 
 fs.mount.host_lib.type = "chroot"
-fs.mount.host_lib.path = "$(ARCH_LIBDIR)"
-fs.mount.host_lib.uri = "file:$(ARCH_LIBDIR)"
+fs.mount.host_lib.path = "{{ arch_libdir }}"
+fs.mount.host_lib.uri = "file:{{ arch_libdir }}"
 
 fs.mount.host_usr_lib.type = "chroot"
-fs.mount.host_usr_lib.path = "/usr/$(ARCH_LIBDIR)"
-fs.mount.host_usr_lib.uri = "file:/usr/$(ARCH_LIBDIR)"
+fs.mount.host_usr_lib.path = "/usr/{{ arch_libdir }}"
+fs.mount.host_usr_lib.uri = "file:/usr/{{ arch_libdir }}"
 
 fs.mount.bin.type = "chroot"
 fs.mount.bin.path = "/bin"
@@ -23,14 +23,14 @@ fs.mount.output.type = "chroot"
 fs.mount.output.path = "/mounted"
 fs.mount.output.uri = "file:tmp"
 
-sgx.trusted_files.entrypoint = "file:$(ENTRYPOINT)"
+fs.mount.tmpfs.type = "tmpfs"
+fs.mount.tmpfs.path = "/mnt-tmpfs"
+fs.mount.tmpfs.uri = "file:dummy-unused-by-tmpfs-uri"
 
-sgx.trusted_files.ld = "file:../../../../Runtime/ld-linux-x86-64.so.2"
-sgx.trusted_files.libc = "file:../../../../Runtime/libc.so.6"
-sgx.trusted_files.libdl = "file:../../../../Runtime/libdl.so.2"
-sgx.trusted_files.libm = "file:../../../../Runtime/libm.so.6"
-sgx.trusted_files.libpthread = "file:../../../../Runtime/libpthread.so.0"
-sgx.trusted_files.libgcc_s = "file:$(ARCH_LIBDIR)/libgcc_s.so.1"
+sgx.trusted_files.entrypoint = "file:{{ entrypoint }}"
+
+sgx.trusted_files.runtime = "file:{{ graphene.runtimedir() }}/"
+sgx.trusted_files.libgcc_s = "file:{{ arch_libdir }}/libgcc_s.so.1"
 
 sgx.allowed_files.tmp_dir = "file:tmp/"
 
@@ -38,4 +38,6 @@ sgx.protected_files_key = "ffeeddccbbaa99887766554433221100"
 sgx.protected_files.input = "file:tmp/pf_input"
 sgx.protected_files.output = "file:tmp/pf_output"
 
-sgx.nonpie_binary = 1
+sgx.nonpie_binary = true
+
+sgx.thread_num = 16

@@ -25,7 +25,7 @@ static void signal_io(IDTYPE caller, void* arg) {
         .si_fd = 0,
     };
     if (kill_current_proc(&info) < 0) {
-        debug("signal_io: failed to deliver a signal\n");
+        log_warning("signal_io: failed to deliver a signal");
     }
 }
 
@@ -42,7 +42,7 @@ long shim_do_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg) {
                 break;
             }
 
-            if (test_user_memory((void*)arg, sizeof(int), /*write=*/true)) {
+            if (!is_user_memory_writable((void*)arg, sizeof(int))) {
                 ret = -EFAULT;
                 break;
             }
@@ -50,7 +50,12 @@ long shim_do_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg) {
             ret = 0;
             break;
         case FIONBIO:
-            ret = set_handle_nonblocking(hdl);
+            if (!is_user_memory_readable((void*)arg, sizeof(int))) {
+                ret = -EFAULT;
+                break;
+            }
+            int nonblocking_on = *(int*)arg;
+            ret = set_handle_nonblocking(hdl, !!nonblocking_on);
             break;
         case FIONCLEX:
             hdl->flags &= ~FD_CLOEXEC;
@@ -64,12 +69,12 @@ long shim_do_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg) {
             ret = install_async_event(hdl->pal_handle, 0, &signal_io, NULL);
             break;
         case FIONREAD: {
-            if (test_user_memory((void*)arg, sizeof(int), /*write=*/true)) {
+            if (!is_user_memory_writable((void*)arg, sizeof(int))) {
                 ret = -EFAULT;
                 break;
             }
 
-            struct shim_mount* fs = hdl->fs;
+            struct shim_fs* fs = hdl->fs;
             if (!fs || !fs->fs_ops) {
                 ret = -EACCES;
                 break;
@@ -84,8 +89,9 @@ long shim_do_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg) {
                 size = stat.st_size;
             } else if (hdl->pal_handle) {
                 PAL_STREAM_ATTR attr;
-                if (!DkStreamAttributesQueryByHandle(hdl->pal_handle, &attr)) {
-                    ret = -PAL_ERRNO();
+                ret = DkStreamAttributesQueryByHandle(hdl->pal_handle, &attr);
+                if (ret < 0) {
+                    ret = pal_to_unix_errno(ret);
                     break;
                 }
                 size = attr.pending_size;
@@ -109,5 +115,8 @@ long shim_do_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg) {
     }
 
     put_handle(hdl);
+    if (ret == -EINTR) {
+        ret = -ERESTARTSYS;
+    }
     return ret;
 }

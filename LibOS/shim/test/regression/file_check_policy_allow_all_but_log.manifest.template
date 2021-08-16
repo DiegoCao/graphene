@@ -1,0 +1,19 @@
+loader.preload = "file:{{ graphene.libos }}"
+libos.entrypoint = "file_check_policy"
+loader.argv0_override = "file_check_policy"
+
+loader.env.LD_LIBRARY_PATH = "/lib"
+loader.insecure__use_cmdline_argv = true
+
+fs.mount.lib.type = "chroot"
+fs.mount.lib.path = "/lib"
+fs.mount.lib.uri = "file:{{ graphene.runtimedir() }}"
+
+sgx.file_check_policy = "allow_all_but_log"
+
+sgx.trusted_files.runtime = "file:{{ graphene.runtimedir() }}/"
+sgx.trusted_files.file_check_policy = "file:file_check_policy"
+
+sgx.trusted_files.test = "file:trusted_testfile"
+
+sgx.nonpie_binary = true

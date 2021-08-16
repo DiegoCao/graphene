@@ -8,7 +8,6 @@
 #include "api.h"
 #include "enclave_pages.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_flags_conv.h"
@@ -18,11 +17,10 @@
 #include "pal_security.h"
 
 extern struct atomic_int g_allocated_pages;
-extern size_t g_page_size;
 
 bool _DkCheckMemoryMappable(const void* addr, size_t size) {
     if (addr < DATA_END && addr + size > TEXT_START) {
-        SGX_DBG(DBG_E, "Address %p-%p is not mappable\n", addr, addr + size);
+        log_error("Address %p-%p is not mappable", addr, addr + size);
         return true;
     }
 
@@ -42,11 +40,6 @@ int _DkVirtualMemoryAlloc(void** paddr, uint64_t size, int alloc_type, int prot)
         return -PAL_ERROR_INVAL;
 
     void* addr = *paddr;
-
-    if ((alloc_type & PAL_ALLOC_INTERNAL) && addr) {
-        /* internal-PAL memory allocation never uses fixed addresses */
-        return -PAL_ERROR_INVAL;
-    }
 
     void* mem = get_enclave_pages(addr, size, alloc_type & PAL_ALLOC_INTERNAL);
     if (!mem)
@@ -83,7 +76,7 @@ int _DkVirtualMemoryProtect(void* addr, uint64_t size, int prot) {
     int64_t t = 0;
     if (__atomic_compare_exchange_n(&at_cnt.counter, &t, 1, /*weak=*/false, __ATOMIC_SEQ_CST,
                                     __ATOMIC_RELAXED))
-        SGX_DBG(DBG_M, "[Warning] DkVirtualMemoryProtect is unimplemented in Linux-SGX PAL");
+        log_warning("DkVirtualMemoryProtect is unimplemented in Linux-SGX PAL");
     return 0;
 }
 

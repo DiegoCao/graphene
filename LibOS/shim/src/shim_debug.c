@@ -26,10 +26,9 @@ void remove_r_debug(void* addr) {
     /* do nothing */
 }
 
-void append_r_debug(const char* uri, void* addr, void* dyn_addr) {
+void append_r_debug(const char* uri, void* addr) {
     __UNUSED(uri);
     __UNUSED(addr);
-    __UNUSED(dyn_addr);
     /* do nothing */
 }
 
@@ -38,7 +37,6 @@ void append_r_debug(const char* uri, void* addr, void* dyn_addr) {
 struct gdb_link_map {
     void* l_addr;
     char* l_name;
-    void* l_ld;
     struct gdb_link_map *l_next, *l_prev;
 };
 
@@ -53,8 +51,10 @@ void clean_link_map_list(void) {
         link_map_list->l_prev->l_next = NULL;
 
     struct gdb_link_map* m = link_map_list;
-    for (; m; m = m->l_next) {
+    struct gdb_link_map* next;
+    for (; m; m = next) {
         DkDebugMapRemove(m->l_addr);
+        next = m->l_next;
         free(m);
     }
 
@@ -71,7 +71,7 @@ void remove_r_debug(void* addr) {
     if (!m)
         return;
 
-    debug("remove a library for gdb: %s\n", m->l_name);
+    log_debug("removing a library for gdb: %s", m->l_name);
 
     if (m->l_prev) {
         m->l_prev->l_next = m->l_next;
@@ -87,7 +87,7 @@ void remove_r_debug(void* addr) {
     free(m);
 }
 
-void append_r_debug(const char* uri, void* addr, void* dyn_addr) {
+void append_r_debug(const char* uri, void* addr) {
     struct gdb_link_map* new = malloc(sizeof(struct gdb_link_map));
     if (!new)
         return;
@@ -99,7 +99,6 @@ void append_r_debug(const char* uri, void* addr, void* dyn_addr) {
     }
 
     new->l_addr = addr;
-    new->l_ld   = dyn_addr;
     new->l_name = new_uri;
 
     struct gdb_link_map* prev  = NULL;
@@ -110,7 +109,7 @@ void append_r_debug(const char* uri, void* addr, void* dyn_addr) {
         tail = &(*tail)->l_next;
     }
 
-    debug("add a library for gdb: %s\n", uri);
+    log_debug("adding a library for gdb: %s", uri);
 
     new->l_prev = prev;
     new->l_next = NULL;

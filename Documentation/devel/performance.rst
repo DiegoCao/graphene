@@ -21,7 +21,7 @@ Enabling per-thread and process-wide SGX stats
 
 See also :ref:`perf` below for installing ``perf``.
 
-Enable statistics using ``sgx.enable_stats = 1`` manifest option. Now your
+Enable statistics using ``sgx.enable_stats = true`` manifest option. Now your
 graphenized application correctly reports performance counters. This is useful
 when using e.g. ``perf stat`` to collect performance statistics. This manifest
 option also forces Graphene to dump SGX-related information on each
@@ -29,7 +29,7 @@ thread/process exit. Here is an example:
 
 ::
 
-   LibOS/shim/test/regression$ SGX=1 perf stat graphene/Runtime/pal_loader helloworld
+   LibOS/shim/test/regression$ perf stat graphene-sgx helloworld
    Hello world (helloworld)!
    ----- SGX stats for thread 87219 -----
    # of EENTERs:        224
@@ -44,7 +44,7 @@ thread/process exit. Here is an example:
    # of sync signals:   32
    # of async signals:  0
 
-   Performance counter stats for 'graphene/Runtime/pal_loader helloworld':
+   Performance counter stats for 'graphene-sgx helloworld':
         3,568,568,948      cycles
         1,072,072,581      instructions
           172,308,653      branches
@@ -202,12 +202,12 @@ Here is an example:
 ::
 
    # exitless disabled: `sgx.thread_num = 8` and `sgx.rpc_thread_num = 0`
-   Examples/redis$ SGX=1 ./pal_loader redis-server --save '' --protected-mode no &
+   Examples/redis$ graphene-sgx redis-server --save '' --protected-mode no &
    Examples/redis$ src/src/redis-benchmark -t set
    43010.75 requests per second
 
    # exitless enabled: `sgx.thread_num = 8` and `sgx.rpc_thread_num = 8`
-   Examples/redis$ SGX=1 ./pal_loader redis-server --save '' --protected-mode no &
+   Examples/redis$ graphene-sgx redis-server --save '' --protected-mode no &
    Examples/redis$ src/src/redis-benchmark -t set
    68119.89 requests per second
 
@@ -237,19 +237,20 @@ Optional CPU features (AVX, AVX512, MPX, PKRU)
 SGX technology allows to specify which CPU features are required to run the SGX
 enclave. Graphene "inherits" this and has the following manifest options:
 ``sgx.require_avx``, ``sgx.require_avx512``, ``sgx.require_mpx``,
-``sgx.require_pkru``. By default, all of them are set to zero – this means that
-SGX hardware will allow running the SGX enclave on any system, whether the
+``sgx.require_pkru``. By default, all of them are set to ``false`` – this means
+that SGX hardware will allow running the SGX enclave on any system, whether the
 system has the AVX/AVX512/MPX/PKRU feature or not.
 
 Graphene typically correctly identifies the features of the underlying platform
 and propagates the information on AVX/AVX512/MPX/PKRU inside the enclave and to
 the application. It is recommended to leave these manifest options as-is (set to
-zero). However, we observed on some platforms that the graphenized application
-cannot detect these features and falls back to a slow implementation. For
-example, some crypto libraries do not recognize AVX on the platform and use very
-slow functions, leading to 10-100x overhead over native (we still don't know the
-reason for this behavior). If you suspect this can be your case, enable the
-features in the manifest, e.g., set ``sgx.require_avx = 1``.
+``false``). However, we observed on some platforms that the graphenized
+application cannot detect these features and falls back to a slow
+implementation. For example, some crypto libraries do not recognize AVX on the
+platform and use very slow functions, leading to 10-100x overhead over native
+(we still don't know the reason for this behavior). If you suspect this can be
+your case, enable the features in the manifest, e.g., set
+``sgx.require_avx = true``.
 
 For more information on SGX logic regarding optional CPU features, see the Intel
 Software Developer Manual, Table 38-3 ("Layout of ATTRIBUTES Structure") under
@@ -332,13 +333,13 @@ Modern Icelake machines remove many of the hardware bottlenecks of Intel SGX. If
 you must use an older machine (Skylake, Caby Lake, Mehlow), you should be aware
 that they have severe SGX-hardware limitations. In particular:
 
-#. EPC size. You can think of EPC as a physical cache (just like L3 cache) for
-   enclave pages. On all currently available machines, EPC is only 128-256MB in
-   size. This means that if the application has a working set size of more than
-   100-200MB, enclave pages will be evicted from EPC into RAM.  Eviction of
-   enclave pages (also called EPC swapping or paging) is a very expensive
-   hardware operation. Some applications have a working set size of MBs/GBs of
-   data, so performance will be significantly impaired.
+#. :term:`EPC` size. You can think of EPC as a physical cache (just like L3
+   cache) for enclave pages. On all currently available machines, EPC is only
+   128-256MB in size. This means that if the application has a working set size
+   of more than 100-200MB, enclave pages will be evicted from EPC into RAM.
+   Eviction of enclave pages (also called EPC swapping or paging) is a very
+   expensive hardware operation. Some applications have a working set size of
+   MBs/GBs of data, so performance will be significantly impaired.
 
 #. RDTSC/RDTSCP instructions. These instructions are forbidden to execute in an
    SGX enclave on older machines. Unfortunately, many applications and runtimes
@@ -362,6 +363,13 @@ that they have severe SGX-hardware limitations. In particular:
    version that performs function calls inside Graphene instead of raw SYSCALL
    instructions and thus avoids this overhead).
 
+#. CPU topology. The CPU topology may negatively affect performance of Graphene.
+   For example, if the machine has several NUMA domains, it is important to
+   restrict Graphene runs to only one NUMA domain, e.g., via the command
+   ``numactl --cpunodebind=0 --membind=0``. Otherwise Graphene may spread
+   enclave threads and enclave memory across several NUMA domains, which will
+   lead to higher memory access latencies and overall worse performance.
+
 Other considerations
 --------------------
 
@@ -371,6 +379,17 @@ defaults to non-debug configuration). Also build the application itself in
 non-debug configuration (again, typically simple ``make SGX=1`` is sufficient).
 Finally, disable the debug log of Graphene by specifying the manifest option
 ``loader.log_level = "none"``.
+
+There are several manifest options that may improve performance of some
+workloads. The manifest options include:
+
+- ``libos.check_invalid_pointers = false`` -- disable checks of invalid pointers
+  on system call invocations. Most real-world applications never provide invalid
+  arguments to system calls, so there is no need in additional checks.
+- ``sgx.preheat_enclave = true`` -- pre-fault all enclave pages during enclave
+  initialization. This shifts the overhead of page faults on non-present enclave
+  pages from runtime to enclave startup time. Using this option makes sense only
+  if the whole enclave memory fits into :term:`EPC`.
 
 If your application periodically fails and complains about seemingly irrelevant
 things, it may be due to insufficient enclave memory. Please try to increase
@@ -409,10 +428,11 @@ Finally, recall that by default Graphene doesn't propagate environment variables
 into the SGX enclave. Thus, environment variables like ``OMP_NUM_THREADS`` and
 ``MKL_NUM_THREADS`` are not visible to the graphenized application by default.
 To propagate them into the enclave, either use the insecure manifest option
-``loader.insecure__use_host_env = 1`` (don't use this in production!) or specify
-them explicitly in the manifest via ``loader.env.OMP_NUM_THREADS = "8"``. Also,
-it is always better to specify such environment variables explicitly because a
-graphenized application may determine the number of available CPUs incorrectly.
+``loader.insecure__use_host_env = true`` (don't use this in production!) or
+specify them explicitly in the manifest via
+``loader.env.OMP_NUM_THREADS = "8"``. Also, it is always better to specify such
+environment variables explicitly because a graphenized application may determine
+the number of available CPUs incorrectly.
 
 .. _perf:
 
@@ -472,7 +492,7 @@ Recording samples with ``perf record``
 
 To record (saves ``perf.data``)::
 
-    perf record ./pal_loader application
+    perf record graphene-direct application
 
 To view the report for ``perf.data``::
 
@@ -510,16 +530,19 @@ Further reading
 SGX profiling
 -------------
 
-There is some experimental support for profiling the code inside the SGX
-enclave. Here is how to use it:
+There is support for profiling the code inside the SGX enclave. Here is how to
+use it:
 
-#. Compile Graphene with ``SGX=1 DEBUG=1``.
+#. Compile Graphene with ``SGX=1 DEBUGOPT=1``.
+
+   You can also use ``SGX=1 DEBUG=1``, but ``DEBUGOPT=1`` (optimizations
+   enabled) makes Graphene performance more similar to release build.
 
 #. Add ``sgx.profile.enable = "main"`` to manifest (to collect data for the main
    process), or ``sgx.profile.enable = "all"`` (to collect data for all
    processes).
 
-#. (Add ``sgx.profile.with_stack = 1`` for call chain information.)
+#. (Add ``sgx.profile.with_stack = true`` for call chain information.)
 
 #. Run your application. It should say something like ``Profile data written to
    sgx-perf.data`` on process exit (in case of ``sgx.profile.enable = "all"``,
@@ -527,11 +550,39 @@ enclave. Here is how to use it:
 
 #. Run ``perf report -i <data file>`` (see :ref:`perf` above).
 
-*Note*: The accuracy of this tool is unclear. The SGX profiling works by
-measuring the value of instruction pointer on each asynchronous enclave exit
-(AEX), which happen on Linux scheduler interrupts, as well as other events such
-as page faults. While we attempt to measure time (and not only count
-occurences), the results might be inaccurate.
+*Note*: The accuracy of this tool is unclear (though we had positive experiences
+using the tool so far). The SGX profiling works by measuring the value of
+instruction pointer on each asynchronous enclave exit (AEX), which happen on
+Linux scheduler interrupts, as well as other events such as page faults. While
+we attempt to measure time (and not only count occurences), the results might be
+inaccurate.
+
+.. _sgx-profile-ocall:
+
+OCALL profiling
+"""""""""""""""
+
+It's also possible to discover what OCALLs are being executed, which should help
+attribute the EEXIT numbers given by ``sgx.enable_stats``. There are two ways to
+do that:
+
+* Use ``sgx.profile.mode = "ocall_inner"`` and ``sgx.profile.with_stack =
+  1``. This will give you a report on what enclave code is causing the OCALLs
+  (best viewed with ``perf report --no-children``).
+
+  The ``with_stack`` option is important: without it, the report will only show
+  the last function before enclave exit, which is usually the same regardless of
+  which OCALL we're executing.
+
+* Use ``sgx.profile.mode = "ocall_outer"``. This will give you a report on what
+  outer PAL code is handling the OCALLs (``sgx_ocall_open``, ``sgx_ocall_write``
+  etc.)
+
+**Warning**: The report for OCALL modes should be interpreted in term of *number
+of OCALLs*, not time spent in them. The profiler records a sample every time an
+OCALL is executed, and ``perf report`` displays percentages based on the number
+of samples.
+
 
 Other useful tools for profiling
 --------------------------------

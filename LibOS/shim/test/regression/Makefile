@@ -14,8 +14,10 @@ c_executables = \
 	bootstrap_pie \
 	bootstrap_static \
 	debug \
-	dev \
-	device \
+	devfs \
+	device_passthrough \
+	double_fork \
+	epoll_epollet \
 	epoll_wait_timeout \
 	eventfd \
 	exec \
@@ -25,6 +27,7 @@ c_executables = \
 	exec_victim \
 	exit \
 	exit_group \
+	fcntl_lock \
 	fdleak \
 	file_check_policy \
 	file_size \
@@ -38,14 +41,18 @@ c_executables = \
 	futex_wake_op \
 	getcwd \
 	getdents \
+	getdents_lseek \
 	getsockname \
 	getsockopt \
+	gettimeofday \
 	groups \
 	helloworld \
 	host_root_fs \
 	init_fail \
-	large_mmap \
+	kill_all \
 	large_dir_read \
+	large_file \
+	large_mmap \
 	madvise \
 	mkfifo \
 	mmap_file \
@@ -78,8 +85,9 @@ c_executables = \
 	sigprocmask_pending \
 	spinlock \
 	stat_invalid_args \
-	str_close_leak \
 	syscall \
+	syscall_restart \
+	sysfs_common \
 	tcp_ipv6_v6only \
 	tcp_msg_peek \
 	udp \
@@ -87,34 +95,26 @@ c_executables = \
 	vfork_and_exec \
 	$(c_executables-$(ARCH))
 
-cxx_executables = bootstrap_cpp
+cxx_executables-x86_64 = bootstrap_cpp
 
 repo_manifests = \
 	argv_from_file.manifest \
 	debug_log_file.manifest \
 	debug_log_inline.manifest \
+	device_passthrough.manifest \
 	env_from_file.manifest \
 	env_from_host.manifest \
 	file_check_policy_allow_all_but_log.manifest \
 	file_check_policy_strict.manifest \
-	host_root_fs.manifest \
-	init_fail.manifest \
-	init_fail2.manifest \
-	large_mmap.manifest \
-	multi_pthread.manifest \
 	multi_pthread_exitless.manifest
 
-# Empty rule to prevent overriding them using "%.manifest: manifest.template" rule.
-$(repo_manifests): ;
-
-gen_manifests = $(filter-out $(repo_manifests),$(addsuffix .manifest,$(c_executables) $(cxx_executables)))
+gen_manifests = $(addsuffix .manifest,$(c_executables) $(cxx_executables-$(ARCH)))
 all_manifests = $(repo_manifests) $(gen_manifests)
 
 exec_target = \
 	$(c_executables) \
-	$(cxx_executables)
+	$(cxx_executables-$(ARCH))
 
-# repo_manifests needs to be included here to generate .manifest.sgx on SGX also for them.
 target = \
 	$(exec_target) \
 	$(all_manifests)
@@ -122,8 +122,8 @@ target = \
 clean-extra += clean-tmp
 
 extra_rules = \
-	-e 's:\$$(RA_CLIENT_SPID):$(if $(RA_CLIENT_SPID),$(RA_CLIENT_SPID),):g' \
-	-e 's:\$$(RA_CLIENT_LINKABLE):$(if $(RA_CLIENT_LINKABLE),$(RA_CLIENT_LINKABLE),0):g'
+	-Dra_client_spid=$(if $(RA_CLIENT_SPID),$(RA_CLIENT_SPID),) \
+	-Dra_client_linkable=$(if $(RA_CLIENT_LINKABLE),$(RA_CLIENT_LINKABLE),0)
 
 include ../../../../Scripts/manifest.mk
 include ../../../../Scripts/Makefile.Test
@@ -134,7 +134,6 @@ CFLAGS-debug = -g3
 CFLAGS-debug_regs-x86_64 = -g3
 CFLAGS-exec_same = -pthread
 CFLAGS-shared_object = -fPIC -pie
-CFLAGS-syscall += -I$(PALDIR)/../include -I$(PALDIR)/host/$(PAL_HOST) -I$(PALDIR)/../include/arch/$(ARCH)/Linux
 CFLAGS-openmp = -fopenmp
 CFLAGS-multi_pthread = -pthread
 CFLAGS-exit_group = -pthread
@@ -144,18 +143,24 @@ CFLAGS-futex_bitset = -pthread
 CFLAGS-futex_requeue = -pthread
 CFLAGS-futex_wake_op = -pthread
 CFLAGS-proc_common = -pthread
-CFLAGS-spinlock += -I$(PALDIR)/../include/lib -I$(PALDIR)/../include/arch/$(ARCH) -pthread
+CFLAGS-spinlock += -iquote ../../../../common/include -iquote ../../../../common/include/arch/$(ARCH) -pthread
 CFLAGS-sigaction_per_process += -pthread
 CFLAGS-signal_multithread += -pthread
 CFLAGS-pthread_set_get_affinity += -pthread
+CFLAGS-gettimeofday += -pthread
 
-CFLAGS-attestation += -I$(PALDIR)/../lib/crypto/mbedtls/crypto/include \
-                      -I$(PALDIR)/host/Linux-SGX \
-                      -I$(PALDIR)/../include/pal
-LDLIBS-attestation += $(PALDIR)/../lib/crypto/mbedtls/install/lib/libmbedcrypto.a
+CFLAGS-attestation += -iquote ../../../../common/src/crypto/mbedtls/include \
+                      -iquote $(PALDIR)/host/Linux-SGX
+LDLIBS-attestation += ../../../../common/src/crypto/mbedtls/install/lib/libmbedcrypto.a
 
 CFLAGS-fp_multithread += -pthread -fno-builtin  # see comment in the test's source
 LDLIBS-fp_multithread += -lm
+
+proc_common: proc_common.o dump.o
+	$(call cmd,cmulti)
+
+sysfs_common: sysfs_common.o dump.o
+	$(call cmd,cmulti)
 
 %: %.c
 	$(call cmd,csingle)
@@ -173,4 +178,18 @@ libos-regression.xml: test_libos.py $(call expand_target_to_token,$(target))
 
 .PHONY: clean-tmp
 clean-tmp:
-	$(RM) -r *.tmp *.cached *.manifest.sgx *~ *.sig *.token .cache __pycache__ libos-regression.xml testfile tmp/*
+	$(RM) -r \
+		*.cached \
+		*.manifest \
+		*.manifest.sgx \
+		*.sig \
+		*.tmp \
+		*.token \
+		*~ \
+		.cache \
+		.pytest_cache \
+		__pycache__ \
+		libos-regression.xml \
+		testfile \
+		tmp/* \
+		*.o

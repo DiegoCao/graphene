@@ -25,7 +25,7 @@ long shim_do_faccessat(int dfd, const char* filename, mode_t mode) {
     if (!filename)
         return -EINVAL;
 
-    if (test_user_string(filename))
+    if (!is_user_string_readable(filename))
         return -EFAULT;
 
     struct shim_dentry* dir = NULL;
@@ -35,16 +35,16 @@ long shim_do_faccessat(int dfd, const char* filename, mode_t mode) {
     if (*filename != '/' && (ret = get_dirfd_dentry(dfd, &dir)) < 0)
         return ret;
 
-    lock(&dcache_lock);
+    lock(&g_dcache_lock);
 
-    ret = __path_lookupat(dir, filename, LOOKUP_ACCESS | LOOKUP_FOLLOW, &dent, 0, NULL, false);
+    ret = _path_lookupat(dir, filename, LOOKUP_FOLLOW, &dent);
     if (ret < 0)
         goto out;
 
-    ret = __permission(dent, mode);
+    ret = check_permissions(dent, mode);
 
 out:
-    unlock(&dcache_lock);
+    unlock(&g_dcache_lock);
 
     if (dir)
         put_dentry(dir);

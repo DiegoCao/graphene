@@ -32,7 +32,7 @@ endif
 
 .PHONY: all
 all: $(OPENVINO_DIR)/inference-engine/bin/intel64/$(OPENVINO_BUILD)/object_detection_sample_ssd \
-     $(MODEL_DIR)/$(MODEL_NAME).bin object_detection_sample_ssd.manifest pal_loader
+     $(MODEL_DIR)/$(MODEL_NAME).bin object_detection_sample_ssd.manifest
 ifeq ($(SGX),1)
 all: object_detection_sample_ssd.manifest.sgx object_detection_sample_ssd.sig \
      object_detection_sample_ssd.token
@@ -59,40 +59,35 @@ $(OPENVINO_DIR)/README.md:
 
 $(OPENVINO_DIR)/inference-engine/bin/intel64/$(OPENVINO_BUILD)/object_detection_sample_ssd: $(OPENVINO_DIR)/README.md
 	cd $(OPENVINO_DIR)/inference-engine && mkdir -p build
-	cd $(OPENVINO_DIR)/inference-engine/build && cmake -DTHREADING=OMP -DCMAKE_BUILD_TYPE=$(OPENVINO_BUILD) ../..
+	cd $(OPENVINO_DIR)/inference-engine/build && cmake -DCMAKE_BUILD_TYPE=$(OPENVINO_BUILD) ../..
 	$(MAKE) -C $(OPENVINO_DIR)/inference-engine/build
 
 object_detection_sample_ssd.manifest: object_detection_sample_ssd.manifest.template
-	sed -e 's|$$(GRAPHENE_DIR)|'"$(GRAPHENE_DIR)"'|g' \
-	    -e 's|$$(GRAPHENE_LOG_LEVEL)|'"$(GRAPHENE_LOG_LEVEL)"'|g' \
-	    -e 's|$$(OPENVINO_DIR)|'"$(OPENVINO_DIR)"'|g' \
-	    -e 's|$$(OPENVINO_DIR_ABSPATH)|'"$(abspath $(OPENVINO_DIR))"'|g' \
-	    -e 's|$$(MODEL_DIR)|'"$(MODEL_DIR)"'|g' \
-	    -e 's|$$(OPENVINO_BUILD)|'"$(OPENVINO_BUILD)"'|g' \
-	    -e 's|$$(ARCH_LIBDIR)|'"$(ARCH_LIBDIR)"'|g' \
-	    $< > $@
+	graphene-manifest \
+		-Dlog_level=$(GRAPHENE_LOG_LEVEL) \
+		-Darch_libdir=$(ARCH_LIBDIR) \
+		-Dopenvino_dir=$(abspath $(OPENVINO_DIR)) \
+		-Dmodel_dir=$(MODEL_DIR) \
+		-Dopenvino_build=$(OPENVINO_BUILD) \
+		$< > $@
 
 # Generating the SGX-specific manifest (object_detection_sample_ssd.manifest.sgx), the enclave signature,
 # and the token for enclave initialization.
 object_detection_sample_ssd.manifest.sgx: object_detection_sample_ssd.manifest \
 		$(OPENVINO_DIR)/inference-engine/bin/intel64/$(OPENVINO_BUILD)/object_detection_sample_ssd
-	$(GRAPHENE_DIR)/Pal/src/host/Linux-SGX/signer/pal-sgx-sign \
-		-libpal $(GRAPHENE_DIR)/Runtime/libpal-Linux-SGX.so \
-		-key $(SGX_SIGNER_KEY) \
-		-manifest $< \
-		-output $@
+	graphene-sgx-sign \
+		--key $(SGX_SIGNER_KEY) \
+		--manifest $< \
+		--output $@
 
 object_detection_sample_ssd.sig: object_detection_sample_ssd.manifest.sgx
 
 object_detection_sample_ssd.token: object_detection_sample_ssd.sig
-	$(GRAPHENE_DIR)/Pal/src/host/Linux-SGX/signer/pal-sgx-get-token -sig $< -output $@
-
-pal_loader:
-	ln -s $(GRAPHENE_DIR)/Runtime/pal_loader $@
+	graphene-sgx-get-token --sig $< --output $@
 
 .PHONY: clean
 clean:
-	$(RM) *.manifest *.manifest.sgx *.token *.sig pal_loader *.bmp
+	$(RM) *.manifest *.manifest.sgx *.token *.sig *.bmp
 
 .PHONY: distclean
 distclean: clean

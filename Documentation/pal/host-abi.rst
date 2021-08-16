@@ -93,11 +93,10 @@ Basic types
 Graphene control block
 ^^^^^^^^^^^^^^^^^^^^^^
 
-The control block in Graphene is a structure that provides static information
-about the current process and its host. It is also a dynamic symbol that will be
-linked by the library OS and resolved at runtime. Sometimes, for the flexibility
-or the convenience of the dynamic resolution, the address of the control block
-may be resolved by a function (:func:`pal_control_addr()`).
+The control block in Graphene is a structure that provides static immutable
+information about the current process and its host. The address of the control
+block is resolved via :func:`DkGetPalControl()` and can be memorized in a global
+variable for ease of use.
 
 The fields of the Graphene control block are defined as follows:
 
@@ -113,14 +112,17 @@ The fields of the Graphene control block are defined as follows:
    :project: pal
    :members:
 
+.. doxygentypedef:: PAL_TOPO_INFO
+   :project: pal
+.. doxygenstruct:: PAL_TOPO_INFO_
+   :project: pal
+   :members:
+
 .. doxygentypedef:: PAL_MEM_INFO
    :project: pal
 .. doxygenstruct:: PAL_MEM_INFO_
    :project: pal
    :members:
-
-.. doxygenfunction:: pal_control_addr
-   :project: pal
 
 Pal APIs
 --------
@@ -242,9 +244,6 @@ applications.
    :project: pal
 
 
-.. doxygendefine:: PAL_STREAM_ERROR
-   :project: pal
-
 Flags used for stream manipulation
 """"""""""""""""""""""""""""""""""
 
@@ -274,9 +273,6 @@ seven calls to create, signal, and block on synchronization objects.
 .. doxygenfunction:: DkThreadCreate
    :project: pal
 
-.. doxygenfunction:: DkThreadDelayExecution
-   :project: pal
-
 .. doxygenfunction:: DkThreadYieldExecution
    :project: pal
 
@@ -295,7 +291,7 @@ Exception handling
 
 .. doxygentypedef:: PAL_CONTEXT
    :project: pal
-.. doxygenstruct:: PAL_CONTEXT_
+.. doxygenstruct:: PAL_CONTEXT
    :project: pal
    :members:
 
@@ -309,16 +305,10 @@ Exception handling
 Synchronization
 ^^^^^^^^^^^^^^^
 
-.. doxygenfunction:: DkMutexCreate
+.. doxygendefine:: NO_TIMEOUT
    :project: pal
 
-.. doxygenfunction:: DkMutexRelease
-   :project: pal
-
-.. doxygenfunction:: DkNotificationEventCreate
-   :project: pal
-
-.. doxygenfunction:: DkSynchronizationEventCreate
+.. doxygenfunction:: DkEventCreate
    :project: pal
 
 .. doxygenfunction:: DkEventSet
@@ -327,14 +317,11 @@ Synchronization
 .. doxygenfunction:: DkEventClear
    :project: pal
 
+.. doxygenfunction:: DkEventWait
+   :project: pal
+
 Objects
 ^^^^^^^
-
-.. doxygendefine:: NO_TIMEOUT
-   :project: pal
-
-.. doxygenfunction:: DkSynchronizationObjectWait
-   :project: pal
 
 .. doxygenfunction:: DkStreamsWaitEvents
    :project: pal
@@ -351,6 +338,9 @@ increment and decrement the reference counts on objects shared between threads,
 and to obtain an attestation report and quote.
 
 .. doxygenfunction:: DkDebugLog
+   :project: pal
+
+.. doxygenfunction:: DkGetPalControl
    :project: pal
 
 .. doxygenfunction:: DkSystemTimeQuery
@@ -372,9 +362,6 @@ and to obtain an attestation report and quote.
    :project: pal
 
 .. doxygenfunction:: DkCpuIdRetrieve
-   :project: pal
-
-.. doxygenenum:: PAL_CPUID_WORD
    :project: pal
 
 .. doxygenfunction:: DkAttestationReport

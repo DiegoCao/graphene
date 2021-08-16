@@ -1,14 +1,16 @@
 #ifndef _SHIM_SIGNAL_H_
 #define _SHIM_SIGNAL_H_
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "shim_defs.h"
 #include "shim_types.h"
-#include "ucontext.h"
 
 #define __WCOREDUMP_BIT 0x80
 
 void sigaction_make_defaults(struct __kernel_sigaction* sig_action);
-void thread_sigaction_reset_on_execve(struct shim_thread* thread);
+void thread_sigaction_reset_on_execve(void);
 
 #define BITS_PER_WORD (8 * sizeof(unsigned long))
 /* The standard def of this macro is dumb */
@@ -42,14 +44,14 @@ void thread_sigaction_reset_on_execve(struct shim_thread* thread);
         0;                              \
     }))
 
-#define __sigisemptyset(set)               \
-    (__extension__({                       \
-        int __cnt = _SIGSET_NWORDS;        \
-        const __sigset_t* __set = (set);   \
-        int __ret = __set->__val[--__cnt]; \
-        while (!__ret && --__cnt >= 0)     \
-            __ret = __set->__val[__cnt];   \
-        __ret == 0;                        \
+#define __sigisemptyset(set)                             \
+    (__extension__({                                     \
+        int __cnt = _SIGSET_NWORDS;                      \
+        const __sigset_t* __set = (set);                 \
+        unsigned long int __ret = __set->__val[--__cnt]; \
+        while (!__ret && --__cnt >= 0)                   \
+            __ret = __set->__val[__cnt];                 \
+        __ret == 0;                                      \
     }))
 
 #define __sigandset(dest, left, right)                                             \
@@ -102,33 +104,62 @@ __SIGSETFN(shim_sigdelset, ((__set->__val[__word] &= ~__mask), 0), )
 
 void clear_illegal_signals(__sigset_t* set);
 
-/* NB: Check shim_signal.c if this changes.  Some memset(0) elision*/
 struct shim_signal {
-    siginfo_t    info;
-    bool         context_stored;
-    ucontext_t   context;
-    PAL_CONTEXT* pal_context;
+    siginfo_t siginfo;
 };
 
-void get_pending_signals(struct shim_thread* thread, __sigset_t* set);
+void get_all_pending_signals(__sigset_t* set);
+bool have_pending_signals(void);
+
+/*!
+ * \brief Return stack pointer to use in a signal handler.
+ *
+ * \param sp Current stack pointer value.
+ * \param use_altstack True if alternative stack should be used.
+ *
+ * Returns value to be used as a new stack pointer in the signal handler, depending on the current
+ * thread's settings.
+ */
+uintptr_t get_stack_for_sighandler(uintptr_t sp, bool use_altstack);
+/*!
+ * \brief Check whether address is on alternative stack.
+ *
+ * \param sp Stack pointer value.
+ * \param alt_stack Pointer to the alternative stack.
+ *
+ * Returns `true` if \p sp is on \p alt_stack.
+ */
+bool is_on_altstack(uintptr_t sp, stack_t* alt_stack);
 
 struct shim_thread;
 
-int init_signal(void);
-
-void __store_context(shim_tcb_t* tcb, PAL_CONTEXT* pal_context, struct shim_signal* signal);
+int init_signal_handling(void);
 
 int append_signal(struct shim_thread* thread, siginfo_t* info);
-void deliver_signal(siginfo_t* info, PAL_CONTEXT* context);
+
+/*!
+ * \brief Pop any of the pending signals allowed in \p mask.
+ *
+ * \param[in]  mask    Mask of blocked signals to compare against. If NULL, then the current thread
+ *                     signal mask is used.
+ * \param[out] signal  Pointer to signal, filled with signal info.
+ *
+ * Checks whether there is a pending unblocked signal among normal per-thread/per-process signals
+ * and host-injected signals. Returns the first such signal in \p signal, or sets
+ * `signal.siginfo.si_signo = 0` if no signal is found.
+ */
+void pop_unblocked_signal(__sigset_t* mask, struct shim_signal* signal);
 
 void get_sig_mask(struct shim_thread* thread, __sigset_t* mask);
 void set_sig_mask(struct shim_thread* thread, const __sigset_t* new_set);
 
 int kill_current_proc(siginfo_t* info);
-int do_kill_thread(IDTYPE sender, IDTYPE tgid, IDTYPE tid, int sig, bool use_ipc);
-int do_kill_proc(IDTYPE sender, IDTYPE tgid, int sig, bool use_ipc);
+int do_kill_thread(IDTYPE sender, IDTYPE tgid, IDTYPE tid, int sig);
+int do_kill_proc(IDTYPE sender, IDTYPE pid, int sig);
 int do_kill_pgroup(IDTYPE sender, IDTYPE pgid, int sig);
 
 void fill_siginfo_code_and_status(siginfo_t* info, int signal, int exit_code);
+
+int do_nanosleep(uint64_t timeout_us, struct __kernel_timespec* rem);
 
 #endif /* _SHIM_SIGNAL_H_ */

@@ -1,6 +1,6 @@
 # Add host-specific compilation rules here
 
-CFLAGS += -fPIC -maes -Wp,-U_FORTIFY_SOURCE -fno-builtin $(call cc-option,-Wtrampolines)
+CFLAGS += -fPIC -maes -fno-builtin $(call cc-option,-Wtrampolines)
 
 CFLAGS += -Wextra $(call cc-option,-Wnull-dereference)
 
@@ -18,4 +18,3 @@ pal_loader = $(HOST_DIR)/pal-sgx
 pal_lib = $(HOST_DIR)/libpal.so
 pal_lib_deps = pal-symbols $(HOST_DIR)/pal.map.template $(HOST_DIR)/enclave.lds
 pal_static = $(HOST_DIR)/libpal.a
-pal_signer = pal-sgx-get-token pal-sgx-sign aesm_pb2.py

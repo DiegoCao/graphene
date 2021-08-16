@@ -23,21 +23,37 @@
 #include "shim_vma.h"
 #include "stat.h"
 
-#define URI_MAX_SIZE STR_SIZE
-
-#define FILE_BUFMAP_SIZE (PAL_CB(alloc_align) * 4)
-#define FILE_BUF_SIZE    (PAL_CB(alloc_align))
-
 struct mount_data {
     size_t data_size;
     enum shim_file_type base_type;
-    unsigned long ino_base;
+    unsigned long dev;
     size_t root_uri_len;
     char root_uri[];
 };
 
-#define HANDLE_MOUNT_DATA(h) ((struct mount_data*)(h)->fs->data)
-#define DENTRY_MOUNT_DATA(d) ((struct mount_data*)(d)->fs->data)
+struct file_sync_data {
+    off_t size;
+    off_t marker;
+};
+
+static void file_sync_lock(struct shim_file_handle* file, int state) {
+    struct file_sync_data data;
+    bool updated = sync_lock(file->sync, state, &data, sizeof(data));
+    if (updated) {
+        file->size = data.size;
+        file->marker = data.marker;
+    }
+}
+
+static void file_sync_unlock(struct shim_file_handle* file) {
+    struct file_sync_data data = {
+        .size = file->size,
+        .marker = file->marker,
+    };
+    sync_unlock(file->sync, &data, sizeof(data));
+}
+
+#define DENTRY_MOUNT_DATA(d) ((struct mount_data*)(d)->mount->data)
 
 static int chroot_mount(const char* uri, void** mount_data) {
     enum shim_file_type type;
@@ -57,14 +73,14 @@ static int chroot_mount(const char* uri, void** mount_data) {
     if (!(*uri))
         uri = ".";
 
-    int uri_len = strlen(uri);
-    int data_size = uri_len + 1 + sizeof(struct mount_data);
+    size_t uri_len = strlen(uri);
+    size_t data_size = uri_len + 1 + sizeof(struct mount_data);
 
     struct mount_data* mdata = (struct mount_data*)malloc(data_size);
 
     mdata->data_size    = data_size;
     mdata->base_type    = type;
-    mdata->ino_base     = hash_path(uri, uri_len);
+    mdata->dev          = hash_str(uri);
     mdata->root_uri_len = uri_len;
     memcpy(mdata->root_uri, uri, uri_len + 1);
 
@@ -77,44 +93,51 @@ static int chroot_unmount(void* mount_data) {
     return 0;
 }
 
-static inline ssize_t concat_uri(char* buffer, size_t size, int type, const char* root,
-                                 size_t root_len, const char* trim, size_t trim_len) {
-    char* tmp = NULL;
+static int alloc_concat_uri(int type, const char* root, size_t root_len, const char* path,
+                            size_t path_len, char** out, size_t* out_len) {
+    const char* prefix = NULL;
 
     switch (type) {
         case FILE_UNKNOWN:
         case FILE_REGULAR:
-            tmp = strcpy_static(buffer, URI_PREFIX_FILE, size);
+            prefix = URI_PREFIX_FILE;
             break;
 
         case FILE_DIR:
-            tmp = strcpy_static(buffer, URI_PREFIX_DIR, size);
+            prefix = URI_PREFIX_DIR;
             break;
 
         case FILE_DEV:
         case FILE_TTY:
-            tmp = strcpy_static(buffer, URI_PREFIX_DEV, size);
+            prefix = URI_PREFIX_DEV;
             break;
 
         default:
             return -EINVAL;
     }
 
-    if (!tmp || tmp + root_len + trim_len + 2 > buffer + size)
-        return -ENAMETOOLONG;
-
-    if (root_len) {
-        memcpy(tmp, root, root_len + 1);
-        tmp += root_len;
+    size_t prefix_len = strlen(prefix);
+    size_t alloc_size = prefix_len + root_len + 1 + path_len + 1; // one for '/', one for '\0'
+    char* buf = malloc(alloc_size);
+    if (!buf) {
+        return -ENOMEM;
     }
 
-    if (trim_len) {
-        *(tmp++) = '/';
-        memcpy(tmp, trim, trim_len + 1);
-        tmp += trim_len;
-    }
+    *out = buf;
+    *out_len = alloc_size - 1; // return length does not include trailing '\0'
 
-    return tmp - buffer;
+    memcpy(buf, prefix, prefix_len);
+    buf += prefix_len;
+    memcpy(buf, root, root_len);
+    buf += root_len;
+    if (path_len) {
+        *buf++ = '/';
+        memcpy(buf, path, path_len);
+        buf += path_len;
+    }
+    *buf = '\0';
+
+    return 0;
 }
 
 /* simply just create data, sometimes it is individually called when the
@@ -137,18 +160,31 @@ static void __destroy_data(struct shim_file_data* data) {
     free(data);
 }
 
-static ssize_t make_uri(struct shim_dentry* dent) {
+static int make_uri(struct shim_dentry* dent) {
     struct mount_data* mdata = DENTRY_MOUNT_DATA(dent);
     assert(mdata);
 
     struct shim_file_data* data = FILE_DENTRY_DATA(dent);
-    char uri[URI_MAX_SIZE];
-    ssize_t len = concat_uri(uri, URI_MAX_SIZE, data->type, mdata->root_uri, mdata->root_uri_len,
-                             qstrgetstr(&dent->rel_path), dent->rel_path.len);
-    if (len >= 0)
-        qstrsetstr(&data->host_uri, uri, len);
+    char* uri = NULL;
+    size_t uri_len = 0;
 
-    return len;
+    char* rel_path;
+    size_t rel_path_size;
+    int ret = dentry_rel_path(dent, &rel_path, &rel_path_size);
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = alloc_concat_uri(data->type, mdata->root_uri, mdata->root_uri_len,
+                           rel_path, rel_path_size - 1, &uri, &uri_len);
+    free(rel_path);
+    if (ret < 0) {
+        return ret;
+    }
+
+    qstrsetstr(&data->host_uri, uri, uri_len);
+    free(uri);
+    return 0;
 }
 
 /* create a data in the dentry and compose it's uri. dent->lock needs to
@@ -168,7 +204,7 @@ static int create_data(struct shim_dentry* dent, const char* uri, size_t len) {
     struct mount_data* mdata = DENTRY_MOUNT_DATA(dent);
     assert(mdata);
     data->type = (dent->state & DENTRY_ISDIRECTORY) ? FILE_DIR : mdata->base_type;
-    data->mode = NO_MODE;
+    data->queried = false;
 
     if (uri) {
         qstrsetstr(&data->host_uri, uri, len);
@@ -182,96 +218,81 @@ static int create_data(struct shim_dentry* dent, const char* uri, size_t len) {
     return 0;
 }
 
-static int chroot_readdir(struct shim_dentry* dent, struct shim_dirent** dirent);
+static int chroot_readdir(struct shim_dentry* dent, readdir_callback_t callback, void* arg);
 
 static int __query_attr(struct shim_dentry* dent, struct shim_file_data* data,
                         PAL_HANDLE pal_handle) {
     PAL_STREAM_ATTR pal_attr;
     enum shim_file_type old_type = data->type;
 
-    if (pal_handle ? !DkStreamAttributesQueryByHandle(pal_handle, &pal_attr)
-                   : !DkStreamAttributesQuery(qstrgetstr(&data->host_uri), &pal_attr))
-        return -PAL_ERRNO();
+    int ret;
+    if (pal_handle) {
+        ret = DkStreamAttributesQueryByHandle(pal_handle, &pal_attr);
+    } else {
+        ret = DkStreamAttributesQuery(qstrgetstr(&data->host_uri), &pal_attr);
+    }
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
+    mode_t type;
     /* need to correct the data type */
-    if (data->type == FILE_UNKNOWN)
-        switch (pal_attr.handle_type) {
-            case pal_type_file:
-                data->type = FILE_REGULAR;
-                if (dent)
-                    dent->type = S_IFREG;
-                break;
-            case pal_type_dir:
-                data->type = FILE_DIR;
-                if (dent)
-                    dent->type = S_IFDIR;
-                break;
-            case pal_type_dev:
+    switch (pal_attr.handle_type) {
+        case pal_type_file:
+            data->type = FILE_REGULAR;
+            type = S_IFREG;
+            break;
+        case pal_type_dir:
+            data->type = FILE_DIR;
+            type = S_IFDIR;
+            break;
+        case pal_type_dev:
+            if (strstartswith(qstrgetstr(&data->host_uri) + static_strlen(URI_PREFIX_DEV), "tty")) {
+                data->type = FILE_TTY;
+            } else {
                 data->type = FILE_DEV;
-                if (dent)
-                    dent->type = S_IFCHR;
-                break;
-        }
+            }
+            type = S_IFCHR;
+            break;
+        default:
+            log_error("unknown PAL handle type: %d", pal_attr.handle_type);
+            BUG();
+    }
 
-    data->mode = (pal_attr.readable ? S_IRUSR : 0) |
-                 (pal_attr.writable ? S_IWUSR : 0) |
-                 (pal_attr.runnable ? S_IXUSR : 0);
+    mode_t perm = (pal_attr.readable ? S_IRUSR : 0) |
+                  (pal_attr.writable ? S_IWUSR : 0) |
+                  (pal_attr.runnable ? S_IXUSR : 0);
+    if (dent) {
+        dent->type = type;
+        dent->perm = perm;
+    }
 
     __atomic_store_n(&data->size.counter, pal_attr.pending_size, __ATOMIC_SEQ_CST);
 
     if (data->type == FILE_DIR) {
-        int ret;
         /* Move up the uri update; need to convert manifest-level file:
          * directives to 'dir:' uris */
         if (old_type != FILE_DIR) {
             dent->state |= DENTRY_ISDIRECTORY;
-            if ((ret = make_uri(dent)) < 0) {
-                unlock(&data->lock);
+            if ((ret = make_uri(dent)) < 0)
                 return ret;
-            }
         }
-
-        /* DEP 3/18/17: If we have a directory, we need to find out how many
-         * children it has by hand. */
-        /* XXX: Keep coherent with rmdir/mkdir/creat, etc */
-        struct shim_dirent *d, *dbuf = NULL;
-        size_t nlink = 0;
-        int rv = chroot_readdir(dent, &dbuf);
-        if (rv != 0)
-            return rv;
-        if (dbuf) {
-            for (d = dbuf; d; d = d->next)
-                nlink++;
-            free(dbuf);
-        } else {
-            nlink = 2; // Educated guess...
-        }
-        data->nlink = nlink;
-    } else {
-        /* DEP 3/18/17: Right now, we don't support hard links,
-         * so just return 1;
-         */
-        data->nlink = 1;
     }
+
+    /*
+     * Pretend `nlink` is 2 for directories (to account for "." and ".."), 1 for other files.
+     *
+     * Applications are unlikely to depend on exact value of `nlink`, and for us, it's inconvenient
+     * to keep track of the exact value (we would have to list the directory, and also take into
+     * account synthetic files created by Graphene, such as named pipes and sockets).
+     *
+     * TODO: Make this a default for filesystems that don't provide `nlink`?
+     */
+    data->nlink = data->type == FILE_DIR ? 2 : 1;
 
     data->queried = true;
 
     return 0;
-}
-
-/* do not need any lock */
-static void chroot_update_ino(struct shim_dentry* dent) {
-    if (dent->state & DENTRY_INO_UPDATED)
-        return;
-
-    struct mount_data* mdata = DENTRY_MOUNT_DATA(dent);
-    unsigned long ino = mdata->ino_base;
-
-    if (!qstrempty(&dent->rel_path))
-        ino = rehash_path(mdata->ino_base, qstrgetstr(&dent->rel_path), dent->rel_path.len);
-
-    dent->ino = ino;
-    dent->state |= DENTRY_INO_UPDATED;
 }
 
 static inline int try_create_data(struct shim_dentry* dent, const char* uri, size_t len,
@@ -308,37 +329,20 @@ static int query_dentry(struct shim_dentry* dent, PAL_HANDLE pal_handle, mode_t*
     }
 
     if (mode)
-        *mode = data->mode;
+        *mode = dent->type | dent->perm;
 
     if (stat) {
         struct mount_data* mdata = DENTRY_MOUNT_DATA(dent);
-        chroot_update_ino(dent);
 
         memset(stat, 0, sizeof(struct stat));
 
-        stat->st_mode  = (mode_t)data->mode;
-        stat->st_dev   = (dev_t)mdata->ino_base;
-        stat->st_ino   = (ino_t)dent->ino;
+        stat->st_mode  = dent->type | dent->perm;
+        stat->st_dev   = (dev_t)mdata->dev;
         stat->st_size  = (off_t)__atomic_load_n(&data->size.counter, __ATOMIC_SEQ_CST);
         stat->st_atime = (time_t)data->atime;
         stat->st_mtime = (time_t)data->mtime;
         stat->st_ctime = (time_t)data->ctime;
         stat->st_nlink = data->nlink;
-
-        switch (data->type) {
-            case FILE_REGULAR:
-                stat->st_mode |= S_IFREG;
-                break;
-            case FILE_DIR:
-                stat->st_mode |= S_IFDIR;
-                break;
-            case FILE_DEV:
-            case FILE_TTY:
-                stat->st_mode |= S_IFCHR;
-                break;
-            default:
-                break;
-        }
     }
 
     unlock(&data->lock);
@@ -379,26 +383,23 @@ static int __chroot_open(struct shim_dentry* dent, const char* uri, int flags, m
     if (hdl && hdl->pal_handle) {
         palhdl = hdl->pal_handle;
     } else {
-        palhdl = DkStreamOpen(uri, accmode, mode, create, options);
+        ret = DkStreamOpen(uri, accmode, mode, create, options, &palhdl);
 
-        if (!palhdl) {
-            if (PAL_NATIVE_ERRNO() == PAL_ERROR_DENIED && accmode != oldmode)
-                palhdl = DkStreamOpen(uri, oldmode, mode, create, options);
+        if (ret < 0) {
+            if (ret == -PAL_ERROR_DENIED && accmode != oldmode)
+                ret = DkStreamOpen(uri, oldmode, mode, create, options, &palhdl);
 
-            if (!palhdl)
-                return -PAL_ERRNO();
+            if (ret < 0)
+                return pal_to_unix_errno(ret);
         }
-
-        /* If DENTRY_LISTED is set on the parent dentry, list_directory_dentry() will not update
-         * dent's ino, so ino will be actively updated here. */
-        if (create)
-            chroot_update_ino(dent);
     }
 
     if (!data->queried) {
         lock(&data->lock);
         ret = __query_attr(dent, data, palhdl);
         unlock(&data->lock);
+        if (ret < 0)
+            return ret;
     }
 
     if (!hdl) {
@@ -407,12 +408,20 @@ static int __chroot_open(struct shim_dentry* dent, const char* uri, int flags, m
     }
 
     hdl->pal_handle        = palhdl;
+    hdl->type              = TYPE_FILE;
     hdl->info.file.type    = data->type;
     hdl->info.file.version = version;
     hdl->info.file.size    = __atomic_load_n(&data->size.counter, __ATOMIC_SEQ_CST);
     hdl->info.file.data    = data;
 
-    return ret;
+    /* files obtained from checkpoint system will have sync handle initialized already */
+    if (!hdl->info.file.sync) {
+        ret = sync_create(&hdl->info.file.sync, /*id=*/0);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
 }
 
 static int chroot_open(struct shim_handle* hdl, struct shim_dentry* dent, int flags) {
@@ -421,16 +430,10 @@ static int chroot_open(struct shim_handle* hdl, struct shim_dentry* dent, int fl
     if ((ret = try_create_data(dent, NULL, 0, &data)) < 0)
         return ret;
 
-    if (dent->mode == NO_MODE) {
-        lock(&data->lock);
-        ret = __query_attr(dent, data, NULL);
-        dent->mode = data->mode;
-        unlock(&data->lock);
-    }
-
-    if ((ret = __chroot_open(dent, NULL, flags, dent->mode, hdl, data)) < 0)
+    if ((ret = __chroot_open(dent, NULL, flags, dent->perm, hdl, data)) < 0)
         return ret;
 
+    assert(hdl->type == TYPE_FILE);
     struct shim_file_handle* file = &hdl->info.file;
     off_t size = __atomic_load_n(&data->size.counter, __ATOMIC_SEQ_CST);
 
@@ -447,6 +450,8 @@ static int chroot_open(struct shim_handle* hdl, struct shim_dentry* dent, int fl
 
 static int chroot_creat(struct shim_handle* hdl, struct shim_dentry* dir, struct shim_dentry* dent,
                         int flags, mode_t mode) {
+    __UNUSED(dir);
+
     int ret = 0;
     struct shim_file_data* data;
     if ((ret = try_create_data(dent, NULL, 0, &data)) < 0)
@@ -458,6 +463,7 @@ static int chroot_creat(struct shim_handle* hdl, struct shim_dentry* dir, struct
     if (!hdl)
         return 0;
 
+    assert(hdl->type == TYPE_FILE);
     struct shim_file_handle* file = &hdl->info.file;
     off_t size = __atomic_load_n(&data->size.counter, __ATOMIC_SEQ_CST);
 
@@ -469,18 +475,12 @@ static int chroot_creat(struct shim_handle* hdl, struct shim_dentry* dir, struct
     file->size   = size;
     qstrcopy(&hdl->uri, &data->host_uri);
 
-    /* Increment the parent's link count */
-    struct shim_file_data* parent_data = FILE_DENTRY_DATA(dir);
-    if (parent_data) {
-        lock(&parent_data->lock);
-        if (parent_data->queried)
-            parent_data->nlink++;
-        unlock(&parent_data->lock);
-    }
     return 0;
 }
 
 static int chroot_mkdir(struct shim_dentry* dir, struct shim_dentry* dent, mode_t mode) {
+    __UNUSED(dir);
+
     int ret = 0;
     struct shim_file_data* data;
     if ((ret = try_create_data(dent, NULL, 0, &data)) < 0)
@@ -495,37 +495,34 @@ static int chroot_mkdir(struct shim_dentry* dir, struct shim_dentry* dent, mode_
 
     ret = __chroot_open(dent, NULL, O_CREAT | O_EXCL, mode, NULL, data);
 
-    /* Increment the parent's link count */
-    struct shim_file_data* parent_data = FILE_DENTRY_DATA(dir);
-    if (parent_data) {
-        lock(&parent_data->lock);
-        if (parent_data->queried)
-            parent_data->nlink++;
-        unlock(&parent_data->lock);
-    }
     return ret;
 }
 
 #define NEED_RECREATE(hdl) (!FILE_HANDLE_DATA(hdl))
 
 static int chroot_recreate(struct shim_handle* hdl) {
+    lock(&hdl->lock);
+
+    assert(hdl->type == TYPE_FILE);
     struct shim_file_data* data = FILE_HANDLE_DATA(hdl);
     int ret = 0;
 
     /* quickly bail out if the data is created */
     if (data)
-        return 0;
+        goto out;
 
     const char* uri = qstrgetstr(&hdl->uri);
     size_t len = hdl->uri.len;
 
     if (hdl->dentry) {
         if ((ret = try_create_data(hdl->dentry, uri, len, &data)) < 0)
-            return ret;
+            goto out;
     } else {
         data = __create_data();
-        if (!data)
-            return -ENOMEM;
+        if (!data) {
+            ret = -ENOMEM;
+            goto out;
+        }
         qstrsetstr(&data->host_uri, uri, len);
     }
 
@@ -533,10 +530,15 @@ static int chroot_recreate(struct shim_handle* hdl) {
      * when recreating a file handle after migration, the file should
      * not be created again.
      */
-    return __chroot_open(hdl->dentry, uri, hdl->flags & ~(O_CREAT | O_EXCL), 0, hdl, data);
+    ret = __chroot_open(hdl->dentry, uri, hdl->flags & ~(O_CREAT | O_EXCL), 0, hdl, data);
+
+out:
+    unlock(&hdl->lock);
+    return ret;
 }
 
 static inline bool check_version(struct shim_handle* hdl) {
+    assert(hdl->type == TYPE_FILE);
     return __atomic_load_n(&FILE_HANDLE_DATA(hdl)->version.counter, __ATOMIC_SEQ_CST)
            == hdl->info.file.version;
 }
@@ -565,13 +567,9 @@ static int chroot_hstat(struct shim_handle* hdl, struct stat* stat) {
         struct shim_dentry* dent = hdl->dentry;
         struct mount_data* mdata = dent ? DENTRY_MOUNT_DATA(dent) : NULL;
 
-        if (dent)
-            chroot_update_ino(dent);
-
         if (stat) {
             memset(stat, 0, sizeof(struct stat));
-            stat->st_dev  = mdata ? (dev_t)mdata->ino_base : 0;
-            stat->st_ino  = dent ? (ino_t)dent->ino : 0;
+            stat->st_dev  = mdata ? (dev_t)mdata->dev : 0;
             stat->st_size = file->size;
             stat->st_mode |= (file->type == FILE_REGULAR) ? S_IFREG : S_IFCHR;
         }
@@ -583,10 +581,7 @@ static int chroot_hstat(struct shim_handle* hdl, struct stat* stat) {
 }
 
 static int chroot_flush(struct shim_handle* hdl) {
-    int ret = DkStreamFlush(hdl->pal_handle);
-    if (ret < 0)
-        return ret;
-    return 0;
+    return pal_to_unix_errno(DkStreamFlush(hdl->pal_handle));
 }
 
 static int chroot_close(struct shim_handle* hdl) {
@@ -612,23 +607,29 @@ static ssize_t chroot_read(struct shim_handle* hdl, void* buf, size_t count) {
     struct shim_file_handle* file = &hdl->info.file;
 
     off_t dummy_off_t;
-    if (file->type != FILE_TTY && __builtin_add_overflow(file->marker, count, &dummy_off_t)) {
+    if (file->type != FILE_TTY && file->type != FILE_DEV &&
+            __builtin_add_overflow(file->marker, count, &dummy_off_t)) {
         ret = -EFBIG;
         goto out;
     }
 
     lock(&hdl->lock);
+    file_sync_lock(file, SYNC_STATE_EXCLUSIVE);
 
-    PAL_NUM pal_ret = DkStreamRead(hdl->pal_handle, file->marker, count, buf, NULL, 0);
-    if (pal_ret != PAL_STREAM_ERROR) {
-        if (__builtin_add_overflow(pal_ret, 0, &ret))
-            BUG();
-        if (file->type != FILE_TTY && __builtin_add_overflow(file->marker, pal_ret, &file->marker))
-            BUG();
+    ret = DkStreamRead(hdl->pal_handle, file->marker, &count, buf, NULL, 0);
+    if (ret < 0) {
+        ret = pal_to_unix_errno(ret);
     } else {
-        ret = PAL_NATIVE_ERRNO() == PAL_ERROR_ENDOFSTREAM ? 0 : -PAL_ERRNO();
+        if (__builtin_add_overflow(count, 0, &ret)) {
+            BUG();
+        }
+        if (file->type != FILE_TTY && file->type != FILE_DEV &&
+                __builtin_add_overflow(file->marker, count, &file->marker)) {
+            BUG();
+        }
     }
 
+    file_sync_unlock(file);
     unlock(&hdl->lock);
 out:
     return ret;
@@ -649,37 +650,44 @@ static ssize_t chroot_write(struct shim_handle* hdl, const void* buf, size_t cou
         goto out;
     }
 
+    assert(hdl->type == TYPE_FILE);
     struct shim_file_handle* file = &hdl->info.file;
 
     off_t dummy_off_t;
-    if (file->type != FILE_TTY && __builtin_add_overflow(file->marker, count, &dummy_off_t)) {
+    if (file->type != FILE_TTY && file->type != FILE_DEV &&
+            __builtin_add_overflow(file->marker, count, &dummy_off_t)) {
         ret = -EFBIG;
         goto out;
     }
 
     lock(&hdl->lock);
+    file_sync_lock(file, SYNC_STATE_EXCLUSIVE);
 
-    PAL_NUM pal_ret = DkStreamWrite(hdl->pal_handle, file->marker, count, (void*)buf, NULL);
-    if (pal_ret != PAL_STREAM_ERROR) {
-        if (__builtin_add_overflow(pal_ret, 0, &ret))
+    ret = DkStreamWrite(hdl->pal_handle, file->marker, &count, (void*)buf, NULL);
+    if (ret < 0) {
+        ret = pal_to_unix_errno(ret);
+    } else {
+        if (__builtin_add_overflow(count, 0, &ret)) {
             BUG();
-        if (file->type != FILE_TTY && __builtin_add_overflow(file->marker, pal_ret, &file->marker))
+        }
+        if (file->type != FILE_TTY && file->type != FILE_DEV &&
+                __builtin_add_overflow(file->marker, count, &file->marker)) {
             BUG();
+        }
         if (file->marker > file->size) {
             file->size = file->marker;
             chroot_update_size(hdl, file, FILE_HANDLE_DATA(hdl));
         }
-    } else {
-        ret = PAL_NATIVE_ERRNO() == PAL_ERROR_ENDOFSTREAM ? 0 : -PAL_ERRNO();
     }
 
+    file_sync_unlock(file);
     unlock(&hdl->lock);
 out:
     return ret;
 }
 
 static int chroot_mmap(struct shim_handle* hdl, void** addr, size_t size, int prot, int flags,
-                       off_t offset) {
+                       uint64_t offset) {
     int ret;
     if (NEED_RECREATE(hdl) && (ret = chroot_recreate(hdl)) < 0)
         return ret;
@@ -693,23 +701,19 @@ static int chroot_mmap(struct shim_handle* hdl, void** addr, size_t size, int pr
 #endif
         return -EINVAL;
 
-    void* alloc_addr = (void*)DkStreamMap(hdl->pal_handle, *addr, pal_prot, offset, size);
-
-    if (!alloc_addr)
-        return -PAL_ERRNO();
-
-    *addr = alloc_addr;
-    return 0;
+    return pal_to_unix_errno(DkStreamMap(hdl->pal_handle, addr, pal_prot, offset, size));
 }
 
-static off_t chroot_seek(struct shim_handle* hdl, off_t offset, int wence) {
+static off_t chroot_seek(struct shim_handle* hdl, off_t offset, int whence) {
     off_t ret = -EINVAL;
 
     if (NEED_RECREATE(hdl) && (ret = chroot_recreate(hdl)) < 0)
         return ret;
 
+    assert(hdl->type == TYPE_FILE);
     struct shim_file_handle* file = &hdl->info.file;
     lock(&hdl->lock);
+    file_sync_lock(file, SYNC_STATE_EXCLUSIVE);
 
     /* TODO: this function emulates lseek() completely inside the LibOS, but some device files
      *       may report size == 0 during fstat() and may provide device-specific lseek() logic;
@@ -725,7 +729,7 @@ static off_t chroot_seek(struct shim_handle* hdl, off_t offset, int wence) {
         }
     }
 
-    switch (wence) {
+    switch (whence) {
         case SEEK_SET:
             if (offset < 0)
                 goto out;
@@ -744,6 +748,7 @@ static off_t chroot_seek(struct shim_handle* hdl, off_t offset, int wence) {
     ret = file->marker = marker;
 
 out:
+    file_sync_unlock(file);
     unlock(&hdl->lock);
     return ret;
 }
@@ -759,6 +764,7 @@ static int chroot_truncate(struct shim_handle* hdl, off_t len) {
 
     struct shim_file_handle* file = &hdl->info.file;
     lock(&hdl->lock);
+    file_sync_lock(file, SYNC_STATE_EXCLUSIVE);
 
     file->size = len;
 
@@ -767,20 +773,17 @@ static int chroot_truncate(struct shim_handle* hdl, off_t len) {
         __atomic_store_n(&data->size.counter, len, __ATOMIC_SEQ_CST);
     }
 
-    PAL_NUM rv = DkStreamSetLength(hdl->pal_handle, len);
-    if (rv) {
-        // For an error, cast it back down to an int return code
-        ret = -((int)rv);
+    ret = DkStreamSetLength(hdl->pal_handle, len);
+    if (ret < 0) {
+        ret = pal_to_unix_errno(ret);
         goto out;
     }
-
-    // DEP 10/25/16: Truncate returns 0 on success, not the length
-    ret = 0;
 
     if (file->marker > len)
         file->marker = len;
 
 out:
+    file_sync_unlock(file);
     unlock(&hdl->lock);
     return ret;
 }
@@ -796,26 +799,23 @@ static int chroot_dput(struct shim_dentry* dent) {
     return 0;
 }
 
-static int chroot_readdir(struct shim_dentry* dent, struct shim_dirent** dirent) {
+static int chroot_readdir(struct shim_dentry* dent, readdir_callback_t callback, void* arg) {
     struct shim_file_data* data = NULL;
     int ret = 0;
     PAL_HANDLE pal_hdl = NULL;
-    size_t buf_size = MAX_PATH;
-    size_t dirent_buf_size = 0;
+    size_t buf_size = READDIR_BUF_SIZE;
     char* buf = NULL;
-    char* dirent_buf = NULL;
 
     if ((ret = try_create_data(dent, NULL, 0, &data)) < 0)
         return ret;
 
-    chroot_update_ino(dent);
-
     const char* uri = qstrgetstr(&data->host_uri);
     assert(strstartswith(uri, URI_PREFIX_DIR));
 
-    pal_hdl = DkStreamOpen(uri, PAL_ACCESS_RDONLY, 0, 0, 0);
-    if (!pal_hdl)
-        return -PAL_ERRNO();
+    ret = DkStreamOpen(uri, PAL_ACCESS_RDONLY, 0, 0, 0, &pal_hdl);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
     buf = malloc(buf_size);
     if (!buf) {
@@ -825,112 +825,56 @@ static int chroot_readdir(struct shim_dentry* dent, struct shim_dirent** dirent)
 
     while (1) {
         /* DkStreamRead for directory will return as many entries as fits into the buffer. */
-        PAL_NUM bytes = DkStreamRead(pal_hdl, 0, buf_size, buf, NULL, 0);
-        if (bytes == PAL_STREAM_ERROR) {
-            if (PAL_NATIVE_ERRNO() == PAL_ERROR_ENDOFSTREAM) {
-                /* End of directory listing */
-                ret = 0;
-                break;
-            }
-
-            ret = -PAL_ERRNO();
+        size_t bytes = buf_size;
+        ret = DkStreamRead(pal_hdl, 0, &bytes, buf, NULL, 0);
+        if (ret < 0) {
+            ret = pal_to_unix_errno(ret);
             goto out;
+        } else if (bytes == 0) {
+            /* End of directory listing */
+            break;
         }
         /* Last entry must be null-terminated */
         assert(buf[bytes - 1] == '\0');
 
-        size_t dirent_cur_off = dirent_buf_size;
-        /* Calculate needed buffer size */
-        size_t len = buf[0] != '\0' ? 1 : 0;
-        for (size_t i = 1; i < bytes; i++) {
-            if (buf[i] == '\0') {
-                /* The PAL convention: if a name ends with '/', it is a directory.
-                 * struct shim_dirent has a field for a type, hence trailing slash
-                 * can be safely discarded. */
-                if (buf[i - 1] == '/') {
-                    len--;
-                }
-                dirent_buf_size += SHIM_DIRENT_ALIGNED_SIZE(len + 1);
-                len = 0;
-            } else {
-                len++;
-            }
-        }
+        size_t start = 0;
+        while (start < bytes - 1) {
+            size_t end = start;
+            while (buf[end] != '\0')
+                end++;
 
-        /* TODO: If realloc gets enabled delete following and uncomment rest */
-        char* tmp = malloc(dirent_buf_size);
-        if (!tmp) {
-            ret = -ENOMEM;
-            goto out;
-        }
-        memcpy(tmp, dirent_buf, dirent_cur_off);
-        free(dirent_buf);
-        dirent_buf = tmp;
-        /*
-        dirent_buf = realloc(dirent_buf, dirent_buf_size);
-        if (!dirent_buf) {
-            ret = -ENOMEM;
-            goto out;
-        }
-        */
-
-        size_t i = 0;
-        while (i < bytes) {
-            char* name = buf + i;
-            size_t len = strnlen(name, bytes - i);
-            i += len + 1;
-            bool is_dir = false;
-
-            /* Skipping trailing slash - explained above */
-            if (name[len - 1] == '/') {
-                is_dir = true;
-                name[--len] = '\0';
+            if (end == start) {
+                log_error("chroot_readdir: empty name returned from PAL");
+                die_or_inf_loop();
             }
 
-            struct shim_dirent* dptr = (struct shim_dirent*)(dirent_buf + dirent_cur_off);
-            dptr->ino  = rehash_name(dent->ino, name, len);
-            dptr->type = is_dir ? LINUX_DT_DIR : LINUX_DT_REG;
-            memcpy(dptr->name, name, len + 1);
+            /* By the PAL convention, if a name ends with '/', it is a directory. However, we ignore
+             * that distinction here and pass the name without '/' to the callback. */
+            if (buf[end - 1] == '/')
+                buf[end - 1] = '\0';
 
-            dirent_cur_off += SHIM_DIRENT_ALIGNED_SIZE(len + 1);
+            if ((ret = callback(&buf[start], arg)) < 0)
+                goto out;
+
+            start = end + 1;
         }
     }
 
-    *dirent = (struct shim_dirent*)dirent_buf;
-
-    /*
-     * Fix next field of struct shim_dirent to point to the next entry.
-     * Since all entries are assumed to come from single allocation
-     * (as free gets called just on the head of this list) this should have
-     * been just entry size instead of a pointer (and probably needs to be
-     * rewritten as such one day).
-     */
-    struct shim_dirent** last = NULL;
-    for (size_t dirent_cur_off = 0; dirent_cur_off < dirent_buf_size;) {
-        struct shim_dirent* dptr = (struct shim_dirent*)(dirent_buf + dirent_cur_off);
-        size_t len = SHIM_DIRENT_ALIGNED_SIZE(strlen(dptr->name) + 1);
-        dptr->next = (struct shim_dirent*)(dirent_buf + dirent_cur_off + len);
-        last = &dptr->next;
-        dirent_cur_off += len;
-    }
-    if (last) {
-        *last = NULL;
-    }
-
+    ret = 0;
 out:
-    /* Need to free output buffer if error is returned */
-    if (ret) {
-        free(dirent_buf);
-    }
     free(buf);
     DkObjectClose(pal_hdl);
     return ret;
 }
 
-static int chroot_checkout(struct shim_handle* hdl) {
-    if (hdl->fs == &chroot_builtin_fs)
-        hdl->fs = NULL;
+static void chroot_hput(struct shim_handle* hdl) {
+    if (hdl->info.file.sync) {
+        sync_destroy(hdl->info.file.sync);
+        hdl->info.file.sync = NULL;
+    }
+}
 
+static int chroot_checkout(struct shim_handle* hdl) {
     if (hdl->type == TYPE_FILE) {
         struct shim_file_data* data = FILE_HANDLE_DATA(hdl);
         if (data)
@@ -943,7 +887,7 @@ static int chroot_checkout(struct shim_handle* hdl) {
          * the handle over RPC; otherwise, send it.
          */
         PAL_STREAM_ATTR attr;
-        if (DkStreamAttributesQuery(qstrgetstr(&hdl->uri), &attr))
+        if (DkStreamAttributesQuery(qstrgetstr(&hdl->uri), &attr) == 0)
             hdl->pal_handle = NULL;
     }
 
@@ -959,45 +903,42 @@ static ssize_t chroot_checkpoint(void** checkpoint, void* mount_data) {
 
 static int chroot_migrate(void* checkpoint, void** mount_data) {
     struct mount_data* mdata = checkpoint;
-    size_t alloc_len = mdata->root_uri_len + sizeof(struct mount_data) + 1;
+    size_t alloc_size = mdata->root_uri_len + sizeof(struct mount_data) + 1;
 
-    void* new_data = malloc(alloc_len);
+    void* new_data = malloc(alloc_size);
     if (!new_data)
         return -ENOMEM;
 
-    memcpy(new_data, mdata, alloc_len);
+    memcpy(new_data, mdata, alloc_size);
     *mount_data = new_data;
 
     return 0;
 }
 
 static int chroot_unlink(struct shim_dentry* dir, struct shim_dentry* dent) {
+    __UNUSED(dir);
+
     int ret;
     struct shim_file_data* data;
     if ((ret = try_create_data(dent, NULL, 0, &data)) < 0)
         return ret;
 
-    PAL_HANDLE pal_hdl = DkStreamOpen(qstrgetstr(&data->host_uri), 0, 0, 0, 0);
-    if (!pal_hdl)
-        return -PAL_ERRNO();
+    PAL_HANDLE pal_hdl = NULL;
+    ret = DkStreamOpen(qstrgetstr(&data->host_uri), 0, 0, 0, 0, &pal_hdl);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
-    DkStreamDelete(pal_hdl, 0);
+    ret = DkStreamDelete(pal_hdl, 0);
     DkObjectClose(pal_hdl);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
-    dent->mode = NO_MODE;
-    data->mode = 0;
+    data->queried = false;
 
     __atomic_add_fetch(&data->version.counter, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&data->size.counter, 0, __ATOMIC_SEQ_CST);
-
-    /* Drop the parent's link count */
-    struct shim_file_data* parent_data = FILE_DENTRY_DATA(dir);
-    if (parent_data) {
-        lock(&parent_data->lock);
-        if (parent_data->queried)
-            parent_data->nlink--;
-        unlock(&parent_data->lock);
-    }
 
     return 0;
 }
@@ -1013,9 +954,10 @@ static off_t chroot_poll(struct shim_handle* hdl, int poll_type) {
     if (poll_type == FS_POLL_SZ)
         return size;
 
-    lock(&hdl->lock);
-
     struct shim_file_handle* file = &hdl->info.file;
+    lock(&hdl->lock);
+    file_sync_lock(file, SYNC_STATE_EXCLUSIVE);
+
     if (check_version(hdl) && file->size < size)
         file->size = size;
 
@@ -1031,6 +973,7 @@ static off_t chroot_poll(struct shim_handle* hdl, int poll_type) {
     ret = -EAGAIN;
 
 out:
+    file_sync_unlock(file);
     unlock(&hdl->lock);
     return ret;
 }
@@ -1048,21 +991,21 @@ static int chroot_rename(struct shim_dentry* old, struct shim_dentry* new) {
         return ret;
     }
 
-    PAL_HANDLE pal_hdl = DkStreamOpen(qstrgetstr(&old_data->host_uri), 0, 0, 0, 0);
-    if (!pal_hdl) {
-        return -PAL_ERRNO();
+    PAL_HANDLE pal_hdl = NULL;
+    ret = DkStreamOpen(qstrgetstr(&old_data->host_uri), 0, 0, 0, 0, &pal_hdl);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
     }
 
-    if (!DkStreamChangeName(pal_hdl, qstrgetstr(&new_data->host_uri))) {
+    ret = DkStreamChangeName(pal_hdl, qstrgetstr(&new_data->host_uri));
+    if (ret < 0) {
         DkObjectClose(pal_hdl);
-        return -PAL_ERRNO();
+        return pal_to_unix_errno(ret);
     }
 
-    new->mode = new_data->mode = old_data->mode;
-    old->mode = NO_MODE;
-    old_data->mode = 0;
-
+    new->perm = old->perm;
     new->type = old->type;
+    old_data->queried = false;
 
     DkObjectClose(pal_hdl);
 
@@ -1079,20 +1022,21 @@ static int chroot_chmod(struct shim_dentry* dent, mode_t mode) {
     if ((ret = try_create_data(dent, NULL, 0, &data)) < 0)
         return ret;
 
-    PAL_HANDLE pal_hdl = DkStreamOpen(qstrgetstr(&data->host_uri), 0, 0, 0, 0);
-    if (!pal_hdl)
-        return -PAL_ERRNO();
+    PAL_HANDLE pal_hdl = NULL;
+    ret = DkStreamOpen(qstrgetstr(&data->host_uri), 0, 0, 0, 0, &pal_hdl);
+    if (ret < 0) {
+        return pal_to_unix_errno(ret);
+    }
 
     PAL_STREAM_ATTR attr = {.share_flags = mode};
 
-    if (!DkStreamAttributesSetByHandle(pal_hdl, &attr)) {
+    ret = DkStreamAttributesSetByHandle(pal_hdl, &attr);
+    if (ret < 0) {
         DkObjectClose(pal_hdl);
-        return -PAL_ERRNO();
+        return pal_to_unix_errno(ret);
     }
 
     DkObjectClose(pal_hdl);
-    dent->mode = data->mode = mode;
-
     return 0;
 }
 
@@ -1107,6 +1051,7 @@ struct shim_fs_ops chroot_fs_ops = {
     .seek       = &chroot_seek,
     .hstat      = &chroot_hstat,
     .truncate   = &chroot_truncate,
+    .hput       = &chroot_hput,
     .checkout   = &chroot_checkout,
     .checkpoint = &chroot_checkpoint,
     .migrate    = &chroot_migrate,
@@ -1127,14 +1072,8 @@ struct shim_d_ops chroot_d_ops = {
     .chmod   = &chroot_chmod,
 };
 
-struct mount_data chroot_data = {
-    .root_uri_len = 5,
-    .root_uri     = URI_PREFIX_FILE,
-};
-
-struct shim_mount chroot_builtin_fs = {
-    .type   = "chroot",
+struct shim_fs chroot_builtin_fs = {
+    .name   = "chroot",
     .fs_ops = &chroot_fs_ops,
     .d_ops  = &chroot_d_ops,
-    .data   = &chroot_data,
 };

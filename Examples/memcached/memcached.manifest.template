@@ -6,7 +6,7 @@
 
 # Memcached must be run with the --user=<existing-user-name> argument:
 #
-# ./pal_loader ./memcached --user=nobody
+# graphene-{direct|sgx} ./memcached --user=nobody
 #
 # User argument is required because Graphene currently emulates real/effective
 # user ID as 0 (root). This leads Memcached to believe it is run under root. For
@@ -21,21 +21,21 @@
 # so it is always set to libsysdb.so. Note that GRAPHENEDIR macro is expanded
 # to relative path to Graphene repository in the Makefile as part of the
 # build process.
-loader.preload = "file:$(GRAPHENEDIR)/Runtime/libsysdb.so"
+loader.preload = "file:{{ graphene.libos }}"
 
 # Binary to run.
-libos.entrypoint = "file:memcached"
+libos.entrypoint = "memcached"
 
-# Verbosity of Graphene debug log (none/error/info/debug/trace/all). Note that
-# GRAPHENE_LOG_LEVEL macro is expanded in the Makefile as part of the building
-# process: the default is "error" for non-debug builds, and "debug" for debug
-# builds.
-loader.log_level = "$(GRAPHENE_LOG_LEVEL)"
+# Verbosity of Graphene debug log (none/error/warning/debug/trace/all). Note
+# that GRAPHENE_LOG_LEVEL macro is expanded in the Makefile as part of the
+# building process: the default is "error" for non-debug builds, and "debug"
+# for debug builds.
+loader.log_level = "{{ log_level }}"
 
 ################################# ARGUMENTS ###################################
 
 # Read application arguments directly from the command line. Don't use this on production!
-loader.insecure__use_cmdline_argv = 1
+loader.insecure__use_cmdline_argv = true
 
 ################################# ENV VARS ####################################
 
@@ -45,13 +45,18 @@ loader.insecure__use_cmdline_argv = 1
 #
 # In case of Memcached:
 # - /lib is searched for Glibc libraries (ld, libc, libpthread)
-# - $(ARCH_LIBDIR) is searched for Name Service Switch (NSS) libraries
-# - /usr/$(ARCH_LIBDIR) is searched for libevent (the only explicit
+# - {{ arch_libdir }} is searched for Name Service Switch (NSS) libraries
+# - /usr/{{ arch_libdir }} is searched for libevent (the only explicit
 #                             Memcached dependency)
-loader.env.LD_LIBRARY_PATH = "/lib:$(ARCH_LIBDIR):/usr/$(ARCH_LIBDIR)"
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:/usr/{{ arch_libdir }}"
 
 # All other environment variables are unset. This is the default Graphene
 # behavior. Memcached doesn't require any environment variables to be set.
+
+################################## SIGNALS ####################################
+
+# Allow for injecting SIGTERM signal from the host.
+sys.enable_sigterm_injection = true
 
 ################################# MOUNT FS  ###################################
 
@@ -68,19 +73,19 @@ loader.env.LD_LIBRARY_PATH = "/lib:$(ARCH_LIBDIR):/usr/$(ARCH_LIBDIR)"
 # of the build process.
 fs.mount.lib.type = "chroot"
 fs.mount.lib.path = "/lib"
-fs.mount.lib.uri = "file:$(GRAPHENEDIR)/Runtime"
+fs.mount.lib.uri = "file:{{ graphene.runtimedir() }}"
 
 # Mount host-OS directory to Name Service Switch (NSS) libraries (in "uri")
 # into in-Graphene visible directory e.g., /lib/x86_64-linux-gnu (in "path").
 fs.mount.lib2.type = "chroot"
-fs.mount.lib2.path = "$(ARCH_LIBDIR)"
-fs.mount.lib2.uri = "file:$(ARCH_LIBDIR)"
+fs.mount.lib2.path = "{{ arch_libdir }}"
+fs.mount.lib2.uri = "file:{{ arch_libdir }}"
 
 # Mount host-OS directory to libevent lib required by Memcached (in "uri")
 # into in-Graphene visible directory e.g., /usr/lib/x86_64-linux-gnu (in "path").
 fs.mount.lib3.type = "chroot"
-fs.mount.lib3.path = "/usr/$(ARCH_LIBDIR)"
-fs.mount.lib3.uri = "file:/usr/$(ARCH_LIBDIR)"
+fs.mount.lib3.path = "/usr/{{ arch_libdir }}"
+fs.mount.lib3.uri = "file:/usr/{{ arch_libdir }}"
 
 # Mount host-OS directory to NSS files required by Glibc + NSS libs (in "uri")
 # into in-Graphene visible directory /etc (in "path").
@@ -103,7 +108,7 @@ fs.mount.etc.uri = "file:/etc"
 # an issue in Memcached source code, not related to Graphene.
 sgx.enclave_size = "1024M"
 
-sgx.nonpie_binary = 1
+sgx.nonpie_binary = true
 
 # Set maximum number of in-enclave threads (somewhat arbitrarily) to 16. Recall
 # that SGX v1 requires to specify the maximum number of simulteneous threads at
@@ -122,7 +127,7 @@ sgx.thread_num = 16
 # are host-OS paths. These files will be searched for in in-Graphene visible
 # paths according to mount points above.
 #
-# As part of the build process, Graphene-SGX script (`pal-sgx-sign`) finds each
+# As part of the build process, Graphene-SGX script (`graphene-sgx-sign`) finds each
 # specified file, measures its hash, and outputs the hash in auto-generated
 # entry 'sgx.trusted_checksum.xxx' in auto-generated memcached.manifest.sgx.
 # Note that this happens on the developer machine or a build server.
@@ -132,32 +137,11 @@ sgx.thread_num = 16
 # match, this file is trusted and allowed to be loaded and used. Note that
 # this happens on the client machine.
 
-
 sgx.trusted_files.memcached = "file:memcached"
 
-# Glibc libraries. ld and libc are needed for all apps; pthread is needed
-# because Memcached is multi-threaded.
-sgx.trusted_files.ld = "file:$(GRAPHENEDIR)/Runtime/ld-linux-x86-64.so.2"
-sgx.trusted_files.libc = "file:$(GRAPHENEDIR)/Runtime/libc.so.6"
-sgx.trusted_files.libpthread = "file:$(GRAPHENEDIR)/Runtime/libpthread.so.0"
-
-# Name Service Switch (NSS) libraries. Glibc calls these libraries as part of
-# name-service information gathering. libnss_{compat,files,nis} are the
-# most widely used libraries, at least on Ubuntu.
-# For more info, see 'man nsswitch.conf'.
-sgx.trusted_files.libnsscompat = "file:$(ARCH_LIBDIR)/libnss_compat.so.2"
-sgx.trusted_files.libnssfiles  = "file:$(ARCH_LIBDIR)/libnss_files.so.2"
-sgx.trusted_files.libnssnis  = "file:$(ARCH_LIBDIR)/libnss_nis.so.2"
-
-# libNSL is a dependency of libnss_compat above. It is a good example of nested
-# library dependencies required by Graphene-SGX.
-sgx.trusted_files.libnsl = "file:$(ARCH_LIBDIR)/libnsl.so.1"
-
-# libEvent is an explicit dependency of Memcached. We choose to install it on
-# host OS instead of downloading the sources, building, and linking Memcached
-# against the built library (which is possible but would require more effort).
-# [Ubuntu16.04] sgx.trusted_files.libevent = "file:/usr/$(ARCH_LIBDIR)/libevent-2.0.so.5"
-# [Ubuntu18.04] sgx.trusted_files.libevent = "file:/usr/$(ARCH_LIBDIR)/libevent-2.1.so.6"
+sgx.trusted_files.runtime = "file:{{ graphene.runtimedir() }}/"
+sgx.trusted_files.arch_libdir = "file:{{ arch_libdir }}/"
+sgx.trusted_files.usr_arch_libdir = "file:/usr/{{ arch_libdir }}/"
 
 ############################# SGX: ALLOWED FILES ###############################
 

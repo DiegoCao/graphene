@@ -74,14 +74,13 @@ int ocall_sched_getaffinity(void* tcs, size_t cpumask_size, void* cpu_mask);
 
 int ocall_clone_thread(void);
 
-int ocall_create_process(const char* uri, size_t nargs, const char** args, int* stream_fd,
-                         unsigned int* pid);
+int ocall_create_process(size_t nargs, const char** args, int* stream_fd, unsigned int* pid);
 
-int ocall_futex(uint32_t* uaddr, int op, int val, int64_t timeout_us);
+int ocall_futex(uint32_t* uaddr, int op, int val, uint64_t* timeout_us);
 
 int ocall_gettime(uint64_t* microsec);
 
-int ocall_sleep(uint64_t* microsec);
+void ocall_sched_yield(void);
 
 int ocall_socketpair(int domain, int type, int protocol, int sockfds[2]);
 
@@ -94,8 +93,6 @@ int ocall_delete(const char* pathname);
 int ocall_debug_map_add(const char* name, void* addr);
 
 int ocall_debug_map_remove(void* addr);
-
-int ocall_report_mmap(const char* filename, uint64_t addr, uint64_t len, uint64_t offset);
 
 int ocall_eventfd(unsigned int initval, int flags);
 

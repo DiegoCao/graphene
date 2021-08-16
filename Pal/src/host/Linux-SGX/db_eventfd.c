@@ -13,7 +13,6 @@
 
 #include "api.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -40,7 +39,6 @@ static inline int eventfd_type(int options) {
  * `options` holds eventfd's flags */
 static int eventfd_pal_open(PAL_HANDLE* handle, const char* type, const char* uri, int access,
                             int share, int create, int options) {
-    int ret;
     __UNUSED(access);
     __UNUSED(share);
 
@@ -49,18 +47,22 @@ static int eventfd_pal_open(PAL_HANDLE* handle, const char* type, const char* ur
     }
 
     /* Using create arg as a work-around (note: initval is uint32 but create is int32).*/
-    ret = ocall_eventfd(create, eventfd_type(options));
+    int fd = ocall_eventfd(create, eventfd_type(options));
 
-    if (IS_ERR(ret))
-        return unix_to_pal_error(ERRNO(ret));
+    if (fd < 0)
+        return unix_to_pal_error(fd);
 
     PAL_HANDLE hdl = malloc(HANDLE_SIZE(eventfd));
+    if (!hdl) {
+        ocall_close(fd);
+        return -PAL_ERROR_NOMEM;
+    }
     SET_HANDLE_TYPE(hdl, eventfd);
 
     /* Note: using index 0, given that there is only 1 eventfd FD per pal-handle. */
     HANDLE_HDR(hdl)->flags = RFD(0) | WFD(0);
 
-    hdl->eventfd.fd          = ret;
+    hdl->eventfd.fd          = fd;
     hdl->eventfd.nonblocking = (options & PAL_OPTION_NONBLOCK) ? PAL_TRUE : PAL_FALSE;
     *handle = hdl;
 
@@ -81,11 +83,8 @@ static int64_t eventfd_pal_read(PAL_HANDLE handle, uint64_t offset, uint64_t len
      * attacks) */
     ssize_t bytes = ocall_read(handle->eventfd.fd, buffer, len);
 
-    if (IS_ERR(bytes))
-        return unix_to_pal_error(ERRNO(bytes));
-
-    if (!bytes)
-        return -PAL_ERROR_ENDOFSTREAM;
+    if (bytes < 0)
+        return unix_to_pal_error(bytes);
 
     return bytes;
 }
@@ -102,8 +101,8 @@ static int64_t eventfd_pal_write(PAL_HANDLE handle, uint64_t offset, uint64_t le
         return -PAL_ERROR_INVAL;
 
     ssize_t bytes = ocall_write(handle->eventfd.fd, buffer, len);
-    if (IS_ERR(bytes))
-        return unix_to_pal_error(ERRNO(bytes));
+    if (bytes < 0)
+        return unix_to_pal_error(bytes);
 
     return bytes;
 }
@@ -121,16 +120,16 @@ static int eventfd_pal_attrquerybyhdl(PAL_HANDLE handle, PAL_STREAM_ATTR* attr) 
 
     /* get number of bytes available for reading */
     ret = ocall_fionread(handle->eventfd.fd);
-    if (IS_ERR(ret))
-        return unix_to_pal_error(ERRNO(ret));
+    if (ret < 0)
+        return unix_to_pal_error(ret);
 
     attr->pending_size = ret;
 
     /* query if there is data available for reading */
     struct pollfd pfd = {.fd = handle->eventfd.fd, .events = POLLIN | POLLOUT, .revents = 0};
     ret = ocall_poll(&pfd, 1, 0);
-    if (IS_ERR(ret))
-        return unix_to_pal_error(ERRNO(ret));
+    if (ret < 0)
+        return unix_to_pal_error(ret);
 
     attr->readable = ret == 1 && (pfd.revents & (POLLIN | POLLERR | POLLHUP)) == POLLIN;
     attr->writable = ret == 1 && (pfd.revents & (POLLOUT | POLLERR | POLLHUP)) == POLLOUT;

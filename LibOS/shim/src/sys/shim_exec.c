@@ -43,14 +43,11 @@ struct execve_rtld_arg {
 noreturn static void __shim_do_execve_rtld(struct execve_rtld_arg* __arg) {
     struct execve_rtld_arg arg = *__arg;
 
-    struct shim_thread* cur_thread = get_cur_thread();
     int ret = 0;
 
-    unsigned long tls_base = 0;
-    update_tls_base(tls_base);
-    debug("set tls_base to 0x%lx\n", tls_base);
+    set_default_tls();
 
-    thread_sigaction_reset_on_execve(cur_thread);
+    thread_sigaction_reset_on_execve();
 
     remove_loaded_libraries();
     clean_link_map_list();
@@ -64,6 +61,7 @@ noreturn static void __shim_do_execve_rtld(struct execve_rtld_arg* __arg) {
         goto error;
     }
 
+    struct shim_thread* cur_thread = get_cur_thread();
     for (struct shim_vma_info* vma = vmas; vma < vmas + count; vma++) {
         /* Don't free the current stack */
         if (vma->addr == cur_thread->stack || vma->addr == cur_thread->stack_red)
@@ -73,7 +71,9 @@ noreturn static void __shim_do_execve_rtld(struct execve_rtld_arg* __arg) {
         if (bkeep_munmap(vma->addr, vma->length, !!(vma->flags & VMA_INTERNAL), &tmp_vma) < 0) {
             BUG();
         }
-        DkVirtualMemoryFree(vma->addr, vma->length);
+        if (DkVirtualMemoryFree(vma->addr, vma->length) < 0) {
+            BUG();
+        }
         bkeep_remove_tmp_vma(tmp_vma);
     }
 
@@ -94,13 +94,13 @@ noreturn static void __shim_do_execve_rtld(struct execve_rtld_arg* __arg) {
 
     cur_thread->robust_list = NULL;
 
-    debug("execve: start execution\n");
+    log_debug("execve: start execution");
     /* Passing ownership of `exec` to `execute_elf_object`. */
     execute_elf_object(exec, arg.new_argp, arg.new_auxv);
     /* NOTREACHED */
 
 error:
-    debug("execve: failed %d\n", ret);
+    log_error("execve failed with errno=%d", ret);
     process_exit(/*error_code=*/0, /*term_signal=*/SIGKILL);
 }
 
@@ -116,6 +116,9 @@ static int shim_do_execve_rtld(struct shim_handle* hdl, const char** argv, const
     get_handle(hdl);
     g_process.exec = hdl;
     unlock(&g_process.fs_lock);
+
+    /* Update log prefix to include new executable name from `g_process.exec` */
+    log_setprefix(shim_get_tcb());
 
     cur_thread->stack_top = NULL;
     cur_thread->stack     = NULL;
@@ -141,18 +144,17 @@ static int shim_do_execve_rtld(struct shim_handle* hdl, const char** argv, const
 }
 
 long shim_do_execve(const char* file, const char** argv, const char** envp) {
-    struct shim_dentry* dent = NULL;
     int ret = 0, argc = 0;
 
-    if (test_user_string(file))
+    if (!is_user_string_readable(file))
         return -EFAULT;
 
     for (const char** a = argv; /* no condition*/; a++, argc++) {
-        if (test_user_memory(a, sizeof(*a), false))
+        if (!is_user_memory_readable(a, sizeof(*a)))
             return -EFAULT;
         if (*a == NULL)
             break;
-        if (test_user_string(*a))
+        if (!is_user_string_readable(*a))
             return -EFAULT;
     }
 
@@ -161,147 +163,29 @@ long shim_do_execve(const char* file, const char** argv, const char** envp) {
         envp = migrated_envp;
 
     for (const char** e = envp; /* no condition*/; e++) {
-        if (test_user_memory(e, sizeof(*e), false))
+        if (!is_user_memory_readable(e, sizeof(*e)))
             return -EFAULT;
         if (*e == NULL)
             break;
-        if (test_user_string(*e))
+        if (!is_user_string_readable(*e))
             return -EFAULT;
     }
 
-    DEFINE_LIST(sharg);
-    struct sharg {
-        LIST_TYPE(sharg) list;
-        int len;
-        char arg[0];
-    };
-    DEFINE_LISTP(sharg);
-    LISTP_TYPE(sharg) shargs;
-    INIT_LISTP(&shargs);
-
-reopen:
-
-    /* XXX: Not sure what to do here yet */
-    if ((ret = path_lookupat(NULL, file, LOOKUP_OPEN, &dent, NULL)) < 0)
-        return ret;
-
-    struct shim_mount* fs = dent->fs;
-    get_dentry(dent);
-
-    if (!fs->d_ops->open) {
-        ret = -EACCES;
-    err:
-        put_dentry(dent);
-        return ret;
-    }
-
-    if (fs->d_ops->mode) {
-        __kernel_mode_t mode;
-        if ((ret = fs->d_ops->mode(dent, &mode)) < 0)
-            goto err;
-        /* Check if the file is executable. Currently just looks at the user bit. */
-        if (!(mode & S_IXUSR)) {
-            ret = -EACCES;
-            goto err;
-        }
-    }
-
     struct shim_handle* exec = NULL;
-
     if (!(exec = get_new_handle())) {
-        ret = -ENOMEM;
-        goto err;
+        return -ENOMEM;
     }
 
-    set_handle_fs(exec, fs);
-    exec->flags    = O_RDONLY;
-    exec->acc_mode = MAY_READ;
-    ret = fs->d_ops->open(exec, dent, O_RDONLY);
-
-    if (qstrempty(&exec->uri)) {
-        put_handle(exec);
-        return -EACCES;
-    }
-
-    dentry_get_path_into_qstr(dent, &exec->path);
-
-    if ((ret = check_elf_object(exec)) < 0 && ret != -EINVAL) {
+    if ((ret = open_executable(exec, file)) < 0) {
         put_handle(exec);
         return ret;
     }
 
-    if (ret == -EINVAL) { /* it's a shebang */
-        LISTP_TYPE(sharg) new_shargs = LISTP_INIT;
-        struct sharg* next = NULL;
-        bool ended = false, started = false;
-        char buf[80];
-
-        do {
-            ret = do_handle_read(exec, buf, 80);
-            if (ret <= 0)
-                break;
-
-            char* s = buf;
-            char* c = buf;
-            char* e = buf + ret;
-
-            if (!started) {
-                if (ret < 2 || buf[0] != '#' || buf[1] != '!')
-                    break;
-
-                s += 2;
-                c += 2;
-                started = true;
-            }
-
-            for (; c < e; c++) {
-                if (*c == ' ' || *c == '\n' || c == e - 1) {
-                    int l = (*c == ' ' || *c == '\n') ? c - s : e - s;
-                    if (next) {
-                        struct sharg* sh = __alloca(sizeof(struct sharg) + next->len + l + 1);
-                        sh->len = next->len + l;
-                        memcpy(sh->arg, next->arg, next->len);
-                        memcpy(sh->arg + next->len, s, l);
-                        sh->arg[next->len + l] = 0;
-                        next = sh;
-                    } else {
-                        next = __alloca(sizeof(struct sharg) + l + 1);
-                        next->len = l;
-                        memcpy(next->arg, s, l);
-                        next->arg[l] = 0;
-                    }
-                    if (*c == ' ' || *c == '\n') {
-                        INIT_LIST_HEAD(next, list);
-                        LISTP_ADD_TAIL(next, &new_shargs, list);
-                        next = NULL;
-                        s = c + 1;
-                        if (*c == '\n') {
-                            ended = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        } while (!ended);
-
-        if (!started) {
-            debug("file not recognized as ELF or shebang");
-            put_handle(exec);
-            return -ENOEXEC;
-        }
-
-        if (next) {
-            INIT_LIST_HEAD(next, list);
-            LISTP_ADD_TAIL(next, &new_shargs, list);
-        }
-
-        struct sharg* first = LISTP_FIRST_ENTRY(&new_shargs, struct sharg, list);
-        assert(first);
-        debug("detected as script: run by %s\n", first->arg);
-        file = first->arg;
-        LISTP_SPLICE(&new_shargs, &shargs, list, sharg);
+    /* TODO: consider handling shebangs, if necessary */
+    if ((ret = check_elf_object(exec)) < 0) {
+        log_warning("file not recognized as ELF");
         put_handle(exec);
-        goto reopen;
+        return ret;
     }
 
     /* If `execve` is invoked concurrently by multiple threads, let only one succeed. From this
@@ -317,14 +201,10 @@ reopen:
      * instance and call execve again. */
     __atomic_store_n(&first, 0, __ATOMIC_RELAXED);
 
-    /* Disable preemption during `execve`. It will be enabled back in `execute_elf_object` if we
-     * stay in the same process. Otherwise it is never enabled, since this process dies both on
-     * errors and success. */
-    disable_preempt(NULL);
-
     /* Passing ownership of `exec`. */
     ret = shim_do_execve_rtld(exec, argv, envp);
     assert(ret < 0);
+
     put_handle(exec);
     /* We might have killed some threads and closed some fds and execve failed internally. User app
      * might now be in undefined state, we would better blow everything up. */

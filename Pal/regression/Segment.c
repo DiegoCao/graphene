@@ -1,10 +1,10 @@
 #include "pal.h"
-#include "pal_debug.h"
+#include "pal_regression.h"
 
 void* dummy = &dummy;
 
 int main(int argc, char** argv, char** envp) {
-    if (!DkSegmentRegisterSet(PAL_SEGMENT_FS, dummy)) {
+    if (DkSegmentRegisterSet(PAL_SEGMENT_FS, dummy) < 0) {
         pal_printf("Error setting FS\n");
         return 1;
     }

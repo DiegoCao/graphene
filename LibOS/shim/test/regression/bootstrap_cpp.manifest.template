@@ -1,0 +1,31 @@
+loader.preload = "file:{{ graphene.libos }}"
+libos.entrypoint = "bootstrap_cpp"
+loader.argv0_override = "bootstrap_cpp"
+
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:/usr/{{ arch_libdir }}"
+# Preload libunwind so that it has precedence over libstdc++ when resolving stack-unwinding routines
+loader.env.LD_PRELOAD = "libunwind.so.8"
+
+fs.mount.graphene_lib.type = "chroot"
+fs.mount.graphene_lib.path = "/lib"
+fs.mount.graphene_lib.uri = "file:{{ graphene.runtimedir() }}"
+
+fs.mount.host_lib.type = "chroot"
+fs.mount.host_lib.path = "{{ arch_libdir }}"
+fs.mount.host_lib.uri = "file:{{ arch_libdir }}"
+
+fs.mount.host_usr_lib.type = "chroot"
+fs.mount.host_usr_lib.path = "/usr/{{ arch_libdir }}"
+fs.mount.host_usr_lib.uri = "file:/usr/{{ arch_libdir }}"
+
+sgx.trusted_files.runtime = "file:{{ graphene.runtimedir() }}/"
+sgx.trusted_files.libgcc_s = "file:{{ arch_libdir }}/libgcc_s.so.1"
+sgx.trusted_files.libstdcxx = "file:/usr{{ arch_libdir }}/libstdc++.so.6"
+sgx.trusted_files.libunwindso = "file:/usr{{ arch_libdir }}/libunwind.so.8"
+sgx.trusted_files.liblzma = "file:{{ arch_libdir }}/liblzma.so.5"
+
+sgx.trusted_files.entrypoint = "file:bootstrap_cpp"
+
+sgx.thread_num = 8
+
+sgx.nonpie_binary = true

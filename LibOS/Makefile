@@ -19,7 +19,7 @@ GNU_MIRRORS ?= https://ftp.gnu.org/gnu/ \
 #
 # Override CC, CXX, AS in case we're compiling the rest of the project with clang.
 # ------------------------------------------------------------------------------------------------
-GLIBC_VERSION ?= 2.31
+GLIBC_VERSION ?= 2.33
 GLIBC_SRC = glibc-$(GLIBC_VERSION)
 GLIBC_HASH = $(firstword $(shell grep $(GLIBC_SRC).tar.gz glibc-checksums))
 SHIM_DIR = shim
@@ -33,8 +33,14 @@ GLIBC_LIBS = \
 	libc.so.6 \
 	login/libutil.so.1 \
 	math/libm.so.6 \
+	mathvec/libmvec.so.1 \
+	nis/libnsl.so.1 \
 	nptl/libpthread.so.0 \
 	nptl_db/libthread_db.so.1 \
+	nss/libnss_compat.so.2 \
+	nss/libnss_db.so.2 \
+	nss/libnss_files.so.2 \
+	resolv/libanl.so.1 \
 	resolv/libnss_dns.so.2 \
 	resolv/libresolv.so.2 \
 	rt/librt.so.1
@@ -45,11 +51,16 @@ endif
 GLIBC_TARGET = $(addprefix $(BUILD_DIR)/, $(GLIBC_LIBS))
 GLIBC_RUNTIME = $(addprefix $(RUNTIME_DIR)/, $(notdir $(GLIBC_TARGET)))
 
-GLIBC_CFLAGS = -O2 -Wp,-U_FORTIFY_SOURCE -Wno-unused-value
+GLIBC_CFLAGS = -O2 -Wno-unused-value
 ifeq ($(DEBUG),1)
 	GLIBC_CFLAGS += -g
 endif
 export GLIBC_CFLAGS
+
+# For LibOS entry API
+GLIBC_CPPFLAGS = -I$(abspath $(SHIM_DIR))/include -I$(abspath $(SHIM_DIR))/include/arch/$(ARCH)
+export GLIBC_CPPFLAGS
+GLIBC_DEPS = shim/include/arch/$(ARCH)/shim_entry_api.h
 
 .PHONY: all
 all: $(GLIBC_TARGET) $(GLIBC_RUNTIME)
@@ -69,8 +80,10 @@ $(BUILD_DIR)/Makefile: $(GLIBC_SRC)/.configured
 	mkdir -p $(BUILD_DIR)
 	(cd $(BUILD_DIR) || exit 1; \
 	CC=gcc CXX=g++ AS=gcc \
-	CFLAGS=$$GLIBC_CFLAGS ../$(GLIBC_SRC)/configure --prefix=$(RUNTIME_DIR) \
+	CFLAGS=$$GLIBC_CFLAGS CPPFLAGS=$$GLIBC_CPPFLAGS \
+	../$(GLIBC_SRC)/configure --prefix=$(RUNTIME_DIR) \
 		--with-tls \
+		--without-gd \
 		--without-selinux \
 		--disable-test \
 		--disable-nscd \
@@ -79,27 +92,18 @@ $(BUILD_DIR)/Makefile: $(GLIBC_SRC)/.configured
 $(foreach lib,$(GLIBC_TARGET),$(eval $(call LN_SF_TO_RUNTIME_DIR_template,$(lib))))
 
 GLIBC_PATCHES = \
-	glibc-patches/$(GLIBC_SRC).patch \
-	glibc-patches/syscalldb-api.patch
-
-GLIBC_PATCHES_2.23 = \
-	glibc-patches/hp-timing-2.23.patch \
-	glibc-patches/dangling-else.patch \
-	glibc-patches/cvs-common-symbols.patch \
-	glibc-patches/rpc-format-overflow.patch \
-	glibc-patches/ieee754-boolean-context.patch \
-	glibc-patches/nis-bogus-conditional.patch
-
-GLIBC_PATCHES_2.27 = \
-	glibc-patches/hp-timing-2.27.patch
+	glibc-patches/$(GLIBC_SRC).patch
 
 GLIBC_PATCHES_2.31 = \
 	glibc-patches/hp-timing-2.31.patch
 
+GLIBC_PATCHES_2.33 = \
+	glibc-patches/hp-timing-2.33.patch
+
 GLIBC_PATCHES += $(GLIBC_PATCHES_$(GLIBC_VERSION))
 
 .SECONDARY: $(GLIBC_SRC)/.configured
-$(GLIBC_SRC)/.configured: $(GLIBC_PATCHES) $(GLIBC_SRC).tar.gz
+$(GLIBC_SRC)/.configured: $(GLIBC_PATCHES) $(GLIBC_SRC).tar.gz $(GLIBC_DEPS)
 	$(RM) -r $(GLIBC_SRC)
 	tar -mxzf $(GLIBC_SRC).tar.gz
 	cd $(GLIBC_SRC) && \
@@ -160,8 +164,11 @@ $(foreach lib,$(GCC_TARGET),$(eval $(call LN_SF_TO_RUNTIME_DIR_template,$(lib)))
 GCC_PATCHES = \
 	gcc-patches/libgomp-replace-futex-instruction.patch
 
+# For LibOS entry API (file symlinked in patch)
+GCC_DEPS = shim/include/arch/$(ARCH)/shim_entry_api.h
+
 .SECONDARY: $(GCC_SRC)/.configured
-$(GCC_SRC)/.configured: $(GCC_PATCHES) $(GCC_SRC).tar.gz
+$(GCC_SRC)/.configured: $(GCC_PATCHES) $(GCC_SRC).tar.gz $(GCC_DEPS)
 	$(RM) -r $(GCC_SRC)
 	tar -mxzf $(GCC_SRC).tar.gz
 	cd $(GCC_SRC) && \
@@ -208,10 +215,6 @@ clean:
 .PHONY: distclean
 distclean: clean
 endif
-
-.PHONY: format
-format:
-	$(MAKE) -C $(SHIM_DIR) format
 
 .PHONY: test
 test:

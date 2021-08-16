@@ -12,38 +12,10 @@
 #error "cannot be included outside PAL"
 #endif
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "atomic.h"
-
-/* Simpler mutex design: a single variable that tracks whether the
- * mutex is locked.  State is 1 (locked) or 0 (unlocked).
- * Keep a count of how many threads are waiting on the mutex.
- *
- * If DEBUG_MUTEX is defined, mutex_handle will record the owner of mutex locking.
- */
-typedef struct mutex_handle {
-    uint32_t locked;
-    struct atomic_int nwaiters;
-#ifdef DEBUG_MUTEX
-    int owner;
-#endif
-} PAL_LOCK;
-
-/* Initializer of Mutexes */
-#define MUTEX_HANDLE_INIT \
-    { .locked = 0, .nwaiters.counter = 0 }
-#define INIT_MUTEX_HANDLE(m)           \
-    do {                               \
-        (m)->locked = 0;               \
-        atomic_set(&(m)->nwaiters, 0); \
-    } while (0)
-
-#define LOCK_INIT       MUTEX_HANDLE_INIT
-#define INIT_LOCK(lock) INIT_MUTEX_HANDLE(lock)
-
-/* Locking and unlocking of Mutexes */
-int _DkMutexLock(struct mutex_handle* mut);
-int _DkMutexLockTimeout(struct mutex_handle* mut, int64_t timeout_us);
-int _DkMutexUnlock(struct mutex_handle* mut);
 
 typedef struct {
     PAL_HDR hdr;
@@ -137,16 +109,11 @@ typedef struct pal_handle {
         } thread;
 
         struct {
-            struct mutex_handle mut;
-        } mutex;
-
-        struct {
             uint32_t signaled;
-            struct atomic_int nwaiters;
-            PAL_BOL isnotification;
+            bool auto_clear;
         } event;
     };
-} * PAL_HANDLE;
+}* PAL_HANDLE;
 
 #define RFD(n)   (1 << (MAX_FDS * 0 + (n)))
 #define WFD(n)   (1 << (MAX_FDS * 1 + (n)))
@@ -154,17 +121,8 @@ typedef struct pal_handle {
 
 #define HANDLE_TYPE(handle) ((handle)->hdr.type)
 
-extern void __check_pending_event(void);
-
-#define LEAVE_PAL_CALL()         \
-    do {                         \
-        __check_pending_event(); \
-    } while (0)
-
-#define LEAVE_PAL_CALL_RETURN(retval) \
-    do {                              \
-        __check_pending_event();      \
-        return (retval);              \
-    } while (0)
+int arch_do_rt_sigprocmask(int sig, int how);
+int arch_do_rt_sigaction(int sig, void* handler,
+                         const int* async_signals, size_t num_async_signals);
 
 #endif /* PAL_HOST_H */

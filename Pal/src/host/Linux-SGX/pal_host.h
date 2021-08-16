@@ -12,41 +12,16 @@
 #error "cannot be included outside PAL"
 #endif
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #include "atomic.h"
 #include "list.h"
 #include "spinlock.h"
 
-typedef spinlock_t PAL_LOCK;
-
-#define LOCK_INIT           INIT_SPINLOCK_UNLOCKED
-#define _DkInternalLock     spinlock_lock
-#define _DkInternalUnlock   spinlock_unlock
-#define _DkInternalIsLocked spinlock_is_locked
-
-void* malloc_untrusted(int size);
+void* malloc_untrusted(size_t size);
 void free_untrusted(void* mem);
-
-/* Simpler mutex design: a single variable that tracks whether the
- * mutex is locked.  State is 1 (locked) or 0 (unlocked).
- * Keep a count of how many threads are waiting on the mutex.
- *
- * If DEBUG_MUTEX is defined, mutex_handle will record the owner of mutex locking.
- */
-struct mutex_handle {
-    uint32_t* locked;
-    struct atomic_int nwaiters;
-#ifdef DEBUG_MUTEX
-    int owner;
-#endif
-};
-
-/* Initializer of Mutexes */
-#define MUTEX_HANDLE_INIT \
-    { .u = 0 }
-#define INIT_MUTEX_HANDLE(m) \
-    do {                     \
-        (m)->u = 0;          \
-    } while (0)
 
 DEFINE_LIST(pal_handle_thread);
 struct pal_handle_thread {
@@ -81,9 +56,9 @@ typedef struct pal_handle {
             PAL_STR realpath;
             PAL_NUM total;
             /* below fields are used only for trusted files */
-            PAL_PTR stubs;    /* contains hashes of file chunks */
-            PAL_PTR umem;     /* valid only when stubs != NULL */
-            PAL_BOL seekable; /* regular files are seekable, FIFO pipes are not */
+            PAL_PTR chunk_hashes; /* array of hashes of file chunks */
+            PAL_PTR umem;         /* valid only when chunk_hashes != NULL */
+            PAL_BOL seekable;     /* regular files are seekable, FIFO pipes are not */
         } file;
 
         struct {
@@ -148,18 +123,21 @@ typedef struct pal_handle {
         struct pal_handle_thread thread;
 
         struct {
-            struct atomic_int nwaiters;
-            PAL_NUM max_value;
-            union {
-                struct mutex_handle mut;
-            } mutex;
-
-            struct {
-                uint32_t* signaled;
-                struct atomic_int nwaiters;
-                PAL_BOL isnotification;
-            } event;
-        };
+            /* Guards accesses to the rest of the fields.
+             * We need to be able to set `signaled` and `signaled_untrusted` atomically, which is
+             * impossible without a lock. They are essentialy the same field, but we need two
+             * separate copies, because we need to guard against malicious host modifications yet
+             * still be able to call futex on it. */
+            spinlock_t lock;
+            /* Current number of waiters - used solely as an optimization. `uint32_t` because futex
+             * syscall does not allow for more than `INT_MAX` waiters anyway. */
+            uint32_t waiters_cnt;
+            bool signaled;
+            bool auto_clear;
+            /* Access to the *content* of this field should be atomic, because it's used as futex
+             * word on the untrusted host. */
+            uint32_t* signaled_untrusted;
+        } event;
     };
 }* PAL_HANDLE;
 

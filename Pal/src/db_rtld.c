@@ -11,7 +11,6 @@
 #include "api.h"
 #include "elf/elf.h"
 #include "pal.h"
-#include "pal_debug.h"
 #include "pal_defs.h"
 #include "pal_error.h"
 #include "pal_internal.h"
@@ -22,6 +21,11 @@ struct link_map* g_loaded_maps = NULL;
 struct link_map* g_exec_map = NULL;
 
 struct link_map* lookup_symbol(const char* undef_name, ElfW(Sym)** ref);
+
+/* err - positive or negative value of error code */
+static inline void print_error(const char* msg, int err) {
+    log_error("%s (%s)", msg, pal_strerror(err));
+}
 
 /* This macro is used as a callback from the ELF_DYNAMIC_RELOCATE code.  */
 static struct link_map* resolve_map(const char** strtab, ElfW(Sym)** ref) {
@@ -113,17 +117,11 @@ void setup_elf_hash(struct link_map* map) {
     map->l_chain = hash;
 }
 
-/* Map in the shared object NAME, actually located in REALNAME, and already
-   opened on FD */
+/* Map in the shared object NAME, actually located in REALNAME, and already opened on FD */
 static struct link_map* map_elf_object_by_handle(PAL_HANDLE handle, enum object_type type,
                                                  void* fbp, size_t fbp_len, bool do_copy_dyn) {
     struct link_map* l = new_elf_object(_DkStreamRealpath(handle), type);
     int ret;
-
-    if (handle == NULL) {
-        print_error("cannot stat shared object", PAL_ERROR_INVAL);
-        return NULL;
-    }
 
     /* This is the ELF header.  We read it in `open_verify'.  */
     const ElfW(Ehdr)* header = (void*)fbp;
@@ -200,7 +198,7 @@ static struct link_map* map_elf_object_by_handle(PAL_HANDLE handle, enum object_
                 c->mapstart = ALLOC_ALIGN_DOWN(ph->p_vaddr);
                 c->mapend   = ALLOC_ALIGN_UP(ph->p_vaddr + ph->p_filesz);
                 c->dataend  = ph->p_vaddr + ph->p_filesz;
-                c->allocend = ph->p_vaddr + ph->p_memsz;
+                c->allocend = ALLOC_ALIGN_UP(ph->p_vaddr + ph->p_memsz);
                 c->mapoff   = ALLOC_ALIGN_DOWN(ph->p_offset);
 
                 /* Determine whether there is a gap between the last segment
@@ -432,7 +430,7 @@ static int relocate_elf_object(struct link_map* l);
 int load_elf_object_by_handle(PAL_HANDLE handle, enum object_type type, void** out_loading_base) {
     struct link_map* map = NULL;
     char fb[FILEBUF_SIZE];
-    char* errstring;
+    const char* errstring;
     int ret = 0;
 
     /* Now we will start verify the file as a ELF header. This part of code was borrowed from
@@ -441,14 +439,17 @@ int load_elf_object_by_handle(PAL_HANDLE handle, enum object_type type, void** o
     ElfW(Phdr)* phdr = NULL;
     int phdr_malloced = 0;
 
-    int len = _DkStreamRead(handle, 0, FILEBUF_SIZE, &fb, NULL, 0);
+    int64_t read_ret = _DkStreamRead(handle, 0, FILEBUF_SIZE, &fb, NULL, 0);
 
-    if ((size_t)len < sizeof(ElfW(Ehdr))) {
-        if (len < 0)
-            ret = len;
-        else
-            ret = -PAL_ERROR_INVAL;
-        errstring = "ELF file with a strange size";
+    if (read_ret < 0) {
+        ret = read_ret;
+        errstring = "reading ELF file failed";
+        goto verify_failed;
+    }
+    size_t size = read_ret;
+    if (size < sizeof(ElfW(Ehdr))) {
+        ret = -PAL_ERROR_INVAL;
+        errstring = "too small for an ELF";
         goto verify_failed;
     }
 
@@ -483,7 +484,7 @@ int load_elf_object_by_handle(PAL_HANDLE handle, enum object_type type, void** o
     size_t maplength = ehdr->e_phnum * sizeof(ElfW(Phdr));
 
     /* if e_phoff + maplength is smaller than the data read */
-    if (ehdr->e_phoff + maplength <= (size_t)len) {
+    if (ehdr->e_phoff + maplength <= size) {
         phdr = (void*)(&fb + ehdr->e_phoff);
     } else {
         /* ...otherwise, we have to read again */
@@ -499,7 +500,7 @@ int load_elf_object_by_handle(PAL_HANDLE handle, enum object_type type, void** o
         }
     }
 
-    if (!(map = map_elf_object_by_handle(handle, type, &fb, len, true))) {
+    if (!(map = map_elf_object_by_handle(handle, type, &fb, size, true))) {
         ret = -PAL_ERROR_INVAL;
         errstring = "unexpected failure";
         goto verify_failed;
@@ -538,7 +539,7 @@ verify_failed:
     if (phdr && phdr_malloced)
         free(phdr);
 
-    printf("%s\n", errstring);
+    log_error("%s", errstring);
     return ret;
 }
 
@@ -800,6 +801,17 @@ static int relocate_elf_object(struct link_map* l) {
     return 0;
 }
 
+/*
+ * TODO: This function assumes that a "file:" URI describes a path that can be opened on a host
+ * directly (e.g. by GDB or other tools). This is mostly true, except for protected files in
+ * Linux-SGX, which are stored encrypted. As a result, if we load a binary that is a protected file,
+ * we will (incorrectly) report the encrypted file as the actual binary, and code that tries to
+ * parse this file will trip up.
+ *
+ * For now, this doesn't seem worth fixing, as there's no use case for running binaries from
+ * protected files system, and a workaround would be ugly. Instead, the protected files system needs
+ * rethinking.
+ */
 void DkDebugMapAdd(PAL_STR uri, PAL_PTR start_addr) {
 #ifndef DEBUG
     __UNUSED(uri);

@@ -14,6 +14,7 @@
 #include "shim_handle.h"
 #include "shim_internal.h"
 #include "shim_lock.h"
+#include "shim_signal.h"
 #include "shim_table.h"
 #include "shim_thread.h"
 #include "shim_utils.h"
@@ -44,7 +45,7 @@ typedef unsigned long __fd_mask;
 
 #define POLL_NOTIMEOUT ((uint64_t)-1)
 
-static int _shim_do_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
+static long _shim_do_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
     if ((uint64_t)nfds > get_rlimit_cur(RLIMIT_NOFILE))
         return -EINVAL;
 
@@ -101,9 +102,12 @@ static int _shim_do_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
             continue;
         }
 
-        if (hdl->type == TYPE_FILE || hdl->type == TYPE_DEV) {
-            /* Files and devs are special cases: their poll is emulated at LibOS level; do not
-             * include them in handles-to-poll array but instead use handle-specific callback. */
+        if (hdl->type == TYPE_FILE || hdl->type == TYPE_DEV || hdl->type == TYPE_STR) {
+            /* Files, devs and strings are special cases: their poll is emulated at LibOS level; do
+             * not include them in handles-to-poll array but instead use handle-specific
+             * callback.
+             *
+             * TODO: we probably should use the poll() callback in all cases. */
             int shim_events = 0;
             if ((fds[i].events & (POLLIN | POLLRDNORM)) && (hdl->acc_mode & MAY_READ))
                 shim_events |= FS_POLL_RD;
@@ -118,6 +122,13 @@ static int _shim_do_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
             if (shim_revents & FS_POLL_WR)
                 fds[i].revents |= fds[i].events & (POLLOUT | POLLWRNORM);
 
+            if (fds[i].revents)
+                nrevents++;
+            continue;
+        }
+
+        if (!hdl->pal_handle) {
+            fds[i].revents = POLLNVAL;
             nrevents++;
             continue;
         }
@@ -146,7 +157,13 @@ static int _shim_do_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
 
     unlock(&map->lock);
 
-    PAL_BOL polled = DkStreamsWaitEvents(pal_cnt, pals, pal_events, ret_events, timeout_us);
+    bool polled = false;
+    long error = 0;
+    if (pal_cnt) {
+        error = DkStreamsWaitEvents(pal_cnt, pals, pal_events, ret_events, timeout_us);
+        polled = error == 0;
+        error = pal_to_unix_errno(error);
+    }
 
     for (nfds_t i = 0; i < nfds; i++) {
         if (!fds_mapping[i].hdl)
@@ -173,11 +190,19 @@ static int _shim_do_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
     free(pal_events);
     free(fds_mapping);
 
-    return nrevents;
+    if (error == -EAGAIN) {
+        /* `poll` returns 0 on timeout. */
+        error = 0;
+    } else if (error == -EINTR) {
+        /* `poll`, `ppoll`, `select` and `pselect` are not restarted after being interrupted by
+         * a signal handler. */
+        error = -ERESTARTNOHAND;
+    }
+    return nrevents ? (long)nrevents : error;
 }
 
 long shim_do_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
-    if (!fds || test_user_memory(fds, sizeof(*fds) * nfds, true))
+    if (!is_user_memory_writable(fds, sizeof(*fds) * nfds))
         return -EFAULT;
 
     return _shim_do_poll(fds, nfds, timeout_ms);
@@ -205,10 +230,7 @@ long shim_do_select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* errorfd
             return shim_do_pause();
 
         /* special case of select(0, ..., tsv) used for sleep */
-        struct __kernel_timespec tsp;
-        tsp.tv_sec  = tsv->tv_sec;
-        tsp.tv_nsec = tsv->tv_usec * 1000;
-        return shim_do_nanosleep(&tsp, NULL);
+        return do_nanosleep(tsv->tv_sec * TIME_US_IN_S + tsv->tv_usec, NULL);
     }
 
     if (nfds < __NFDBITS) {
@@ -255,7 +277,7 @@ long shim_do_select(int nfds, fd_set* readfds, fd_set* writefds, fd_set* errorfd
     unlock(&map->lock);
 
     uint64_t timeout_ms = tsv ? tsv->tv_sec * 1000ULL + tsv->tv_usec / 1000 : POLL_NOTIMEOUT;
-    int ret = _shim_do_poll(fds_poll, nfds_poll, timeout_ms);
+    long ret = _shim_do_poll(fds_poll, nfds_poll, timeout_ms);
 
     if (ret < 0) {
         free(fds_poll);
